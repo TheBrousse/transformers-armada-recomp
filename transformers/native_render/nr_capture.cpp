@@ -96,6 +96,7 @@ namespace nr
         std::vector<uint32_t> g_recent;          // textures asked for since the last capture
         std::vector<uint32_t> g_prefetchBlocks;  // state blocks captured since the last frame: their textures made ahead (prefetchBlockTextures)
         uint64_t g_bindExact = 0, g_bindGuess = 0; // captures bound by TEX0's block / by the last texture
+        uint64_t g_boundRefit = 0; // (TODO 206) draws whose binding, larger than TEX0, gave way to the upload at TBP
         uint32_t g_stateBlock = 0; // the last state block applied (its GS registers: TEX0_1 at +0x30)
         // Which wrote a GS register last, in the display list's order: the state block applied last (a
         // DMA call of its packet) or func_00225D60 (a register written on its own, its shadow kept at
@@ -1353,6 +1354,26 @@ namespace nr
                 if (!level || !word(rdram, level + 0x0Cu) || !word(rdram, level + 0x10u) ||
                     (bpp != 4u && bpp != 8u && bpp != 16u && bpp != 24u && bpp != 32u))
                     bound = 0u;
+                // (TODO 206: ... or a binding left over from another texture at the same TBP, its image larger than
+                // TEX0's window - the HQ warp gate's tunnel: its additive pass, TEX0 64 x 64 at 37C3, bound on most
+                // frames to the room's 256 x 256 RM_05 kept at that block, while what the GS holds there is
+                // LIGHTING_ZAP0A03, 64 x 64: the tunnel bright and even with a dark frame every 7th, where the PS2
+                // and the emulated renderers show the lightning's dimmer, pulsing streaks. Then the texture uploaded
+                // at TBP, when it fits. TF_NATIVE_BOUNDFIT=0: the binding, as before.)
+                static const bool boundFit = !(std::getenv("TF_NATIVE_BOUNDFIT") && *std::getenv("TF_NATIVE_BOUNDFIT") == '0');
+                auto inWindow = [&](uint32_t lv) {
+                    return lv && word(rdram, lv + 0x0Cu) <= key.width && word(rdram, lv + 0x10u) <= key.height;
+                };
+                if (bound && boundFit && !inWindow(level))
+                    if (auto up = uploadsTable().find(key.tbp); up != uploadsTable().end() && up->second.texture != bound &&
+                                                                up->second.texture && word(rdram, up->second.texture) == 0x006B4760u &&
+                                                                inWindow(up->second.level) &&
+                                                                word(rdram, up->second.texture + 0x98u + 4u * std::min(word(rdram, up->second.texture + 0x90u), 15u)) ==
+                                                                    up->second.level)
+                    {
+                        bound = up->second.texture;
+                        ++g_boundRefit;
+                    }
             }
             if (bound)
             {
@@ -4612,14 +4633,14 @@ namespace nr
                 g_frame.tick = tick;
                 std::fprintf(stderr,
                              "[native render] frame at tick %llu: %zu draws, %zu meshes (%llu decoded, %llu empty), "
-                             "%llu immediate so far, textures %llu converted (%llu upscaled, %llu of them a large image shared, %llu large let go of for video memory), %llu not, %llu draws with no upload known, state blocks bound %llu by TEX0, %llu guessed; %llu kept in GS memory alone (from targets), %llu group loads (%llu levels); %llu with the game's own mip levels\n",
+                             "%llu immediate so far, textures %llu converted (%llu upscaled, %llu of them a large image shared, %llu large let go of for video memory), %llu not, %llu draws with no upload known, state blocks bound %llu by TEX0, %llu guessed, %llu bindings larger than TEX0 given the upload at TBP; %llu kept in GS memory alone (from targets), %llu group loads (%llu levels); %llu with the game's own mip levels\n",
                              static_cast<unsigned long long>(tick), g_frame.draws.size(), g_meshes.size(),
                              static_cast<unsigned long long>(g_decoded), static_cast<unsigned long long>(g_failed),
                              static_cast<unsigned long long>(g_immediate),
                              static_cast<unsigned long long>(g_texturesConverted), static_cast<unsigned long long>(g_texturesUpscaled),
                              static_cast<unsigned long long>(g_largeShares), static_cast<unsigned long long>(g_largeEvicted),
                              static_cast<unsigned long long>(g_texturesFailed), static_cast<unsigned long long>(g_texturesUnknown),
-                             static_cast<unsigned long long>(g_bindExact), static_cast<unsigned long long>(g_bindGuess),
+                             static_cast<unsigned long long>(g_bindExact), static_cast<unsigned long long>(g_bindGuess), static_cast<unsigned long long>(g_boundRefit),
                              static_cast<unsigned long long>(g_texturesVram), static_cast<unsigned long long>(g_groupLoads),
                              static_cast<unsigned long long>(g_groupLevels), static_cast<unsigned long long>(g_texturesGameMips));
                 for (Counted &c : g_counted)

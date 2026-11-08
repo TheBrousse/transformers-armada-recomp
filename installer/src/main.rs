@@ -382,12 +382,23 @@ impl Job {
 
         // Git first: the repository comes with it.
         let _ = tx.send(Msg::Step(STEP_TOOLS));
+        // (a Git that is installed but not on PATH - its "Git Bash only" option, a per-user install - is used where it is)
+        if !has(&path_env, "git") {
+            path_env = with_git_dir(&path_env);
+        }
         if !has(&path_env, "git") {
             let _ = tx.send(Msg::Detail(STEP_TOOLS, "installing Git (winget)".into()));
-            self.exec("winget", &["install", "--id", "Git.Git", "-e", "--accept-package-agreements", "--accept-source-agreements"], None, &path_env, tx, STEP_TOOLS, &log)?;
-            path_env = fresh_path(&path_env);
+            // (winget's exit code does not decide: "already installed, no newer version" is an error
+            // code too - a player's setup stopped on it. The check after it decides.)
+            let r = self.exec("winget", &["install", "--id", "Git.Git", "-e", "--accept-package-agreements", "--accept-source-agreements"], None, &path_env, tx, STEP_TOOLS, &log);
+            path_env = with_git_dir(&fresh_path(&path_env));
             if !has(&path_env, "git") {
-                return Err("Git was installed but is not found: restart the setup".into());
+                return Err(match r {
+                    Err(e) => format!("{e}
+
+Git could not be installed or found. Install Git from git-scm.com and run the setup again."),
+                    Ok(()) => "Git was installed but is not found: restart the setup".into(),
+                });
             }
         }
         let _ = tx.send(Msg::Progress(0.03));
@@ -912,6 +923,23 @@ fn write_bmp(path: &str, image: &egui::ColorImage) -> std::io::Result<()> {
 
 fn has(path_env: &str, exe: &str) -> bool {
     path_env.split(';').any(|d| !d.is_empty() && Path::new(d).join(format!("{exe}.exe")).exists())
+}
+
+/// PATH plus the folder of an installed Git that is not on it (the usual install folders), if any.
+fn with_git_dir(path_env: &str) -> String {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            dirs.push(Path::new(&v).join("Git").join("cmd"));
+        }
+    }
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        dirs.push(Path::new(&v).join("Programs").join("Git").join("cmd"));
+    }
+    match dirs.into_iter().find(|d| d.join("git.exe").exists()) {
+        Some(d) => format!("{};{path_env}", d.display()),
+        None => path_env.to_string(),
+    }
 }
 
 /// PATH as the registry has it now (programs installed meanwhile), plus what we had.

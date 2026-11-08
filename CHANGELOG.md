@@ -1,5 +1,13 @@
 # What's new
 
+## 0.2.5
+
+**Fixed**
+- The setup no longer stops at "Tools" with "no newer package versions are available" when Git is already
+  installed but Windows can't find it. It now finds and uses the Git you have.
+- Native renderer: the HQ warp gate's tunnel no longer flickers dark every few frames. It pulses smoothly, like on
+  the PS2.
+
 ## 0.2.4
 
 **Fixed**
