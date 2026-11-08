@@ -1,0 +1,5 @@
+# The Rust that builds tfa-setup.exe, pinned: the same sources and Cargo.lock then give the same exe
+# (installer/build.ps1), here and in the setup workflow. Raise it on purpose, not by accident.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"

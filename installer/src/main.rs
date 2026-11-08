@@ -18,6 +18,8 @@
 // The install is <folder>\<the repository's name>, a clone of it.
 #![windows_subsystem = "windows"]
 
+mod winapi;
+
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -99,7 +101,7 @@ struct App {
     progress: f32,
     error: String,
     rx: Option<Receiver<Msg>>,
-    child: Arc<Mutex<Option<u32>>>,
+    child: Arc<Mutex<Option<Arc<winapi::ProcessTree>>>>, // the running step's process tree (Cancel ends it)
     update: bool,  // the job updates an installed copy (update.ps1) instead of setting up
     play: bool,    // the game started again after the update (the game's own "Update now")
     wait_pid: u32, // the game that asked for the update: the update waits for it to close
@@ -225,8 +227,9 @@ impl App {
     }
 
     fn cancel(&mut self) {
-        if let Some(pid) = *self.child.lock().unwrap() {
-            let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags_no_window().status();
+        let tree = self.child.lock().unwrap().clone();
+        if let Some(tree) = tree {
+            tree.terminate();
         }
     }
 
@@ -338,7 +341,7 @@ struct Job {
     prototype: String,
     folder: PathBuf,
     hd: bool,
-    child: Arc<Mutex<Option<u32>>>,
+    child: Arc<Mutex<Option<Arc<winapi::ProcessTree>>>>, // the running step's process tree (Cancel ends it)
     update: bool,
     play: bool,
     wait_pid: u32,
@@ -358,14 +361,11 @@ impl Job {
             // (the game that asked for the update closes first: its folder is about to change)
             if self.wait_pid != 0 {
                 let _ = tx.send(Msg::Detail(STEP_DOWNLOAD, "waiting for the game to close".into()));
-                let _ = Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &format!("Wait-Process -Id {} -Timeout 120 -ErrorAction SilentlyContinue", self.wait_pid)])
-                    .creation_flags_no_window()
-                    .status();
+                winapi::wait_for_process(self.wait_pid, 120_000);
             }
             self.keep_local_work(&repo, tx, &log).map_err(|e| format!("{e}\n\nThe full log: {}", log_path.display()))?;
             let script = repo.join("update.ps1").to_string_lossy().to_string();
-            let mut args: Vec<String> = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), script,
+            let mut args: Vec<String> = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "RemoteSigned".into(), "-File".into(), script,
                 "-StashLocalChanges".into()];
             if self.wait_pid != 0 {
                 args.extend(["-WaitForPid".into(), self.wait_pid.to_string()]);
@@ -411,7 +411,7 @@ impl Job {
 
         // setup.ps1 does the rest; a second run after it installed missing tools (they need a fresh PATH).
         let script = repo.join("setup.ps1").to_string_lossy().to_string();
-        let mut args: Vec<String> = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), script,
+        let mut args: Vec<String> = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "RemoteSigned".into(), "-File".into(), script,
             "-Iso".into(), self.retail.clone(), "-InstallPrerequisites".into()];
         if self.mods && !self.prototype.is_empty() {
             args.extend(["-PrototypeIso".into(), self.prototype.clone()]);
@@ -480,7 +480,10 @@ impl Job {
             cmd.current_dir(d);
         }
         let mut child = cmd.spawn().map_err(|e| format!("{exe} could not be started: {e}"))?;
-        *self.child.lock().unwrap() = Some(child.id());
+        // (its whole process tree in a job object: Cancel ends all of it. When the step is done what it
+        // left is ended too - but not after an update that starts the game again at its end)
+        let tree = Arc::new(winapi::ProcessTree::new(&child, !self.play));
+        *self.child.lock().unwrap() = Some(tree.clone());
         let tail = Arc::new(Mutex::new(Vec::<String>::new()));
         let current = Arc::new(Mutex::new(step));
         let readers: Vec<_> = [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
@@ -533,6 +536,7 @@ impl Job {
             let _ = r.join();
         }
         *self.child.lock().unwrap() = None;
+        drop(tree);
         if status.success() {
             Ok(())
         } else {
@@ -912,14 +916,21 @@ fn has(path_env: &str, exe: &str) -> bool {
 
 /// PATH as the registry has it now (programs installed meanwhile), plus what we had.
 fn fresh_path(old: &str) -> String {
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"])
-        .creation_flags_no_window()
-        .output();
-    match out {
-        Ok(o) => format!("{};{old}", String::from_utf8_lossy(&o.stdout).trim()),
-        Err(_) => old.to_string(),
+    let now = winapi::registry_path();
+    if now.is_empty() { old.to_string() } else { format!("{now};{old}") }
+}
+
+/// Starts the game (what Play.bat does): settings.ini made from settings.example.ini on the first
+/// start, then the game's exe in the game's folder.
+fn play(repo: &Path) {
+    let game = game_folder(repo);
+    let settings = game.join("settings.ini");
+    let example = game.join("settings.example.ini");
+    if !settings.exists() && example.exists() {
+        let _ = std::fs::copy(&example, &settings);
     }
+    let exe = game.join("out").join("build").join("transformers").join("RelWithDebInfo").join("TransformersRecomp.exe");
+    let _ = Command::new(exe).current_dir(&game).spawn();
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1059,7 +1070,7 @@ impl App {
                     self.start_update();
                 }
                 if ui.add_sized([150.0, 40.0], egui::Button::new("Play")).clicked() {
-                    let _ = Command::new("cmd").args(["/c", "Play.bat"]).current_dir(self.repo()).creation_flags_no_window().spawn();
+                    play(&self.repo());
                 }
                 if ui.add_enabled(self.check_rx.is_none(), egui::Button::new("Check again").min_size(Vec2::new(150.0, 40.0))).clicked() {
                     self.start_check();
@@ -1191,10 +1202,10 @@ impl App {
                 ui.horizontal(|ui| {
                     let repo = self.repo();
                     if ok && ui.add_sized([150.0, 40.0], egui::Button::new(RichText::new("Play").size(16.0)).fill(ACCENT)).clicked() {
-                        let _ = Command::new("cmd").args(["/c", "Play.bat"]).current_dir(&repo).creation_flags_no_window().spawn();
+                        play(&repo);
                     }
                     if ui.add_sized([150.0, 40.0], egui::Button::new("Open folder")).clicked() {
-                        let _ = Command::new("explorer").arg(&self.folder).spawn();
+                        winapi::open_folder(Path::new(&self.folder));
                     }
                     if !ok && ui.add_sized([150.0, 40.0], egui::Button::new("Try again")).clicked() {
                         self.error.clear();

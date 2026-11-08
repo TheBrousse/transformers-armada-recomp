@@ -619,7 +619,8 @@ namespace updates
             if (!hidden && fs::exists(setup, ec))
                 command = quoted(setup) + L" --folder " + quoted(repo.parent_path()) + L" --update --play --wait-pid " + std::to_wstring(pid);
             else
-                command = L"powershell.exe -NoProfile -ExecutionPolicy Bypass" + std::wstring(hidden ? L" -NonInteractive" : L"") +
+                // (RemoteSigned: the copy's own scripts came with git, so they carry no Mark of the Web and run)
+                command = L"powershell.exe -NoProfile -ExecutionPolicy RemoteSigned" + std::wstring(hidden ? L" -NonInteractive" : L"") +
                           L" -File " + quoted(repo / "update.ps1") + L" -WaitForPid " + std::to_wstring(pid) + L" -Play -StashLocalChanges";
             std::vector<wchar_t> line(command.begin(), command.end());
             line.push_back(L'\0');
