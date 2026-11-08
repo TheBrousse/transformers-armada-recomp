@@ -1,0 +1,41 @@
+Subject: [PATCH] GS GPU renderer: the player's silhouette into his shadow map drawn by the emulated path (TODO 203)
+
+In Amazon the GPU renderer left out the player's whole shadow (a dark band over the ground and the rock wall beside
+him, at every scale). The game draws his silhouette into a 128-wide shadow map (FBW 2), softens it, moves its colour
+bits into the top byte through a 16-bit view and has the shadow receivers alpha-test that byte. Drawn by the native
+pixel path the silhouette came out with alpha 254 where the GS writes 255 (1718 pixels of the map's second half
+measured, the emulated path 255 there), which through the shuffle the receivers' test left out. A textured model -
+not a sprite, its texture not a buffer - drawn into a buffer at most 128 wide now goes the emulated path; the map's
+clear and softening copies and the glow's working buffers of the same width stay native.
+
+Checked against the software renderer (PS2X_GPU_MIRROR=1) on the user's Amazon state: GPU minus software mean 10.1 ->
+-0.3 (scale 1) and 0.5 (scale 4), the shadow back. Easter Island unchanged (-0.4). GPU time per frame at scale 8 with
+8 samples on a GTX 1080 unchanged within noise (40.7 vs 40.5 ms). PS2X_GPU_NATIVE_SMALL=1: natively, as before.
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 10f54fb..f21cb80 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -3000,6 +3000,22 @@ bool GSGpuRenderer::Impl::nativeDraw(const Target &frame, bool usesDepth, Kind d
+         return false;
+     if (usesDepth && depthKind != kZ32)
+         return false;
++    // (TODO 203) A model drawn into a buffer at most 128 pixels wide (FBW 2 or less) with a texture from local memory -
++    // the player's silhouette into his shadow map - through the emulated path: the game reads that buffer back bit by
++    // bit (a 16-bit view's shuffle into the top byte, then an alpha test against it), and drawn natively the
++    // silhouette came out with alpha 254 where the GS writes 255, which the shadow receivers' alpha test then left out:
++    // the whole shadow under the player (Amazon). The buffer's other draws stay native (its clear, its softening
++    // copies, the glow's working buffers of the same width: sprites, or textures from buffers). PS2X_GPU_NATIVE_SMALL=1:
++    // natively, as before.
++    static const bool smallNative = envFlag("PS2X_GPU_NATIVE_SMALL", false);
++    if (!smallNative && std::max<uint32_t>(ctx.frame.fbw, 1u) <= 2u && state.prim.tme && state.prim.type != GS_PRIM_SPRITE)
++    {
++        bool fromBuffer = false;
++        for (const auto &t : targets)
++            fromBuffer = fromBuffer || t->bp == ctx.tex0.tbp0;
++        if (!fromBuffer)
++            return false;
++    }
+     if (!fieldPicture && fields && (frame.shadowed || (state.scanmsk & 3u) >= 2u))
+         return false;
+     if (fieldPicture && (usesDepth || (state.prim.abe && ((ctx.alpha >> 4u) & 3u) == 1u && fpsm == GS_PSM_CT32)))

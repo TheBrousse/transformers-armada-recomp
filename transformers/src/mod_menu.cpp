@@ -1877,7 +1877,11 @@ namespace mod_menu
                     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(colour("amber")), "Restarting...");
                 else if (button(modRestart ? "Restart game" : "Restart to apply", true))
                 {
-                    if (modRestart)
+                    if (modRestart && ext::restartGame(true))
+                    {
+                        // (an extension's own restart: it asks first - the mod loader's, port_ext.h)
+                    }
+                    else if (modRestart)
                     {
                         // File mods replace loaded resources: never resume an old
                         // snapshot after rebuilding the disc with different files.
@@ -1897,6 +1901,7 @@ namespace mod_menu
                 dl->AddText(f.text, size * 0.75f, ImVec2(pad, bottom + size * 2.2f), colour("amber"), message.c_str());
             if (!g_modRestartError.empty())
                 dl->AddText(f.text, size * 0.75f, ImVec2(pad, bottom + size * 2.2f), colour("amber"), g_modRestartError.c_str());
+            ext::restartGame(false); // (an extension's restart dialog, while it is open: port_ext.h)
             ImGui::End();
         }
 #endif

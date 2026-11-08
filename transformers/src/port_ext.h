@@ -81,6 +81,10 @@ namespace ext
         void (*menuSection)(const char *section) = nullptr;
         // A change of its that takes a fresh start of the game (the menu offers "Restart game").
         bool (*restartPending)() = nullptr;
+        // That restart carried out by the extension itself (it asks first): the menu calls it each frame it is drawn,
+        // clicked = its "Restart game" button was pressed this frame (then true: the extension took it; none taking it,
+        // the menu restarts at once).
+        bool (*restartGame)(bool clicked) = nullptr;
         // Functions of its own for the decomp layer's registry, added when that installs (decomp::install, before
         // it sorts and switches them; not with TF_DECOMP=0).
         void (*addDecompFunctions)() = nullptr;
@@ -113,6 +117,8 @@ namespace ext
     void menuSection(const char *section);
     // Any extension waits for a fresh start.
     bool restartPending();
+    // The menu's restart for it, each frame the menu is drawn (restartGame above); true when an extension took the click.
+    bool restartGame(bool clicked);
     void addDecompFunctions();
     void beforeQuit();
 }

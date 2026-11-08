@@ -24,7 +24,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build tfa-setup.exe (no build-machine paths in it, deterministic: installer/build.ps1)
+      - name: "Build tfa-setup.exe (no build-machine paths in it, deterministic: installer/build.ps1)"
         shell: pwsh
         run: ./installer/build.ps1
       - name: Publish it as a release of its own

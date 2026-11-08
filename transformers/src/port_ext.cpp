@@ -151,6 +151,15 @@ namespace ext
         return false;
     }
 
+    bool restartGame(bool clicked)
+    {
+        bool taken = false;
+        for (const Extension *e : registry())
+            if (e->restartGame && e->restartGame(clicked))
+                taken = true;
+        return taken;
+    }
+
     void addDecompFunctions()
     {
         for (const Extension *e : registry())
