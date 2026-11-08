@@ -54,7 +54,19 @@ for ($n = 2; $tags -contains $tag; $n++) { $tag = "$base-$n" }
 
 $short = $Commit.Substring(0, [Math]::Min(7, $Commit.Length))
 $title = "Setup v$version" + $(if ($tag -ne $base) { " (build $($tag.Substring($base.Length + 1)))" } else { "" })
-$notes = @"
+# The player-facing notes for this version: CHANGELOG.md's "## <version>" section, when there is one.
+$whatsNew = ""
+$log = Join-Path $top "CHANGELOG.md"
+if (Test-Path -LiteralPath $log) {
+    $lines = Get-Content -LiteralPath $log -Encoding UTF8
+    $start = [array]::IndexOf($lines, ($lines | Where-Object { $_ -match ("^## " + [regex]::Escape($version) + '(\s|$)') } | Select-Object -First 1))
+    if ($start -ge 0) {
+        $end = $start + 1
+        while ($end -lt $lines.Count -and $lines[$end] -notmatch '^## ') { $end++ }
+        $whatsNew = "## What's new in $version`n" + (($lines[($start + 1)..($end - 1)]) -join "`n").Trim() + "`n`n"
+    }
+}
+$notes = $whatsNew + @"
 The setup program for the Transformers (PS2) PC port, v$version (built from $short).
 
 Download tfa-setup.exe, run it, pick your own Transformers (USA, SLUS-20668) disc image and a folder: it installs the tools the build needs, then builds the game on your PC from your disc. The setup contains no game code and no game data.

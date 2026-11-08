@@ -9,7 +9,7 @@ name: Setup program
 on:
   push:
     branches: [main]
-    paths: ["installer/**", ".github/workflows/setup-exe.yml"]
+    paths: ["installer/**", ".github/workflows/setup-exe.yml", "VERSION"]
   workflow_dispatch:
 
 permissions:
