@@ -1,0 +1,255 @@
+Subject: [PATCH] Runtime: the game's light bar and adaptive triggers on a DualSense (TODO 209)
+
+The game can now ask for what a DualSense / DualShock 4 shows (ps2_sony_pad.h): setLightbarRequest (a colour, or
+two colours taking turns every blinkMs by real time, worked out on the device thread so a blink is the same at any
+frame rate) and setTriggerRequest (the 11-byte adaptive-trigger effect of L2 and R2, DualSense only). The device
+thread writes when the colour or the effects change, besides the motor changes and keep-alives it wrote before.
+Trigger effects go out only in the writes that change them (valid_flag0 0x04 | 0x08, effects at +10 / +21 of the
+common block, as in our earlier launcher's pad code): a pad holds an effect until it is told otherwise, and the first write
+of a connection and the closing write clear one a pad still holds. A request left inactive changes nothing.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+index 2ca9acc..34de019 100644
+--- a/ps2xRuntime/include/runtime/ps2_sony_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -111,6 +111,11 @@ namespace ps2x::sonypad
+         uint8_t playerLeds = 0x04u; // DualSense player indicator: the centre LED = player 1
+         bool lightbarSetup = false; // DualSense: fade out the firmware's start-up glow so the colour shows
+         bool releaseLeds = false;   // DualSense: hand the LEDs back to the firmware (the game is closing)
++        // DualSense: write the adaptive-trigger effects below (11 bytes each: the mode, then its parameters; all zero =
++        // no effect). Only in the writes that change them: a pad keeps an effect until it is told otherwise, and
++        // writing one again restarts it.
++        bool triggers = false;
++        uint8_t rightTrigger[11] = {}, leftTrigger[11] = {};
+     };
+ 
+     // The output report for a pad. outputLength: the collection's OutputReportByteLength (USB only; a Bluetooth report
+@@ -147,6 +152,38 @@ namespace ps2x::sonypad
+     // Increases with every change of any port's motors (the device thread writes on a change).
+     uint64_t guestMotorsGeneration();
+ 
++    // ---- What the game shows on the pad: the light bar, the adaptive triggers ----
++
++    // The light bar the game asks for, in place of the setting's colour (never with PS2X_SONYPAD_LIGHTBAR=off).
++    // blinkMs > 0: colours a and b take turns, each for blinkMs, by real time (the device thread works it out, so it
++    // blinks the same at any frame rate). Any thread; cheap.
++    struct LightbarRequest
++    {
++        bool active = false; // false: the setting's colour
++        uint8_t a[3] = {}, b[3] = {};
++        uint32_t blinkMs = 0u;
++        bool operator==(const LightbarRequest &o) const;
++        bool operator!=(const LightbarRequest &o) const { return !(*this == o); }
++    };
++    void setLightbarRequest(const LightbarRequest &request);
++    LightbarRequest lightbarRequest();
++    // The colour of a request at a time (ms on any steady clock).
++    void lightbarColourAt(const LightbarRequest &request, int64_t nowMs, uint8_t rgb[3]);
++
++    // The adaptive-trigger effects the game asks for (DualSense; a DualShock 4 has none). Inactive = no effect on
++    // either trigger (the device thread then writes the off effect once, so a held resistance lets go).
++    struct TriggerRequest
++    {
++        bool active = false;
++        uint8_t left[11] = {}, right[11] = {};
++        bool operator==(const TriggerRequest &o) const;
++        bool operator!=(const TriggerRequest &o) const { return !(*this == o); }
++    };
++    void setTriggerRequest(const TriggerRequest &request);
++    TriggerRequest triggerRequest();
++    // Increases with every change of either request (the device thread writes on a change).
++    uint64_t padRequestGeneration();
++
+     // ---- The PS2 pad report ----
+ 
+     // data[1] of the pad backend's 32-byte report when data[8..19] carry real pressures (DualShock 2 pressure mode).
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+index e012f26..a20a192 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -284,6 +284,14 @@ namespace ps2x::sonypad
+                 buf[c + 38] = 0x02u; // valid_flag2: light-bar setup control
+                 buf[c + 41] = 0x02u; // light out: fade the start-up glow so the colour shows
+             }
++            if (state.triggers)
++            {
++                // valid_flag0 0x04 right trigger, 0x08 left trigger (our earlier launcher's pad code: set only in a write that
++                // carries the effects - a set bit with zero bytes is the off effect)
++                buf[c + 0] |= 0x04u | 0x08u;
++                std::memcpy(&buf[c + 10], state.rightTrigger, 11u);
++                std::memcpy(&buf[c + 21], state.leftTrigger, 11u);
++            }
+         }
+         else
+         {
+@@ -401,6 +409,68 @@ namespace ps2x::sonypad
+ 
+     uint64_t guestMotorsGeneration() { return g_guestMotorsGeneration.load(std::memory_order_acquire); }
+ 
++    namespace
++    {
++        std::mutex g_requestMutex;
++        LightbarRequest g_lightbarRequest;
++        TriggerRequest g_triggerRequest;
++        std::atomic<uint64_t> g_requestGeneration{0};
++    }
++
++    bool LightbarRequest::operator==(const LightbarRequest &o) const
++    {
++        return active == o.active && blinkMs == o.blinkMs && std::memcmp(a, o.a, 3) == 0 && std::memcmp(b, o.b, 3) == 0;
++    }
++
++    bool TriggerRequest::operator==(const TriggerRequest &o) const
++    {
++        return active == o.active && std::memcmp(left, o.left, 11) == 0 && std::memcmp(right, o.right, 11) == 0;
++    }
++
++    void setLightbarRequest(const LightbarRequest &request)
++    {
++        {
++            std::lock_guard<std::mutex> lock(g_requestMutex);
++            if (g_lightbarRequest == request)
++                return;
++            g_lightbarRequest = request;
++        }
++        g_requestGeneration.fetch_add(1u, std::memory_order_acq_rel);
++        host::wake();
++    }
++
++    LightbarRequest lightbarRequest()
++    {
++        std::lock_guard<std::mutex> lock(g_requestMutex);
++        return g_lightbarRequest;
++    }
++
++    void lightbarColourAt(const LightbarRequest &request, int64_t nowMs, uint8_t rgb[3])
++    {
++        const bool second = request.blinkMs > 0u && ((nowMs / static_cast<int64_t>(request.blinkMs)) & 1) != 0;
++        std::memcpy(rgb, second ? request.b : request.a, 3);
++    }
++
++    void setTriggerRequest(const TriggerRequest &request)
++    {
++        {
++            std::lock_guard<std::mutex> lock(g_requestMutex);
++            if (g_triggerRequest == request)
++                return;
++            g_triggerRequest = request;
++        }
++        g_requestGeneration.fetch_add(1u, std::memory_order_acq_rel);
++        host::wake();
++    }
++
++    TriggerRequest triggerRequest()
++    {
++        std::lock_guard<std::mutex> lock(g_requestMutex);
++        return g_triggerRequest;
++    }
++
++    uint64_t padRequestGeneration() { return g_requestGeneration.load(std::memory_order_acquire); }
++
+     bool gamepadButtonDown(const InputState &state, int raylibButton)
+     {
+         uint32_t mask = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+index fa42e41..4152245 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+@@ -22,6 +22,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <cwctype>
+ #include <iostream>
+ #include <map>
+@@ -379,6 +380,16 @@ namespace ps2x::sonypad::host
+                 out.red = m_config.red;
+                 out.green = m_config.green;
+                 out.blue = m_config.blue;
++                // The game's light bar (its Autobot's colour, its blinks: setLightbarRequest), worked out by real time.
++                const LightbarRequest request = lightbarRequest();
++                if (request.active)
++                {
++                    uint8_t rgb[3];
++                    lightbarColourAt(request, nowMs(), rgb);
++                    out.red = rgb[0];
++                    out.green = rgb[1];
++                    out.blue = rgb[2];
++                }
+                 out.lightbarSetup = setup;
+                 out.releaseLeds = release && m_config.lightbar;
+                 if (setup)
+@@ -435,6 +446,9 @@ namespace ps2x::sonypad::host
+                 uint64_t writtenGeneration = guestMotorsGeneration() - 1u; // forces the first state write
+                 bool writesOn = canWrite;
+                 bool setupPending = canWrite && m_config.lightbar && device.model == Model::DualSense;
++                uint8_t writtenRgb[3] = {0u, 0u, 0u};
++                TriggerRequest writtenTriggers;
++                bool triggersSent = false; // (the first write clears any effect a pad still holds)
+                 std::string endReason = "stopping";
+ 
+                 if (!canWrite)
+@@ -535,10 +549,24 @@ namespace ps2x::sonypad::host
+                     if (writesOn)
+                     {
+                         const uint64_t generation = guestMotorsGeneration();
+-                        const OutputState out = outputState(false, false);
++                        OutputState out = outputState(false, false);
+                         const bool rumbling = out.weakMotor != 0u || out.strongMotor != 0u;
+-                        const bool due = generation != writtenGeneration ||
++                        // (the game's light bar and triggers: a new colour - a blink's turn too - or new effects)
++                        const bool colourChanged = out.lightbar && (out.red != writtenRgb[0] || out.green != writtenRgb[1] ||
++                                                                    out.blue != writtenRgb[2]);
++                        const TriggerRequest triggers = triggerRequest();
++                        const bool triggersChanged = device.model == Model::DualSense && (!triggersSent || triggers != writtenTriggers);
++                        const bool due = generation != writtenGeneration || colourChanged || triggersChanged ||
+                                          now - lastWrite >= (rumbling ? kRumbleKeepAliveMs : kIdleKeepAliveMs);
++                        if (triggersChanged)
++                        {
++                            out.triggers = true; // (inactive: all zero, the off effect - a held resistance lets go)
++                            if (triggers.active)
++                            {
++                                std::memcpy(out.leftTrigger, triggers.left, 11u);
++                                std::memcpy(out.rightTrigger, triggers.right, 11u);
++                            }
++                        }
+                         if (setupPending || due)
+                         {
+                             const bool setup = setupPending;
+@@ -551,7 +579,24 @@ namespace ps2x::sonypad::host
+                             if (setup)
+                                 setupPending = false;
+                             else
++                            {
+                                 writtenGeneration = generation;
++                                if (ok)
++                                {
++                                    writtenRgb[0] = out.red;
++                                    writtenRgb[1] = out.green;
++                                    writtenRgb[2] = out.blue;
++                                    if (triggersChanged)
++                                    {
++                                        writtenTriggers = triggers;
++                                        triggersSent = true;
++                                        if (m_config.trace)
++                                            logLine(std::string("[sonypad] adaptive triggers ") +
++                                                    (triggers.active ? "L2 " + hex(triggers.left, 11) + " R2 " + hex(triggers.right, 11)
++                                                                     : std::string("off")));
++                                    }
++                                }
++                            }
+                             if (m_config.trace && (writes <= 4 || (!setup && generation != m_tracedGeneration)))
+                             {
+                                 const Motors motors = guestMotors(0);
+@@ -607,7 +652,9 @@ namespace ps2x::sonypad::host
+                 {
+                     // The game is closing: motors off, the LEDs back to the firmware (our earlier launcher's exit).
+                     DWORD error = 0;
+-                    write(h, device, buildOutputReport(device.model, device.link, outputState(false, true), device.outputLength), error);
++                    OutputState release = outputState(false, true);
++                    release.triggers = device.model == Model::DualSense && writtenTriggers.active; // (and no held trigger effect)
++                    write(h, device, buildOutputReport(device.model, device.link, release, device.outputLength), error);
+                 }
+                 setLive(false);
+                 CloseHandle(h);

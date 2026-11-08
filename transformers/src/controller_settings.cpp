@@ -4,6 +4,9 @@
 
 #include "runtime/ps2_settings.h"
 
+#include <cstdlib>
+#include <string>
+
 namespace controller_settings
 {
     void add()
@@ -38,11 +41,22 @@ namespace controller_settings
             s.section = "Controller";
             s.label = "Light bar";
             s.order = 30;
-            s.help = "The light bar's colour on a DualSense / DualShock 4.";
-            s.choices = {{"DC1616", "Autobot red"},     {"1E50DC", "Optimus blue"}, {"00C8DC", "Energon cyan"},
-                         {"F0B400", "Hot Shot yellow"}, {"8C28C8", "Decepticon purple"}, {"FFFFFF", "White"},
-                         {"off", "The pad's own"}};
-            s.defaultValue = "DC1616";
+            s.help = "The light bar's colour on a DualSense / DualShock 4. Your Autobot's: Optimus red, Hot Shot yellow, "
+                     "Red Alert blue.";
+            s.choices = {{"autobot", "Your Autobot's"}, {"DC1616", "Autobot red"},     {"1E50DC", "Optimus blue"},
+                         {"00C8DC", "Energon cyan"},    {"F0B400", "Hot Shot yellow"}, {"8C28C8", "Decepticon purple"},
+                         {"FFFFFF", "White"},           {"off", "The pad's own"}};
+            s.defaultValue = "autobot";
+            // (the game sends the colour as it plays, dualsense.cpp: a change shows at once; only to or from the pad's
+            // own light it takes a restart - the device thread reads that when it starts)
+            s.apply = [](const std::string &value)
+            {
+                static const bool startedOff = [] {
+                    const char *env = std::getenv("PS2X_SONYPAD_LIGHTBAR");
+                    return env && std::string(env) == "off";
+                }();
+                return (value == "off") == startedOff;
+            };
             ps2_settings::add(s);
         }
         const auto responseSetting = [](const char *key, const char *label, const char *help,

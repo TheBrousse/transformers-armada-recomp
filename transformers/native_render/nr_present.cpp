@@ -292,6 +292,15 @@ namespace nr
                     im.generation = sp.generation;
                     if (im.texture)
                         std::fprintf(stderr, "[native render] live picture: shared texture %d, %ux%u\n", sp.index, sp.width, sp.height);
+                    else if (sharedShown < 0)
+                    {
+                        // The driver says it can share but no picture can be read (Wine / Proton: GL error 0500 on
+                        // every import, so the window stayed its own pink-purple - a player's report): the CPU
+                        // hand-over for the rest of the session, from the next frame on.
+                        std::fprintf(stderr, "[native render] shared pictures cannot be read by the window: the CPU hand-over from now on\n");
+                        share = -1;
+                        d3d::setSharedPictures(false);
+                    }
                 }
                 if (sp.stamp)
                     std::fprintf(stderr, "[present] window takes stamp %u (texture %d)\n", sp.stamp, sp.index);

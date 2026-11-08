@@ -1,0 +1,30 @@
+Subject: [PATCH] Runtime: a gamepad's View + Menu held together are kept from the game (TODO 208)
+
+View + Menu held together on a GLFW gamepad (an Xbox pad: Windows keeps its guide button) open and close the port's
+overlay. While both are held, until both are let go, the game gets neither Select nor Start, so the shortcut does
+not also pause the game.
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index c892b47..cbbb432 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -746,8 +746,17 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1), PAD_R1);
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2), PAD_L2);
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2), PAD_R2);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT), PAD_START);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT), PAD_SELECT);
++        // View + Menu held together (an Xbox pad's overlay shortcut: the port's menu opens) reach the game as
++        // neither Select nor Start, until both are let go.
++        static bool comboHeld = false;
++        const bool view = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
++        const bool menu = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
++        if (view && menu)
++            comboHeld = true;
++        else if (!view && !menu)
++            comboHeld = false;
++        press(menu && !comboHeld, PAD_START);
++        press(view && !comboHeld, PAD_SELECT);
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB), PAD_L3);
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB), PAD_R3);
+         lx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);

@@ -1,5 +1,17 @@
 # What's new
 
+## 0.3.0
+
+**Fixed**
+- Linux and Steam Deck (Proton): the screen no longer turns pink after the Atari logo. The game now shows its picture
+  under Proton (checked on Linux with GE-Proton). Building the game still needs Windows.
+
+**New**
+- DualSense and DualShock 4: the PS button opens and closes the settings menu (F1). On an Xbox controller, hold View
+  and Menu together.
+- DualSense and DualShock 4: the light bar blinks blue and red while your health is low, and blinks while your Autobot
+  is destroyed. It can be turned off in F1 > Controls ("Light bar warnings").
+
 ## 0.2.9
 
 **New**

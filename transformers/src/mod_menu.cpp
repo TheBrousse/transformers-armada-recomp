@@ -46,6 +46,7 @@
 #include "imgui.h"
 #include "raylib.h"
 #include "rlImGui.h"
+#include "runtime/ps2_sony_pad.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_host_display.h"
 #include "runtime/ps2_host_input.h"
@@ -1150,7 +1151,8 @@ namespace mod_menu
             {"PS2X_MOUSE_SENSITIVITY", "Mouse speed", "How fast the mouse turns the camera."},
             {"TF_MENU_MOUSE", "Mouse in menus", "Point and click in the game's menus."},
             {"PS2X_SONYPAD_RUMBLE", "Vibration", "Controller vibration strength."},
-            {"PS2X_SONYPAD_LIGHTBAR", "Light bar", "The DualSense or DualShock 4 light colour."},
+            {"PS2X_SONYPAD_LIGHTBAR", "Light bar", "The DualSense or DualShock 4 light colour. Your Autobot's: Optimus red, Hot Shot yellow, Red Alert blue."},
+            {"TF_LIGHTBAR_ALERTS", "Light bar warnings", "The light blinks blue and red when your health is low, and blinks your Autobot's colour when he is destroyed."},
             {"PS2X_GAMEPAD_BACKEND", "Controller support", "Others only leaves a Sony pad to Steam Input."},
             {"PS2X_STICK_RESPONSE", "Stick response", "Modern: a light touch walks, a third of the stick runs. Off: as before."},
             {"PS2X_STICK_VEHICLE_MODE", "Car steering", "Original: the car steers as before. Tuned: gentler near the centre."},
@@ -1456,7 +1458,7 @@ namespace mod_menu
             "TF_DRAW_DISTANCE", "TF_SCENERY_DISTANCE", "TF_FOREST_DISTANCE", "TF_FOREST_SPRITES", "TF_GRASS_DISTANCE",
             "TF_TERRAIN_DETAIL", "TF_FOREST_ADAPTIVE", "TF_FOREST_FULL_DETAIL", "TF_ENEMY_DETAIL", "TF_NATIVE_AA", "PS2X_GPU_AA", "PS2X_GPU_MSAA",
             "TF_NATIVE_SSAA", "TF_NATIVE_QUALITY", "TF_SHARP_TEXTURES", "PS2X_TEXTURE_PACK", "PS2X_GPU_ANISOTROPY",
-            "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "PS2X_GAMEPAD_BACKEND",
+            "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "TF_LIGHTBAR_ALERTS", "PS2X_GAMEPAD_BACKEND",
             "PS2X_STICK_RESPONSE", "PS2X_STICK_VEHICLE_MODE", "PS2X_STICK_LEFT_LIFT", "PS2X_STICK_LEFT_SENSITIVITY",
             "PS2X_STICK_RIGHT_LIFT", "PS2X_STICK_VEHICLE_LIFT", "PS2X_STICK_VEHICLE_RESPONSE",
             "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_NATIVE_SOUND", "TF_CFG_showHUD", "TF_START_SCREENS",
@@ -1574,6 +1576,7 @@ namespace mod_menu
             pageHeading("Controller");
             keyRow("PS2X_SONYPAD_RUMBLE");
             keyRow("PS2X_SONYPAD_LIGHTBAR");
+            keyRow("TF_LIGHTBAR_ALERTS");
             keyRow("PS2X_STICK_RESPONSE");
             keyRow("PS2X_STICK_VEHICLE_MODE");
             if (advanced("controls-pad"))
@@ -1810,7 +1813,10 @@ namespace mod_menu
             {
                 char fps[48];
                 std::snprintf(fps, sizeof(fps), "%.0f FPS", ImGui::GetIO().Framerate);
-                const char *keys = "F1  CLOSE     ESC  BACK";
+                ps2x::sonypad::InputState sonyState;
+                const char *keys = ps2x::sonypad::readHostPad(sonyState) ? "F1 / PS  CLOSE     ESC  BACK"
+                                   : IsGamepadAvailable(0)          ? "F1 / VIEW + MENU  CLOSE     ESC  BACK"
+                                                                    : "F1  CLOSE     ESC  BACK";
                 const ImVec2 ke = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, keys);
                 dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - ke.x, pad * 0.8f), colour("dim"), keys);
                 const ImVec2 fe = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, fps);
@@ -1976,6 +1982,24 @@ namespace mod_menu
         const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         if ((ps2_host_input::takeKeyPresses(KEY_F1) % 2) == 1 && !ctrl)
             g_open = !g_open;
+        // (TODO 208) The PlayStation button of a DualSense / DualShock 4 opens and closes it too (the pad read natively,
+        // ps2_sony_pad.h; the game never gets that button), and so do View + Menu held together on another gamepad
+        // (an Xbox pad: Windows keeps its guide button; the game gets neither Select nor Start meanwhile, ps2_pad.cpp).
+        // Only while the game's window has the focus.
+        {
+            static bool shortcutWas = false;
+            ps2x::sonypad::InputState pad;
+            const bool sony = ps2x::sonypad::readHostPad(pad);
+            bool shortcut = sony && (pad.buttons & ps2x::sonypad::kPs) != 0u;
+            if (!sony && ps2x::sonypad::glfwGamepadsAllowed())
+                for (int i = 0; i < 4 && !shortcut; ++i)
+                    shortcut = IsGamepadAvailable(i) && IsGamepadButtonDown(i, GAMEPAD_BUTTON_MIDDLE_LEFT) &&
+                               IsGamepadButtonDown(i, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+            shortcut = shortcut && IsWindowFocused();
+            if (shortcut && !shortcutWas && g_capturing < 0)
+                g_open = !g_open;
+            shortcutWas = shortcut;
+        }
         // One menu: F5's panel no longer opens (its settings are this menu's pages).
         static const bool noPanel = (ps2_settings::setPanelKeyEnabled(false), true);
         (void)noPanel;

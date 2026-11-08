@@ -6,6 +6,7 @@
 #include "cam_trace.h"
 #include "file_trace.h"
 #include "camera_mode.h"
+#include "dualsense.h"
 #include "distance_meter.h"
 #include "hd_movies.h"
 #include "nr_movie.h"
@@ -1397,6 +1398,7 @@ namespace
             uint32_t game = 0u; // (the taGame: there while a level runs)
             std::memcpy(&game, rdram + 0x006CF2B8u, sizeof(game)); // (kGame, below)
             camera_mode::frame(rdram, game != 0u);
+            dualsense::frame(rdram, game != 0u, playerPositionAddress(rdram)); // the pad's light bar (dualsense.h)
             speedrun_timer::frame(rdram, g_liveFmvStreams != 0, runtime->eeScheduler().currentVSyncTick());
             photo_mode::frame(rdram, game != 0u); // (before tuning: the game's speed it sets)
             fast_load::frame(rdram, *runtime, g_executorVtable == 0x006B7360u); // the sound muted while a level loads (fast_load.h)
@@ -7150,6 +7152,7 @@ namespace
     {
         game_config::addSettings(); // the Cheats and Debug tabs (game_config.h)
         controller_settings::add(); // the Controller tab (DualSense / DualShock 4)
+        dualsense::addSettings();   // ... and what the game shows on the pad (dualsense.h)
         ultrawide::addSettings();   // Graphics: the picture's shape (ultrawide.h)
         native_sound::addSettings(); // Sound: the native sound server (native_sound.h)
         fast_load::addSettings();   // Gameplay: fast loading (fast_load.h)

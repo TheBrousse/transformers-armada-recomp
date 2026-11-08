@@ -184,8 +184,8 @@ The game has to be built on a Windows PC first: the setup needs Windows to compi
 
 Tips for the Deck:
 
-- The settings menu opens with **F1**. The Deck has no F1 key: in the game's **Controller settings**, set one of
-  the back buttons (L4, R4, L5 or R5) to the keyboard key **F1**.
+- The settings menu opens with **F1**, or by holding **View** and **Menu** together on the Deck's controls (the
+  Deck's buttons work like an Xbox controller).
 - In **F1 > Graphics**, the **Low** or **Medium** preset suits the Deck best.
 - A native Linux and Steam Deck version is planned; until then the game runs through Proton.
 
