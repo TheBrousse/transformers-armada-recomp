@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 
 #include "nr_shader.h"
 #include <atomic>
@@ -139,12 +140,19 @@ namespace nr
         uint64_t ticket = 0;
         std::shared_ptr<Texture> large;
         bool dropped = false;
+        // (TODO 219) No large image because the HD set has none of this texture YET (being made): asked for again when
+        // the set has grown, not taken for a rejection.
+        bool missing = false;
     };
     std::vector<UpscaledResult> takeUpscaled();
     // A game texture made ahead of its first draw, handed to the uploader at the next frame (nr_d3d.cpp).
     void preUpload(const std::shared_ptr<const Texture> &texture);
     // Whether the remaster has a large image of that name (its index built if not yet).
     bool hasUpscaled(const std::string &name);
+    // (F1 > Graphics, "Open texture folder") The folder the HD images are loaded from (empty: none, TF_HIRES=0).
+    std::filesystem::path hdTextureFolder();
+    // (F1, "Sharp text") Whether the sharp font atlases are there (crisp_fonts	ext_ps5 or the others).
+    bool crispFontsFound();
     // The large images' loading since the last call (cache hits, PNGs decoded, compression time...): a profile line.
     std::string largeImageStats();
 

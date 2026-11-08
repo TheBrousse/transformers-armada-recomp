@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 from PIL import Image, ImageStat
 
@@ -99,7 +100,110 @@ def apply_curve(hd_path, curve, out_path):
         e = curve[c]
         if e != 1.0:
             bands[c] = bands[c].point([min(255, int(255.0 * (v / 255.0) ** e + 0.5)) for v in range(256)])
-    Image.merge(img.mode, bands).save(out_path)
+    # (written whole beside it, then put in place: the game may be reading the set meanwhile - TODO 219)
+    tmp = out_path + ".tmp.png"
+    Image.merge(img.mode, bands).save(tmp)
+    for attempt in range(20):  # (the game reading the old file a moment: Windows refuses the swap meanwhile)
+        try:
+            os.replace(tmp, out_path)
+            break
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.1)
+
+
+def is_matched(rel, path, ledger):
+    """The image is the file the ledger says it became (matched, or checked and left as it was)."""
+    entry = ledger.get(rel)
+    if entry is None:
+        return False
+    st = os.stat(path)
+    return entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns
+
+
+def match_file(rel, path, native, backup, ledger, prefixes=None, threshold=0.05, min_mean=6.0, max_gain=4.0,
+               dry_run=False, note_checked=False):
+    """One HD image matched to the game's texture (the rules above). None: not one of the images treated (another
+    prefix, no game texture). Else (row, group): row None when it could not be measured. The ledger is updated in
+    place (the caller writes it). note_checked: an image left as it is gets a ledger entry too (curve 1, its size
+    and time), so a later full pass with --only-new skips it (upscale_textures.py matches each image as it is made)."""
+    prefixes = prefixes or DEFAULT_PREFIXES
+    if not any(rel.upper().startswith(p.upper()) for p in prefixes):
+        return None
+    nat = os.path.join(native, rel)
+    if not os.path.exists(nat):
+        return None
+    bpath = os.path.join(backup, rel)
+    st = os.stat(path)
+    entry = ledger.get(rel)
+    ours = (entry is not None and entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns) or            (entry is None and os.path.exists(bpath))  # (the backups made before the ledger: the first run's)
+    source = bpath if ours and os.path.exists(bpath) else path
+    parts = rel.split("/")
+    group = parts[3] if rel.upper().startswith("TFA/LEVELS/EPISODES/") and len(parts) > 3 else "/".join(parts[:2])
+    m = measure(source, nat)
+    if m is None:
+        return None, group
+    g, h, opaque, hist = m
+    gains = []
+    for c in range(3):
+        if g[c] < min_mean or h[c] < 1.0:
+            gains.append(1.0)
+        else:
+            gains.append(max(1.0 / max_gain, min(max_gain, g[c] / h[c])))
+    gains = [round(x, 4) for x in gains]
+    lum_g = 0.299 * g[0] + 0.587 * g[1] + 0.114 * g[2]
+    lum_h = 0.299 * h[0] + 0.587 * h[1] + 0.114 * h[2]
+    before = (lum_h / lum_g - 1.0) if lum_g > 0 else 0.0
+    row = {"rel": rel, "game": [round(x, 2) for x in g], "hd": [round(x, 2) for x in h], "opaque": round(opaque, 3),
+           "luma_off": round(before, 4), "gains": gains, "curve": [1.0, 1.0, 1.0], "corrected": False, "written": False}
+    # (Off: the brightness by more than the threshold, or a channel the game uses (mean >= 24) by more than
+    # twice it - a tint. Dark channels alone are noise: 10 against 12 is 20%.)
+    tinted = any(abs(gains[c] - 1.0) > 2.0 * threshold and g[c] >= 24.0 for c in range(3))
+    if abs(before) > threshold or tinted:
+        row["corrected"] = True
+        curve = [1.0 if gains[c] == 1.0 else round(solve_gamma(hist[256 * c:256 * (c + 1)], g[c]), 4) for c in range(3)]
+        row["curve"] = curve
+        same = ours and entry is not None and entry.get("curve") == curve
+        if not same:
+            row["written"] = True
+        if not dry_run and not same:
+            if source == path:  # (a new original: kept before it changes)
+                os.makedirs(os.path.dirname(bpath), exist_ok=True)
+                shutil.copy2(path, bpath)
+            apply_curve(bpath, curve, path)
+            st2 = os.stat(path)
+            ledger[rel] = {"curve": curve, "size": st2.st_size, "mtime_ns": st2.st_mtime_ns}
+        m2 = measure(path, nat) if not dry_run else None
+        if m2:
+            g2, h2, _, _ = m2
+            lum_h2 = 0.299 * h2[0] + 0.587 * h2[1] + 0.114 * h2[2]
+            row["luma_off_after"] = round(lum_h2 / lum_g - 1.0, 4) if lum_g > 0 else 0.0
+    else:
+        if ours and not dry_run and os.path.exists(bpath):  # (corrected once, within the threshold now: the original back)
+            shutil.copy2(bpath, path)
+            ledger.pop(rel, None)
+            st = os.stat(path)
+        if note_checked and not dry_run:
+            ledger[rel] = {"curve": [1.0, 1.0, 1.0], "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    return row, group
+
+
+def load_ledger(backup):
+    path = os.path.join(backup, "colour_gains.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fp:
+            return json.load(fp)
+    return {}
+
+
+def save_ledger(backup, ledger):
+    os.makedirs(backup, exist_ok=True)
+    path = os.path.join(backup, "colour_gains.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fp:
+        json.dump(ledger, fp, indent=0, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def main():
@@ -114,6 +218,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restore", action="store_true", help="put the originals from --backup back")
     ap.add_argument("--report", default=None)
+    ap.add_argument("--only-new", action="store_true",
+                    help="skip the images the ledger already holds as they are (matched as they were made)")
     a = ap.parse_args()
 
     up = os.path.abspath(a.upscaled)
@@ -154,68 +260,23 @@ def main():
                 continue
             path = os.path.join(root, f)
             rel = os.path.relpath(path, up).replace("\\", "/")
-            if not any(rel.upper().startswith(p.upper()) for p in prefixes):
+            if a.only_new and is_matched(rel, path, ledger):
                 continue
-            nat = os.path.join(native, rel)
-            if not os.path.exists(nat):
+            r = match_file(rel, path, native, backup, ledger, prefixes, a.threshold, a.min_mean, a.max_gain, a.dry_run)
+            if r is None:
                 continue
-            bpath = os.path.join(backup, rel)
-            st = os.stat(path)
-            entry = ledger.get(rel)
-            ours = (entry is not None and entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns) or                    (entry is None and os.path.exists(bpath))  # (the backups made before the ledger: the first run's)
-            source = bpath if ours and os.path.exists(bpath) else path
-            m = measure(source, nat)
-            parts = rel.split("/")
-            group = parts[3] if rel.upper().startswith("TFA/LEVELS/EPISODES/") and len(parts) > 3 else "/".join(parts[:2])
+            row, group = r
             gs = per_group.setdefault(group, {"images": 0, "corrected": 0, "written": 0, "before": [], "after": []})
             gs["images"] += 1
-            if m is None:
+            if row is None:
                 continue
-            g, h, opaque, hist = m
-            gains = []
-            for c in range(3):
-                if g[c] < a.min_mean or h[c] < 1.0:
-                    gains.append(1.0)
-                else:
-                    gains.append(max(1.0 / a.max_gain, min(a.max_gain, g[c] / h[c])))
-            gains = [round(x, 4) for x in gains]
-            lum_g = 0.299 * g[0] + 0.587 * g[1] + 0.114 * g[2]
-            lum_h = 0.299 * h[0] + 0.587 * h[1] + 0.114 * h[2]
-            before = (lum_h / lum_g - 1.0) if lum_g > 0 else 0.0
-            row = {"rel": rel, "game": [round(x, 2) for x in g], "hd": [round(x, 2) for x in h], "opaque": round(opaque, 3),
-                   "luma_off": round(before, 4), "gains": gains, "curve": [1.0, 1.0, 1.0], "corrected": False, "written": False}
-            gs["before"].append(before)
-            # (Off: the brightness by more than the threshold, or a channel the game uses (mean >= 24) by more than
-            # twice it - a tint. Dark channels alone are noise: 10 against 12 is 20%.)
-            tinted = any(abs(gains[c] - 1.0) > 2.0 * a.threshold and g[c] >= 24.0 for c in range(3))
-            if abs(before) > a.threshold or tinted:
-                row["corrected"] = True
+            gs["before"].append(row["luma_off"])
+            gs["after"].append(row.get("luma_off_after", row["luma_off"]))
+            if row["corrected"]:
                 gs["corrected"] += 1
-                curve = [1.0 if gains[c] == 1.0 else round(solve_gamma(hist[256 * c:256 * (c + 1)], g[c]), 4) for c in range(3)]
-                row["curve"] = curve
-                same = ours and entry is not None and entry.get("curve") == curve
-                if not same:
-                    row["written"] = True
-                    gs["written"] += 1
-                    written += 1
-                if not a.dry_run and not same:
-                    if source == path:  # (a new original: kept before it changes)
-                        os.makedirs(os.path.dirname(bpath), exist_ok=True)
-                        shutil.copy2(path, bpath)
-                    apply_curve(bpath, curve, path)
-                    st2 = os.stat(path)
-                    ledger[rel] = {"curve": curve, "size": st2.st_size, "mtime_ns": st2.st_mtime_ns}
-                m2 = measure(path, nat) if not a.dry_run else None
-                if m2:
-                    g2, h2, _, _ = m2
-                    lum_h2 = 0.299 * h2[0] + 0.587 * h2[1] + 0.114 * h2[2]
-                    row["luma_off_after"] = round(lum_h2 / lum_g - 1.0, 4) if lum_g > 0 else 0.0
-                    gs["after"].append(row["luma_off_after"])
-            else:
-                if ours and not a.dry_run and os.path.exists(bpath):  # (corrected once, within the threshold now: the original back)
-                    shutil.copy2(bpath, path)
-                    ledger.pop(rel, None)
-                gs["after"].append(before)
+            if row["written"]:
+                gs["written"] += 1
+                written += 1
             rows.append(row)
     if not a.dry_run:
         os.makedirs(backup, exist_ok=True)

@@ -140,7 +140,9 @@ The setup installs everything else for you (Git, Python and the Visual Studio C+
 
 1. **Download** `tfa-setup.exe` with the button above.
 2. **Run it**, pick your disc image and an install folder, then press **Install**.
-   The first build takes about 15 to 25 minutes. Making the HD textures takes longer, and you can skip it.
+   The first build takes about 15 to 25 minutes. Making the HD textures takes longer: pick **Fast** for a quicker
+   set, or skip them. Once they start, **Play now** lets you play while the rest is made: the ones you see first
+   (the menus, the HQ, the first levels) are made first.
 3. **Play.** The setup ends with a Play button. Later, start the game with `Play.bat` in the install folder, or
    straight from `out/build/transformers/RelWithDebInfo/TransformersRecomp.exe` (for example as a non-Steam game in
    Steam).

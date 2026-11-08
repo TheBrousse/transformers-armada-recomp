@@ -15,6 +15,7 @@
 
 #include "port_ext.h"
 #include "hd_movies.h"
+#include "hd_progress.h"
 #include "mod_menu.h"
 #include "nr_install.h"
 #include "menu_mouse.h"
@@ -250,6 +251,9 @@ int main(int argc, char *argv[])
     // The settings panel's choices (settings.ini, F5 while playing) into the environment before
     // anything reads it: a variable already set wins (ps2_settings.h).
     ps2_settings::loadFile();
+    // (TODO 219) An HD set still being made: the sign that the game runs (the upscale waits), the window that carries on
+    // with it when nothing does, and the watcher that tells the renderer and the F1 menu (hd_progress.h).
+    hd_progress::start();
     // (TODO 163) The renderer the settings choose by default: the native one (N1, the port's own - Emulated stays a
     // choice). Set before anything reads TF_RENDERER (the scale below, the native renderer's install, VU1's); a
     // settings.ini line or a variable already set wins.

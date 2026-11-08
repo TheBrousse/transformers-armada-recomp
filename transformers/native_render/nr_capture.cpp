@@ -12,6 +12,7 @@
 // TF_NATIVE_DUMP=1: each saved frame's draws, as text beside the picture (runs\native_<tick>.txt).
 #include "nr_types.h"
 #include "nr_install.h"
+#include "hd_progress.h"
 #include "nr_frame_texture_policy.h"
 #include "view_turn.h"
 #include "nr_shader.h"
@@ -804,6 +805,10 @@ namespace nr
             uint64_t keptAt = 0;
             uint64_t ticket = 0;                // asked for, not back yet
             bool rejected = false;              // no large image passed the checks: not asked for again
+            // (TODO 219) No large image yet - the HD set is still being made: asked for again once it has grown
+            // (hd_progress::generation() past missingGen, the generation when it was asked for).
+            bool missing = false;
+            uint64_t askedGen = 0, missingGen = 0;
             std::string name;
         };
         std::unordered_map<uint64_t, SharedLarge> g_shared;     // by contentKey
@@ -891,12 +896,67 @@ namespace nr
                 e.ticket = s.ticket;
                 return;
             }
+            if (s.missing)
+            {
+                if (s.missingGen == hd_progress::generation())
+                    return; // (TODO 219: not made yet, and the set has not grown since)
+                s.missing = false;
+            }
             if (g_contentLoaded.count(ck))
                 ++g_largeAskedAgain;
             s.name = name;
+            s.askedGen = hd_progress::generation();
             s.ticket = e.ticket = ++g_lastTicket;
             g_ticketContent[s.ticket] = ck;
             requestUpscaled(e.ticket, name, e.texture);
+        }
+
+        // (TODO 219) The textures in use whose HD image was not made yet, asked for again once the set has grown (the
+        // HD set being made while the game runs, hd_progress.h): at most every 10 s, at most 64 contents a time, a
+        // texture drawn in the last 30 s - the rest ask again when next converted (askLarge). Nothing is read or
+        // decoded here: the loaders check the files.
+        void askMissingAgain(uint64_t tick)
+        {
+            static uint64_t lastSweep = 0, lastGen = 0;
+            const uint64_t gen = hd_progress::generation();
+            if (gen == lastGen || tick < lastSweep + 600u)
+                return;
+            lastSweep = tick;
+            lastGen = gen;
+            std::lock_guard<std::recursive_mutex> lock(g_texMutex);
+            unsigned asked = 0;
+            for (auto &kv : g_textures)
+            {
+                TextureEntry &e = kv.second;
+                if (!e.content || e.ticket || !e.texture || e.texture->upscaled || e.lastTick + 1800u < tick)
+                    continue;
+                auto sh = g_shared.find(e.content);
+                if (sh == g_shared.end())
+                    continue;
+                SharedLarge &sl = sh->second;
+                if (sl.ticket)
+                {
+                    e.ticket = sl.ticket; // (asked for already this sweep, for another entry with the same content)
+                    continue;
+                }
+                if (!sl.missing || sl.missingGen == gen || sl.name.empty())
+                    continue;
+                if (asked >= 64u)
+                    break;
+                sl.missing = false;
+                sl.askedGen = gen;
+                sl.ticket = e.ticket = ++g_lastTicket;
+                g_ticketContent[sl.ticket] = e.content;
+                e.askedAt = nowMs();
+                requestUpscaled(e.ticket, sl.name, e.texture);
+                ++asked;
+            }
+            static int told = 6;
+            if (asked && told > 0)
+            {
+                --told;
+                std::fprintf(stderr, "[native render] HD set grown: %u textures asked for their HD image again\n", asked);
+            }
         }
 
         // Large images over the video memory's budget (d3d::largeImageBudget, TODO 94): the ones drawn least
@@ -1136,7 +1196,12 @@ namespace nr
                 {
                     // No large image (rejected: not asked for again), or the asking entry's game texture let go of
                     // before its turn - asked for again with a waiting one's.
-                    if (s && !r.dropped)
+                    if (s && r.missing)
+                    {
+                        s->missing = true; // (TODO 219: its HD image not made yet - asked for again when the set grows)
+                        s->missingGen = s->askedGen;
+                    }
+                    else if (s && !r.dropped)
                         s->rejected = true;
                     for (auto &e : g_textures)
                         if (e.second.ticket == r.ticket)
@@ -4399,6 +4464,7 @@ namespace nr
             }
             evictTextures(g_textureTick);
             evictLarge(g_textureTick);
+            askMissingAgain(g_textureTick);
             reportLargeWaits();
             prefetchBlockTextures(rdram);
             {

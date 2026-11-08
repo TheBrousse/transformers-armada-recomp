@@ -1,5 +1,20 @@
 # What's new
 
+## 0.3.4
+
+**New**
+- You can play while the HD textures are being made: the setup has a "Play now" button during that step. The
+  textures you see first (menus, the HQ, your Autobots, the first levels) are made first, and new ones appear in the
+  game while you play. Making them pauses while the game runs and carries on when you close it, unless you tick
+  "Keep making HD textures while I play".
+- A "Fast" choice for the HD textures: about 9 minutes instead of about an hour on a GTX 1080, a little less sharp
+  on the ground. The setup suggests Fast or Best for your graphics card.
+- If the game is started before the HD textures are finished, a small window finishes them in the background.
+- F1 > Graphics: "Open texture folder", and "Make HD textures" for anyone who skipped them. F1 shows how many are made.
+
+**Fixed**
+- "Sharp text" now says so when its fonts have not been made yet, instead of quietly showing the old text.
+
 ## 0.3.3
 
 **Fixed**

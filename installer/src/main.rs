@@ -96,6 +96,10 @@ struct App {
     prototype: String,
     folder: String,
     hd: bool,
+    hd_fast: bool,          // (TODO 219) HD textures: Fast (2K characters, one pass) instead of Best
+    hd_while_playing: bool, // keep making them while the game runs
+    gpu: Option<(String, u64)>, // the graphics card the suggestion is for (name, video memory)
+    hd_playable: bool,      // the HD step has got to the upscale: the game can be played meanwhile
     phase: Phase,
     steps: Vec<Step>,
     progress: f32,
@@ -132,6 +136,10 @@ impl App {
             prototype: String::new(),
             folder: format!("{home}\\Games\\TFA"), // (short: Windows' path limit, see exec)
             hd: true,
+            hd_fast: false,
+            hd_while_playing: false,
+            gpu: None,
+            hd_playable: false,
             phase: Phase::Form,
             steps: make_steps(MODS),
             progress: 0.0,
@@ -148,6 +156,26 @@ impl App {
             shot: None,
             shot_state: Arc::new(Mutex::new(0)),
             settled_at: None,
+        }
+    }
+
+    /// The graphics card found, and Fast suggested for it when Best would take long (suggest_fast).
+    fn detect_gpu(&mut self) {
+        let cards = winapi::graphics_cards();
+        let best = cards.into_iter().filter(|(n, _)| !n.to_ascii_lowercase().contains("basic")).max_by_key(|(_, v)| *v);
+        if let Some((name, vram)) = best {
+            self.hd_fast = suggest_fast(&name, vram);
+            self.gpu = Some((name, vram));
+        }
+    }
+
+    /// The HD choices an install made before (hd_textures\hd_options.json), shown again in the form.
+    fn load_hd_options(&mut self) {
+        let file = game_folder(&self.repo()).join("hd_textures").join("hd_options.json");
+        if let Ok(text) = std::fs::read_to_string(file) {
+            let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            self.hd_fast = t.contains("\"quality\":\"fast\"");
+            self.hd_while_playing = t.contains("\"while_playing\":true");
         }
     }
 
@@ -201,6 +229,7 @@ impl App {
         self.phase = Phase::Running;
         self.kept.clear();
         self.progress = 0.0;
+        self.hd_playable = false;
         if !self.hd && !self.update {
             self.steps[STEP_HD].status = Status::Skipped;
             self.steps[STEP_HD].detail = "skipped: the game shows its original textures".into();
@@ -215,6 +244,8 @@ impl App {
             prototype: self.prototype.clone(),
             folder: PathBuf::from(&self.folder),
             hd: self.hd,
+            hd_fast: self.hd_fast,
+            hd_while_playing: self.hd_while_playing,
             child: self.child.clone(),
             update: self.update,
             play: self.play,
@@ -256,6 +287,10 @@ impl App {
                     }
                 }
                 Msg::Detail(i, line) if i < self.steps.len() => {
+                    // (TODO 219: from the upscale on, the game can be played while the rest is made)
+                    if i == STEP_HD && (line.starts_with("Upscaling") || line.starts_with("HD textures:") || line.starts_with("paused while")) {
+                        self.hd_playable = true;
+                    }
                     if self.steps[i].status != Status::Skipped {
                         self.steps[i].detail = line;
                     }
@@ -341,6 +376,8 @@ struct Job {
     prototype: String,
     folder: PathBuf,
     hd: bool,
+    hd_fast: bool,
+    hd_while_playing: bool,
     child: Arc<Mutex<Option<Arc<winapi::ProcessTree>>>>, // the running step's process tree (Cancel ends it)
     update: bool,
     play: bool,
@@ -433,6 +470,9 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
         }
         if !self.hd {
             args.push("-SkipHdTextures".into());
+        } else {
+            args.extend(["-HdQuality".into(), if self.hd_fast { "fast" } else { "best" }.into()]);
+            args.extend(["-HdWhilePlaying".into(), if self.hd_while_playing { "on" } else { "off" }.into()]);
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let _ = tx.send(Msg::Step(STEP_TOOLS));
@@ -540,6 +580,11 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
                                     let _ = tx.send(Msg::Progress(p));
                                 }
                             }
+                            if *cur == STEP_HD {
+                                if let Some(p) = hd_progress(&text) {
+                                    let _ = tx.send(Msg::Progress(p));
+                                }
+                            }
                             let short: String = text.chars().take(110).collect();
                             let _ = tx.send(Msg::Detail(*cur, short));
                         }
@@ -634,6 +679,58 @@ fn compile_progress(text: &str) -> Option<f32> {
 
 /// The mark a setup run keeps in the install folder until it has finished every step.
 const UNFINISHED_MARK: &str = ".setup_unfinished";
+
+/// make_hd_textures.ps1's "HD textures: 640 of 1900 made, about 25 min left" (TODO 219): the bar moves
+/// through the upscale, from where "upscaling" put it (0.72) to 0.97.
+fn hd_progress(text: &str) -> Option<f32> {
+    let rest = text.strip_prefix("HD textures: ")?;
+    let mut words = rest.split_whitespace();
+    let done: f32 = words.next()?.parse().ok()?;
+    if words.next()? != "of" {
+        return None;
+    }
+    let total: f32 = words.next()?.trim_end_matches(',').parse().ok()?;
+    if total <= 0.0 {
+        return None;
+    }
+    Some(0.72 + 0.25 * (done / total).clamp(0.0, 1.0))
+}
+
+/// Fast suggested for a graphics card on which Best would take a long time (TODO 219: the times measured are in
+/// docs/TODO.md, item 219). Best for the newer and bigger cards; Fast for the older and smaller ones, and for a
+/// card it does not know.
+fn suggest_fast(name: &str, vram: u64) -> bool {
+    let n = name.to_ascii_lowercase();
+    let gb = vram as f64 / (1u64 << 30) as f64;
+    if vram > 0 && gb < 5.5 {
+        return true;
+    }
+    let model = |after: &str| -> Option<u32> {
+        let at = n.find(after)? + after.len();
+        let d: String = n[at..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        d.parse().ok()
+    };
+    if n.contains("nvidia") || n.contains("geforce") {
+        // RTX 30, 40 and 50 series: the 60 cards and up; RTX 20 series: the 70 and up; GTX and older: Fast.
+        return match model("rtx") {
+            Some(m) if m >= 3000 => m % 1000 < 60,
+            Some(m) if m >= 2000 => m % 1000 < 70,
+            _ => true,
+        };
+    }
+    if n.contains("amd") || n.contains("radeon") {
+        // Radeon RX 7000 and 9000: Best; RX 6000: the 6700 and up.
+        return match model("rx") {
+            Some(m) if m >= 7000 => false,
+            Some(m) if m >= 6000 => m % 1000 < 700,
+            _ => true,
+        };
+    }
+    if n.contains("arc") {
+        return !(n.contains("a770") || n.contains("a750") || n.contains(" b5") || n.contains(" b7"));
+    }
+    true
+}
 
 /// Where the install finished last, so a setup started from somewhere else (a launcher's own copy, Quiver) finds it.
 fn remembered_folder_file() -> Option<PathBuf> {
@@ -1083,7 +1180,7 @@ impl eframe::App for App {
         }
         if let Some(path) = self.shot.clone() {
             // (tests: the window's picture, a second after the check answered or the update ended)
-            let settled = (self.phase == Phase::Installed && self.check.done) || matches!(self.phase, Phase::Done(_));
+            let settled = (self.phase == Phase::Installed && self.check.done) || matches!(self.phase, Phase::Done(_) | Phase::Form);
             if settled && self.settled_at.is_none() {
                 self.settled_at = Some(Instant::now());
             }
@@ -1233,7 +1330,24 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.checkbox(&mut self.hd, "HD textures (recommended; tens of minutes to a few hours on your graphics card)");
+        ui.checkbox(&mut self.hd, "HD textures (recommended; made on your graphics card, you can play meanwhile)");
+        if self.hd {
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.radio_value(&mut self.hd_fast, false, "Best").on_hover_text("4K characters, 2K levels: the sharpest, takes longest");
+                ui.radio_value(&mut self.hd_fast, true, "Fast")
+                    .on_hover_text("One upscale pass: characters up to 2K, levels up to 1K. About ten times quicker, still much sharper than the original");
+                if let Some((name, vram)) = &self.gpu {
+                    let pick = if suggest_fast(name, *vram) { "Fast" } else { "Best" };
+                    ui.label(RichText::new(format!("suggested for your {name}: {pick}")).color(DIM).small());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.checkbox(&mut self.hd_while_playing, "Keep making HD textures while I play").on_hover_text(
+                    "Off: they wait while the game runs and carry on when you close it. On: they carry on, and the game runs a little slower meanwhile.");
+            });
+        }
         ui.add_space(6.0);
         ui.label(RichText::new("Missing tools (Git, Python, Visual Studio Build Tools) are installed with winget; Windows may ask for permission.").color(DIM).small());
 
@@ -1296,9 +1410,23 @@ impl App {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| match self.phase {
             Phase::Running => {
-                if ui.add_sized([150.0, 40.0], egui::Button::new("Cancel")).clicked() {
-                    self.cancel();
-                }
+                ui.horizontal(|ui| {
+                    if ui.add_sized([150.0, 40.0], egui::Button::new("Cancel")).clicked() {
+                        self.cancel();
+                    }
+                    // (TODO 219) The game while the HD textures are made: it takes each one as it is ready, and the
+                    // upscale waits while the game runs (unless "Keep making HD textures while I play" is on).
+                    if !self.update && self.hd_playable && self.steps[STEP_HD].status == Status::Active {
+                        let tip = if self.hd_while_playing {
+                            "The HD textures carry on while you play; each one shows up as it is ready."
+                        } else {
+                            "The HD textures wait while you play and carry on when you close the game. The ones made so far are used."
+                        };
+                        if ui.add_sized([150.0, 40.0], egui::Button::new(RichText::new("Play now").size(16.0)).fill(ACCENT)).on_hover_text(tip).clicked() {
+                            play(&self.repo());
+                        }
+                    }
+                });
             }
             Phase::Done(ok) => {
                 ui.horizontal(|ui| {
@@ -1349,6 +1477,7 @@ fn main() -> eframe::Result {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let repo_arg = all.iter().position(|a| a == "--repo").and_then(|i| all.get(i + 1).cloned());
     app.set_flavour(repo_arg, all.iter().any(|a| a == "--mods"));
+    app.detect_gpu();
     // (the copy a setup leaves in the install folder opens on that folder; a copy elsewhere - a launcher's
     // own, Quiver - on the folder the last install finished in)
     let mut found = false;
@@ -1365,6 +1494,7 @@ fn main() -> eframe::Result {
             }
         }
     }
+    app.load_hd_options();
     // Started with nothing on its command line on a finished install (a launcher's Play button, a shortcut to
     // the setup): the game starts, no setup window. Shift held while starting, or --setup: the setup's window.
     if all.is_empty() && app.installed() && game_exe(&app.repo()).exists() && !Path::new(&app.folder).join(UNFINISHED_MARK).exists()

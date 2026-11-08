@@ -94,8 +94,73 @@ def tier_for(relpath):
     raise ValueError(f"no tier rule matches: {relpath}")
 
 
-def settings_hash():
+def settings_hash(quality="best"):
     """Short hash of the effective config; stamped into every manifest
-    record so config changes invalidate previously-upscaled files."""
-    blob = repr((RULES, sorted(TIERS.items()), ALPHA_MODE)).encode()
+    record so config changes invalidate previously-upscaled files.
+    (The "best" hash is computed exactly as before the Fast choice existed,
+    so a set made before it is not made again.)"""
+    blob = repr((RULES, sorted(tiers_for(quality).items()), ALPHA_MODE)).encode()
     return hashlib.sha1(blob).hexdigest()[:12]
+
+
+# ---- The quality choice ("HD textures: Best / Fast" in the setup) ----
+# Fast: one 4x pass everywhere, never a second (the second pass runs on an
+# image 16 times the size: 85% of Best's time on a GTX 1080). The same network
+# as Best: the lighter realesr-animevideov3 saved nothing measurable (the first
+# pass is seconds) and smeared the level textures (TODO 219).
+FAST_TIERS = {
+    "hero":    {"target_long": 2048, "model": "realesrgan-x4plus", "passes_cap": 1,
+                "small_max": 32, "small_model": "realesr-animevideov3"},
+    "env":     {"target_long": 1024, "model": "realesrgan-x4plus", "passes_cap": 1,
+                "small_max": 32, "small_model": "realesr-animevideov3"},
+    "props":   {"target_long": 1024, "model": "realesrgan-x4plus", "passes_cap": 1,
+                "small_max": 32, "small_model": "realesr-animevideov3"},
+    "ui":      {"target_long": 1024, "model": "realesrgan-x4plus", "passes_cap": 1,
+                "small_max": 32, "small_model": "pil-lanczos"},
+    "ui_font": {"target_long": 1024, "model": "realesrgan-x4plus", "passes_cap": 1},
+}
+QUALITIES = ("best", "fast")
+
+
+def tiers_for(quality="best"):
+    if quality == "fast":
+        return FAST_TIERS
+    if quality != "best":
+        raise ValueError(f"unknown quality: {quality}")
+    return TIERS
+
+
+# ---- The order the textures are made in ----
+# The textures a player sees first, first: so that after a few minutes the
+# start of the game looks HD while the rest is still being made. Lower = sooner.
+# The levels in story order (the folder names sort that way: 01_..08_, and
+# 04_AIRCRAFTCARRIERDEFEATED right after 04_AIRCRAFTCARRIER).
+PRIORITY_RULES = [
+    (0, "prefix", "TFA2/FONTS/"),
+    (1, "contains", "/USERINTERFACE/TEXTURES/BACKGROUND/"),
+    (9, "contains", "/USERINTERFACE/TEXTURES/EXTRAS/"),
+    (9, "prefix", "TA_XTRAS/"),
+    (2, "contains", "/USERINTERFACE/TEXTURES/INGAME/"),
+    (2, "prefix", "TFA2/HUD/"),
+    (1, "contains", "/USERINTERFACE/"),
+    (1, "prefix", "TFA/ANIMATION/TRANSFORMERS/UI/"),
+    (3, "prefix", "TFA/ANIMATION/TRANSFORMERS/GAME/"),
+    (3, "prefix", "TFA2/ANIMATION/MISCELLANEOUS/MINICONS/"),
+    (4, "prefix", "TFA/LEVELS/EPISODES/01_"),
+    (5, "prefix", "TFA/ANIMATION/"),
+    (5, "prefix", "TFA2/"),
+    (5, "prefix", "TFA/PICKUPS/"),
+    (6, "prefix", "TFA/LEVELS/EPISODES/"),
+]
+
+
+def priority_for(relpath):
+    """(rank, sub-key) for a texture: the order make_hd_textures works in."""
+    r = relpath.replace("\\", "/").upper()
+    probe = "/" + r
+    for rank, kind, pat in PRIORITY_RULES:
+        if (kind == "prefix" and r.startswith(pat)) or (kind == "contains" and pat in probe):
+            if rank == 6:  # the levels after the first: in story order
+                return (6, r.split("/")[3] if r.count("/") > 3 else r)
+            return (rank, "")
+    return (8, "")

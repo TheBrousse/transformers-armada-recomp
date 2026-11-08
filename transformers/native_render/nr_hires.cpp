@@ -152,22 +152,28 @@ namespace nr
             return {};
         }
 
+        // Where the set is: TF_HIRES_DIR; else hd_textures\upscaled in the folder the game starts in
+        // (what tools\make_hd_textures.ps1 makes from your disc), or in the exe's folder or one above it
+        // (TODO 186: a start from another folder); only then the remaster's folder on the developer's PC.
+        fs::path resolveUpscaled()
+        {
+            const char *dir = std::getenv("TF_HIRES_DIR");
+            if (dir && *dir)
+                return fs::path(dir);
+            if (const fs::path found = installedTree(); !found.empty())
+                return found;
+            if (!devTree().empty())
+                return devTree() / "upscaled";
+            return {};
+        }
+
         void build()
         {
             g.ready = true;
             if (const char *off = std::getenv("TF_HIRES"); off && *off == '0')
                 return;
-            // Where the set is: TF_HIRES_DIR; else hd_textures\upscaled in the folder the game starts in
-            // (what tools\make_hd_textures.ps1 makes from your disc), or in the exe's folder or one above it
-            // (TODO 186: a start from another folder); only then the remaster's folder on the developer's PC.
             std::error_code ec;
-            const char *dir = std::getenv("TF_HIRES_DIR");
-            if (dir && *dir)
-                g.upscaled = fs::path(dir);
-            else if (const fs::path found = installedTree(); !found.empty())
-                g.upscaled = found;
-            else if (!devTree().empty())
-                g.upscaled = devTree() / "upscaled";
+            g.upscaled = resolveUpscaled();
             g.native = g.upscaled.empty() ? fs::path() : g.upscaled.parent_path() / "converted" / "textures";
             chooseCrisp();
             if (!fs::is_directory(g.upscaled, ec) || !fs::is_directory(g.native, ec))
@@ -603,9 +609,29 @@ namespace nr
 
         // The large image for the game's texture (name, texels): chosen, checked, compressed, capped, its
         // game levels spliced in. False: none (the game's own is drawn).
-        bool loadLarge(const std::string &name, const Texture &game, Texture &out, const std::string *forceSet = nullptr)
+        bool loadLarge(const std::string &name, const Texture &game, Texture &out, const std::string *forceSet = nullptr,
+                       bool *missing = nullptr)
         {
             const auto t0 = std::chrono::steady_clock::now();
+            // (TODO 219) None of the name's images made yet (the set is still being made, hd_progress.h): told as such
+            // at once - a few file checks, no image decoded - so that it is asked for again once the set has grown.
+            if (missing && !forceSet && !g.fontsOnly && g.enabled)
+                if (auto it = g.byStem.find(upper(name)); it != g.byStem.end())
+                {
+                    std::error_code mec;
+                    bool any = false;
+                    for (const std::string &rel : it->second)
+                        if (fs::exists(g.upscaled / (rel + ".png"), mec) || !crispImage(rel, g.crispSet).empty())
+                        {
+                            any = true;
+                            break;
+                        }
+                    if (!any)
+                    {
+                        *missing = true;
+                        return false;
+                    }
+                }
             const std::string *chosen = chooseCandidate(name, game);
             if (!chosen)
                 return false;
@@ -621,7 +647,11 @@ namespace nr
             std::error_code ec;
             const uint64_t srcSize = fs::file_size(png, ec);
             if (ec)
+            {
+                if (missing && !forceSet)
+                    *missing = true; // (TODO 219: its image not made yet)
                 return false;
+            }
             const uint64_t srcTime = static_cast<uint64_t>(fs::last_write_time(png, ec).time_since_epoch().count());
             const uint32_t cap = d3d::largeImageCap();
             const fs::path root = bcOn() ? cacheRoot() : fs::path();
@@ -813,7 +843,8 @@ namespace nr
                 else
                 {
                     auto large = std::make_shared<Texture>();
-                    if (loadLarge(r.name, *game, *large))
+                    bool missing = false;
+                    if (loadLarge(r.name, *game, *large, nullptr, &missing))
                     {
                         large->fallback = game; // (drawn until the large one is on the GPU)
                         if (large->keys)
@@ -822,6 +853,8 @@ namespace nr
                             std::const_pointer_cast<Texture>(large->xbox)->fallback = game;
                         done.large = std::move(large);
                     }
+                    else
+                        done.missing = missing;
                 }
                 {
                     const auto end = std::chrono::steady_clock::now();
@@ -922,6 +955,42 @@ namespace nr
         if (!g.ready)
             build();
         return g.enabled && g.byStem.find(upper(name)) != g.byStem.end();
+    }
+
+    // (The F1 menu's "Open texture folder") The folder the HD images are loaded from: the one in use once the index is
+    // made, else where it would be looked for (no scan here). Empty with TF_HIRES=0 or none anywhere.
+    std::filesystem::path hdTextureFolder()
+    {
+        if (const char *off = std::getenv("TF_HIRES"); off && *off == '0')
+            return {};
+        {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            if (g.ready)
+                return g.upscaled;
+        }
+        return resolveUpscaled();
+    }
+
+    // (F1, "Sharp text") Whether the sharp font atlases exist where the game looks for them (TF_CRISP_DIR, else
+    // crisp_fonts beside the HD set; the developer's tree last, as chooseCrisp). False: the old letters are drawn.
+    bool crispFontsFound()
+    {
+        std::error_code ec;
+        std::vector<fs::path> dirs;
+        if (const char *dir = std::getenv("TF_CRISP_DIR"); dir && *dir)
+            dirs.push_back(fs::path(dir));
+        else
+        {
+            if (const fs::path up = resolveUpscaled(); !up.empty())
+                dirs.push_back(up.parent_path() / "crisp_fonts");
+            if (!devTree().empty())
+                dirs.push_back(devTree() / "crisp_fonts");
+        }
+        for (const fs::path &d : dirs)
+            for (const char *set : {"text_ps5", "text_ps2", "ps5"})
+                if (fs::is_directory(d / set, ec))
+                    return true;
+        return false;
     }
 
     std::vector<UpscaledResult> takeUpscaled()

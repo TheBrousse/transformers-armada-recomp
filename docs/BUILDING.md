@@ -44,7 +44,14 @@ for changes to the runtime or the port's code only (under a minute).
 
 This makes every texture of the game again at a higher resolution on your graphics card (with Real-ESRGAN, on
 Vulkan), and redraws the fonts and button prompts sharp. It writes into `hd_textures\`, where the game finds them.
-It takes from tens of minutes to a few hours. `-FontsOnly` makes only the fonts and prompts, in a few minutes.
+It takes from tens of minutes to a few hours. `-Quality fast` makes a quicker set: one upscale pass (characters up to 2K, levels up to 1K), about ten times quicker.
+`-FontsOnly` makes only the fonts and prompts, in a few minutes.
+
+You can play while they are made: the ones seen first (the menus, the HQ, the characters, the first levels) come
+first, and the game uses each one as soon as it is ready. While the game runs the upscale waits (the two share the
+graphics card) and carries on when you close it; `"while_playing": true` in `hd_textures\hd_options.json` keeps it
+going. If you close the window before it is done, the game carries on with it the next time it starts, in a small
+window of its own (F1 shows how far it is).
 
 ## Play
 

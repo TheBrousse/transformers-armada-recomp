@@ -189,3 +189,43 @@ pub fn open_folder(folder: &Path) {
         ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
     }
 }
+
+/// A value of any type as its raw bytes, or None.
+fn registry_bytes(root: isize, key: &str, value: &str) -> Option<Vec<u8>> {
+    const RRF_RT_ANY: u32 = 0x0000_ffff;
+    let (key, value) = (wide(key), wide(value));
+    let mut size = 0u32;
+    unsafe {
+        if RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_ANY, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) != 0 || size == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size as usize];
+        if RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_ANY, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) != 0 {
+            return None;
+        }
+        buffer.truncate(size as usize);
+        Some(buffer)
+    }
+}
+
+/// The graphics cards Windows knows of: (name, video memory in bytes; 0 when it does not say). From the
+/// display adapters' driver keys: the 64-bit size where the driver writes one (the 32-bit one stops at 4 GB).
+pub fn graphics_cards() -> Vec<(String, u64)> {
+    let class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let mut cards = Vec::new();
+    for i in 0..16 {
+        let key = format!(r"{class}\{i:04}");
+        let Some(name) = registry_string(HKEY_LOCAL_MACHINE, &key, "DriverDesc") else { continue };
+        let size = |b: Vec<u8>| -> u64 {
+            let mut v = [0u8; 8];
+            let n = b.len().min(8);
+            v[..n].copy_from_slice(&b[..n]);
+            u64::from_le_bytes(v)
+        };
+        let vram = registry_bytes(HKEY_LOCAL_MACHINE, &key, "HardwareInformation.qwMemorySize").map(size)
+            .or_else(|| registry_bytes(HKEY_LOCAL_MACHINE, &key, "HardwareInformation.MemorySize").map(size))
+            .unwrap_or(0);
+        cards.push((name, vram));
+    }
+    cards
+}

@@ -3,6 +3,7 @@
 #include "mod_menu.h"
 
 #include "camera_mode.h"
+#include "hd_progress.h"
 #include "photo_mode.h"
 #include "menu_style.h"
 #include "menu_mouse.h"
@@ -1517,6 +1518,11 @@ namespace mod_menu
             advancedEnd();
             pageHeading("Interface");
             keyRow("TF_CRISP_TEXT");
+            // (Sharp text on, but its fonts never made - the HD textures step skipped or stopped before them: said
+            // plainly, not the old letters in silence.)
+            if (!g_list)
+                if (const SettingRow *crisp = rowFor("TF_CRISP_TEXT"); crisp && crisp->available && valueOf(*crisp) != "0" && !hd_progress::crispFontsFound())
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Sharp text: not made yet - the HD textures step makes them");
             mergedRow("prompts", "Button prompts",
                       "Which buttons the game shows in its hints. Match device: your keys, or your controller's buttons.",
                       buttonPrompts(), false);
@@ -1569,6 +1575,36 @@ namespace mod_menu
                 keyRow("TF_SHARP_TEXTURES");
                 keyRow("PS2X_TEXTURE_PACK");
                 keyRow("PS2X_GPU_ANISOTROPY");
+                // (The folder the HD textures are loaded from, in Explorer: hd_progress.h)
+                if (!g_list)
+                {
+                    static std::string note;
+                    static double noteAt = -100.0;
+                    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                    if (menu_style::button("Open texture folder"))
+                    {
+                        note = hd_progress::openTextureFolder();
+                        noteAt = ImGui::GetTime();
+                    }
+                    // (TODO 219) The HD step for a player who skipped it or never finished it, in its own small window.
+                    static std::string makeLabel;
+                    static double labelAt = -100.0;
+                    if (ImGui::GetTime() - labelAt > 2.0)
+                    {
+                        makeLabel = hd_progress::makeLabel();
+                        labelAt = ImGui::GetTime();
+                    }
+                    ImGui::SameLine();
+                    if (menu_style::button(makeLabel.c_str()))
+                    {
+                        note = hd_progress::makeHdTextures();
+                        noteAt = ImGui::GetTime();
+                    }
+                    if (!note.empty() && ImGui::GetTime() - noteAt < 10.0)
+                        ImGui::TextDisabled("%s", note.c_str());
+                }
+                else
+                    listItem("Open texture folder, Make HD textures (buttons)");
             }
             advancedEnd();
             settingRows(Page::Graphics);
@@ -2066,11 +2102,19 @@ namespace mod_menu
                 dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - ke.x, pad * 0.8f), colour("dim"), keys);
                 const ImVec2 fe = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, fps);
                 dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - fe.x, pad * 0.8f + ke.y + 6.0f), colour("dim"), fps);
+                float lineY = pad * 0.8f + ke.y + fe.y + 12.0f;
                 if (updates::updateAvailable()) // (TODO 104: a newer version - the About page)
                 {
                     const char *update = "UPDATE AVAILABLE - ABOUT";
                     const ImVec2 ue = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, update);
-                    dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - ue.x, pad * 0.8f + ke.y + fe.y + 12.0f), colour("amber"), update);
+                    dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - ue.x, lineY), colour("amber"), update);
+                    lineY += ue.y + 6.0f;
+                }
+                // (TODO 219) The HD textures still being made: how far they are.
+                if (const std::string hd = hd_progress::line(); !hd.empty())
+                {
+                    const ImVec2 he = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, hd.c_str());
+                    dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - he.x, lineY), colour("blue"), hd.c_str());
                 }
             }
             const float headerBottom = pad * 0.6f + titleExtent.y + size * 1.3f;

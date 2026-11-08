@@ -35,13 +35,70 @@
 .EXAMPLE
     .\tools\make_hd_textures.ps1 -FontsOnly      # font assets only, no GPU or downloads
 #>
-param([switch]$SkipUpscale, [switch]$CrispFontsOnly, [switch]$FontsOnly, [string]$Python = "python")
+param([switch]$SkipUpscale, [switch]$CrispFontsOnly, [switch]$FontsOnly, [string]$Python = "python",
+      [ValidateSet("", "best", "fast")][string]$Quality = "",
+      [switch]$Resume)
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 $Game = Join-Path $Root "game"
 $Out = Join-Path $Root "hd_textures"
 $Py = Join-Path $PSScriptRoot "hd_textures"
+
+# (TODO 219) Started by the game (-Resume): an HD set left unfinished is carried on in a small window of its own,
+# which waits while the game runs and works once it closes. Python is looked for as the setup does.
+if ($Resume) {
+    try { $Host.UI.RawUI.WindowTitle = "Making the HD textures (you can close this; it carries on next time)" } catch {}
+    . (Join-Path $PSScriptRoot "setup_common.ps1")
+    if ($Python -eq "python") { $found = Find-Python; if ($found) { $Python = $found } }
+    Write-Host "Making the rest of the HD textures. It waits while the game runs and carries on when you close it."
+    Write-Host "You can close this window at any time: it carries on the next time you start the game."
+}
+# (in that window a stop is shown for a minute before it closes; otherwise an error ends the script as always)
+trap {
+    if ($Resume) {
+        Write-Host "`nMaking the HD textures stopped: $_" -ForegroundColor Red
+        Write-Host "It is tried again the next time you start the game. This window closes in a minute."
+        Start-Sleep -Seconds 60
+    }
+    break
+}
+
+# (TODO 219) The choices (the setup writes them): Best or Fast, and whether to keep making them while the game runs.
+$OptionsFile = Join-Path $Out "hd_options.json"
+$StatusFile = Join-Path $Out "upscale_status.json"
+if (-not $Quality) {
+    $Quality = "best"
+    if (Test-Path $OptionsFile) {
+        try { $o = Get-Content $OptionsFile -Raw | ConvertFrom-Json; if ($o.quality -eq "fast") { $Quality = "fast" } } catch {}
+    }
+}
+function SetStatus([string]$State) {
+    # (the upscaler keeps the counts in it; this marks the whole set's state: "done" once everything is made)
+    $st = [ordered]@{ state = $State; done = 0; total = 0; quality = $Quality }
+    if (Test-Path $StatusFile) {
+        try { $old = Get-Content $StatusFile -Raw | ConvertFrom-Json; $st.done = $old.done; $st.total = $old.total } catch {}
+    }
+    $st.updated = (Get-Date).ToUniversalTime().ToString("s")
+    [System.IO.File]::WriteAllText($StatusFile, ($st | ConvertTo-Json))  # (UTF-8 without a BOM: the game reads it)
+}
+# One maker at a time: the setup's, Play.bat's or the game's. hd_textures\.upscaling holds its process id while it runs;
+# Windows deletes the file when it ends (a closed window too).
+$script:WorkerLock = $null
+function TakeWorkerLock {
+    $path = Join-Path $Out ".upscaling"
+    New-Item -ItemType Directory -Force $Out | Out-Null
+    for ($i = 0; $i -lt 2; $i++) {
+        try {
+            $script:WorkerLock = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write,
+                ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete), 4096, [System.IO.FileOptions]::DeleteOnClose)
+            $b = [System.Text.Encoding]::ASCII.GetBytes("$PID")
+            $script:WorkerLock.Write($b, 0, $b.Length); $script:WorkerLock.Flush()
+            return $true
+        } catch { Start-Sleep -Milliseconds 300 }
+    }
+    return $false
+}
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Run([string]$Exe, [string[]]$Arguments) {
@@ -74,6 +131,12 @@ if ($FontsOnly) {
     return
 }
 
+if (-not $CrispFontsOnly -and -not (TakeWorkerLock)) {
+    if ($Resume) { Write-Host "The HD textures are being made already (another window)."; return }
+    # (the setup or an update while the game's own window makes them: it waits for that one, then carries on)
+    Write-Host "The HD textures are being made in another window: waiting for it (close it to carry on here)."
+    while (-not (TakeWorkerLock)) { Start-Sleep -Seconds 5 }
+}
 $zips = "TFA", "TFA2", "TA_XTRAS", "SOUNDE" | ForEach-Object { Join-Path $Game "$_.ZIP" }
 foreach ($z in $zips) { if (-not (Test-Path $z)) { throw "$z not found: run build.ps1 -Iso <your disc> first" } }
 & $Python -c "import PIL" 2>$null
@@ -118,6 +181,10 @@ function CrispFonts {
 if ($CrispFontsOnly) { CrispFonts; return }
 if ($SkipUpscale) { CrispFonts; return }
 
+# (TODO 219) The sharp fonts first, when there are none yet: a minute, and the game started while the rest is made
+# (the setup's "Play now", Play.bat) has sharp menus from the start. Made again at the end, with the upscaled set.
+if (-not (Test-Path (Join-Path $Out "crisp_fonts\manifest.json"))) { CrispFonts }
+
 $esr = Join-Path $Out "realesrgan"
 $exe = Join-Path $esr "realesrgan-ncnn-vulkan.exe"
 if (-not (Test-Path $exe)) {
@@ -135,8 +202,10 @@ Step "Upscaling into $(Join-Path $Out 'upscaled') (resumable)"
 # an upscale, and a run again tries only those. (Exit 1 with its "upscaled N/M" summary = some files
 # failed; anything else - no summary, exit 2 - is a real failure.)
 $ErrorActionPreference = "Continue"
+# (TODO 219) In batches, the textures seen first made first, each colour-matched as it is made; it waits while the
+# game runs (unless hd_options.json says to carry on) and says "HD textures: N of M made" after each batch.
 & $Python (Join-Path $Py "upscale_textures.py") $converted --out (Join-Path $Out "upscaled") `
-    --work (Join-Path $Out "work") --exe $exe 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable lines | Out-Host
+    --work (Join-Path $Out "work") --exe $exe --quality $Quality --match-colour 2>&1 | ForEach-Object { "$_" } | Tee-Object -Variable lines | Out-Host
 $code = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 $summary = $lines | Where-Object { $_ -match '^upscaled \d+/\d+ uniques' } | Select-Object -Last 1
@@ -159,6 +228,8 @@ if (-not (Test-Path (Join-Path $Out "upscaled_precolour\colour_gains.json"))) {
     }
 }
 else { Step "Matching the upscaled images' colour to the game's textures" }
-Run $Python @((Join-Path $Py "match_colour.py"), "--upscaled", (Join-Path $Out "upscaled"), "--native", $converted)
+# (--only-new: the images matched as they were made are not measured again)
+Run $Python @((Join-Path $Py "match_colour.py"), "--upscaled", (Join-Path $Out "upscaled"), "--native", $converted, "--only-new")
 CrispFonts
+SetStatus "done"
 Write-Host "`nDone. Start the game from this folder (Play.bat): the log says '[native render] upscaled textures: N images'." -ForegroundColor Green

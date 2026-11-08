@@ -9,6 +9,14 @@ supersample-downscale when overshooting) into --out, mirroring source
 relative paths 1:1. Resumable via a JSONL manifest stored with the outputs;
 --dry-run plans without touching the GPU; --audit verifies a finished run.
 
+Works in batches (--batch-files / --batch-mp), the textures a player sees
+first made first (tier_rules.priority_for), each finished batch usable at
+once; --match-colour matches each image's colour as it is made. Beside the
+game (TODO 219): it waits while <hd-dir>/.game_running says the game runs,
+unless <hd-dir>/hd_options.json says "while_playing": true (then the
+upscaler runs at idle CPU and GPU priority), and keeps
+<hd-dir>/upscale_status.json up to date. --quality fast: tier_rules.FAST_TIERS.
+
 Backends (--backend, default = the model's own backend, else ncnn):
   ncnn      realesrgan-ncnn-vulkan.exe, batch directory mode (AMD via Vulkan).
   onnx-dml  onnxruntime InferenceSession(providers=[DmlExecutionProvider,
@@ -246,7 +254,7 @@ def sample_srcs(srcs, n, seed):
     return keep
 
 
-def plan_jobs(srcs, model_override, alpha_mode, notes, requested_backend=None):
+def plan_jobs(srcs, model_override, alpha_mode, notes, requested_backend=None, quality="best"):
     by_sha = defaultdict(list)
     for s in srcs:
         by_sha[s.sha1].append(s)
@@ -258,7 +266,7 @@ def plan_jobs(srcs, model_override, alpha_mode, notes, requested_backend=None):
         if len(tiers) > 1:
             notes.append(f"dup spans tiers {sorted(tiers)} -> {tier}: "
                          f"{group[0].relpath} (+{len(group) - 1})")
-        cfg = tier_rules.TIERS[tier]
+        cfg = tier_rules.tiers_for(quality)[tier]
         w, h = group[0].w, group[0].h
         long_edge = max(w, h)
         model = cfg["model"]
@@ -311,10 +319,14 @@ def load_manifest(out_root):
     return recs
 
 
-def job_done(job, recs, out_root, settings):
+def job_done(job, recs, out_root, settings, also_good=()):
     r = recs.get(job.sha1)
     if not r:
         return False
+    # (A Fast run keeps the images a Best run made already: better ones, not made again.)
+    if (r.get("settings") in also_good and sorted(r.get("relpaths", [])) == job.relpaths
+            and all((out_root / rp).is_file() for rp in r["relpaths"])):
+        return True
     if (r.get("settings") != settings or r.get("model") != job.model
             or r.get("passes") != job.passes
             or r.get("alpha_mode") != job.alpha_mode
@@ -350,14 +362,145 @@ def stage_job(job, in_dir):
             Image.merge("RGB", (a, a, a)).save(in_dir / f"{job.sha1}.a.png")
 
 
-def run_binary(exe, in_dir, out_dir, model, tile, gpu):
+def run_binary(exe, in_dir, out_dir, model, tile, gpu, stop=None, gentle=False):
+    """The upscaler over a directory. stop(): polled every second - True ends the run at once (the game
+    started: its batch is made again later). gentle: idle CPU priority and the graphics card's lowest
+    scheduling class for the upscaler (made while the game runs), small tiles. Returns
+    (returncode, stderr text, stopped)."""
     cmd = [str(exe), "-i", str(in_dir), "-o", str(out_dir),
            "-n", model, "-s", "4", "-f", "png"]
-    if tile:
-        cmd += ["-t", str(tile)]
+    if tile or gentle:
+        cmd += ["-t", str(tile or 128)]
     if gpu is not None:
         cmd += ["-g", str(gpu)]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    flags = 0
+    if os.name == "nt":
+        flags |= 0x08000000  # CREATE_NO_WINDOW
+        flags |= 0x00000040 if gentle else 0x00004000  # IDLE / BELOW_NORMAL priority class
+    errf = io.open(os.path.join(str(out_dir), "..", f"stderr_{os.getpid()}.txt"), "w+", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf, creationflags=flags)
+        if gentle:
+            gpu_priority_idle(proc)
+        stopped = False
+        while True:
+            try:
+                rc = proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                if stop and stop():
+                    proc.kill()
+                    rc = proc.wait()
+                    stopped = True
+                    break
+        errf.seek(0)
+        return rc, errf.read(), stopped
+    finally:
+        errf.close()
+        try:
+            os.remove(errf.name)
+        except OSError:
+            pass
+
+
+def gpu_priority_idle(proc):
+    """The upscaler's work on the graphics card at Windows' lowest scheduling class (the game's frames
+    go first). Best effort: nothing happens where Windows does not offer it."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        gdi = ctypes.WinDLL("gdi32")
+        fn = gdi.D3DKMTSetProcessSchedulingPriorityClass
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        fn(ctypes.c_void_p(int(proc._handle)), 0)  # D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---- Working beside the game (make_hd_textures.ps1 / the setup) ----
+# The game holds <hd_textures>/.game_running (its process id inside) while it runs; Windows deletes the file
+# when the game ends, a crash too. While it is there the upscale waits (the two share the graphics card),
+# unless hd_options.json says "while_playing": true - then it carries on gently.
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k = ctypes.WinDLL("kernel32")
+    k.OpenProcess.restype = ctypes.c_void_p
+    h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    finally:
+        k.CloseHandle(ctypes.c_void_p(h))
+
+
+def game_running(lock):
+    if not lock or not lock.exists():
+        return False
+    try:
+        text = lock.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return True  # (held and unreadable: the game is there)
+    try:
+        return pid_alive(int(text.split()[0]))
+    except (ValueError, IndexError):
+        return True
+
+
+def read_options(path):
+    try:
+        with open(path, encoding="utf-8-sig") as fp:
+            o = json.load(fp)
+        return o if isinstance(o, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_status(path, **fields):
+    if not path:
+        return
+    fields["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(fields, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def job_priority(job):
+    return min(tier_rules.priority_for(rp) for rp in job.relpaths)
+
+
+def make_batches(jobs, max_files, max_mp):
+    """The jobs in the order they are made (the textures seen first, first), cut into batches of one
+    (backend, model, passes) each: at most max_files images and max_mp megapixels of output."""
+    order = sorted(jobs, key=lambda j: (job_priority(j), j.backend, j.model, j.passes, j.relpaths[0]))
+    batches, cur, key, mp = [], [], None, 0.0
+    for j in order:
+        k = (j.backend, j.model, j.passes)
+        jmp = j.out_w * j.out_h / 1e6
+        if cur and (k != key or len(cur) >= max_files or mp + jmp > max_mp):
+            batches.append(cur)
+            cur, mp = [], 0.0
+        cur.append(j)
+        key = k
+        mp += jmp
+    if cur:
+        batches.append(cur)
+    return batches
 
 
 def make_onnx_session(ort, model_path):
@@ -451,7 +594,14 @@ def finalize(job, last_dir, out_root, settings):
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".tmp")
         tmp.write_bytes(data)
-        os.replace(tmp, dest)
+        for attempt in range(20):  # (the game reading the old file a moment: Windows refuses the swap meanwhile)
+            try:
+                os.replace(tmp, dest)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.1)
     return {
         "sha1": job.sha1, "relpaths": job.relpaths, "tier": job.tier,
         "model": job.model, "backend": job.backend, "passes": job.passes,
@@ -562,6 +712,20 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="redo jobs even if manifest says done")
     ap.add_argument("--keep-work", action="store_true")
+    ap.add_argument("--quality", choices=tier_rules.QUALITIES, default="best",
+                    help="best: characters 4K, two passes where they help; fast: characters 2K, one pass, "
+                         "a lighter network for the levels")
+    ap.add_argument("--batch-files", type=int, default=64,
+                    help="images per upscaler run (the order and the pause work batch by batch)")
+    ap.add_argument("--batch-mp", type=float, default=160.0,
+                    help="megapixels of output per upscaler run")
+    ap.add_argument("--hd-dir", type=Path, default=None,
+                    help="the HD set's folder (default: --out's parent): .game_running, hd_options.json, "
+                         "upscale_status.json")
+    ap.add_argument("--no-wait-for-game", action="store_true",
+                    help="never wait while the game runs")
+    ap.add_argument("--match-colour", action="store_true",
+                    help="match each image's colour to the game's as it is made (match_colour.py)")
     args = ap.parse_args()
 
     if args.list_models:
@@ -589,7 +753,7 @@ def main():
     alpha_mode = (tier_rules.ALPHA_MODE if args.alpha_mode == "auto"
                   else args.alpha_mode)
     notes = []
-    jobs = plan_jobs(srcs, model_override, alpha_mode, notes, args.backend)
+    jobs = plan_jobs(srcs, model_override, alpha_mode, notes, args.backend, args.quality)
     print_plan(srcs, jobs)
     for n in notes:
         print("note:", n)
@@ -597,11 +761,22 @@ def main():
         print("dry run - nothing executed")
         sys.exit(1 if errors else 0)
 
-    settings = tier_rules.settings_hash()
+    settings = tier_rules.settings_hash(args.quality)
+    also_good = {tier_rules.settings_hash("best")} if args.quality == "fast" else set()
     recs = load_manifest(args.out)
     todo = [j for j in jobs
-            if args.force or not job_done(j, recs, args.out, settings)]
+            if args.force or not job_done(j, recs, args.out, settings, also_good)]
     print(f"to do: {len(todo)} uniques ({len(jobs) - len(todo)} already done)")
+
+    hd_dir = args.hd_dir or args.out.parent
+    lock = None if args.no_wait_for_game else hd_dir / ".game_running"
+    options_path = hd_dir / "hd_options.json"
+    status_path = hd_dir / "upscale_status.json"
+    total = len(jobs)
+    done_before = total - len(todo)
+
+    def status(state, made):
+        write_status(status_path, state=state, done=made, total=total, quality=args.quality)
 
     needs_exe = any(j.backend == "ncnn" for j in todo)
     if needs_exe and not args.exe.is_file():
@@ -641,30 +816,98 @@ def main():
                       file=sys.stderr)
                 sys.exit(2)
 
+    # Each image's colour matched as it is made (match_colour.py's rules and ledger): the images the game
+    # takes while the rest is still being made look as they will at the end.
+    mc = ledger = None
+    native_root = args.src
+    backup_root = args.out.parent / "upscaled_precolour"
+    if args.match_colour:
+        import match_colour as mc
+        ledger = mc.load_ledger(str(backup_root))
+
     args.out.mkdir(parents=True, exist_ok=True)
     done = 0
+    status("working", done_before)
+    from concurrent.futures import ThreadPoolExecutor
+    finisher = ThreadPoolExecutor(max_workers=1)  # (a batch's CPU part beside the next batch's GPU part)
+    pending = None
+    t_start = time.time()
+    paused_s = [0.0]  # (the time spent waiting for the game: not in the estimate)
     with open(args.out / MANIFEST_NAME, "a", encoding="utf-8") as mf:
 
         def finish(job, last_dir):
             nonlocal done
             try:
                 rec = finalize(job, last_dir, args.out, settings)
+                if mc is not None:
+                    for rp in job.relpaths:
+                        mc.match_file(rp, str(args.out / rp), str(native_root), str(backup_root), ledger,
+                                      note_checked=True)
                 mf.write(json.dumps(rec) + "\n")
                 mf.flush()
                 done += 1
             except Exception as e:  # noqa: BLE001
                 errors.append((job.srcs[0].relpath, f"finalize: {e}"))
 
-        groups = defaultdict(list)
-        for j in todo:
-            groups[(j.backend, j.model, j.passes)].append(j)
-        for (backend, model, passes), gjobs in sorted(groups.items()):
+        def finish_batch(staged, cur, gdir):
+            for job in staged:
+                missing = [s for s in expected_stems(job)
+                           if not (cur / f"{s}.png").is_file()]
+                if missing:
+                    errors.append((job.srcs[0].relpath,
+                                   f"{job.backend} produced no output ({missing})"))
+                else:
+                    finish(job, cur)
+            if ledger is not None:
+                mc.save_ledger(str(backup_root), ledger)
+            if not args.keep_work and gdir is not None:
+                shutil.rmtree(gdir, ignore_errors=True)
+            made = done_before + done
+            status("working", made)
+            el = time.time() - t_start - paused_s[0]
+            left = ""
+            if done >= 24 and len(todo) > done:
+                left = f", about {max(1, round(el / done * (len(todo) - done) / 60))} min left"
+            print(f"HD textures: {made} of {total} made{left}", flush=True)
+
+        def wait_turn():
+            """While the game runs (and the options do not say to go on): wait. True: go on gently."""
+            told = False
+            t_wait = time.time()
+            while True:
+                if not game_running(lock):
+                    paused_s[0] += time.time() - t_wait
+                    if told:
+                        print("the game closed: carrying on", flush=True)
+                        status("working", done_before + done)
+                    return False
+                if read_options(options_path).get("while_playing"):
+                    return True
+                if not told:
+                    print(f"paused while the game runs ({done_before + done} of {total} made)", flush=True)
+                    status("paused", done_before + done)
+                    told = True
+                time.sleep(2.0)
+
+        def should_stop():
+            return game_running(lock) and not read_options(options_path).get("while_playing")
+
+        batches = make_batches(todo, max(1, args.batch_files), max(1.0, args.batch_mp))
+        bi = 0
+        while bi < len(batches):
+            gjobs = batches[bi]
+            backend, model, passes = gjobs[0].backend, gjobs[0].model, gjobs[0].passes
             if backend == "pil":  # pil-* pseudo-models: no GPU involved
+                if pending:
+                    pending.result()
+                    pending = None
                 for job in gjobs:
                     finish(job, None)
-                print(f"{model}: {len(gjobs)} done in Pillow")
+                status("working", done_before + done)
+                bi += 1
                 continue
-            gdir = args.work / f"{backend}_{model}_p{passes}"
+            gentle = wait_turn()
+            gdir = args.work / f"{backend}_{model}_p{passes}_b{bi}"
             if gdir.exists():
                 shutil.rmtree(gdir)
             in_dir = gdir / "in"
@@ -677,37 +920,40 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     errors.append((job.srcs[0].relpath, f"stage: {e}"))
             cur = in_dir
+            stopped = False
             for i in range(1, passes + 1):
                 nxt = gdir / f"p{i}"
                 nxt.mkdir()
                 t0 = time.time()
                 if backend == "ncnn":
-                    proc = run_binary(args.exe, cur, nxt, model,
-                                      args.tile, args.gpu)
-                    rc = proc.returncode
-                    if rc != 0:
-                        tail = proc.stderr.strip().splitlines()[-3:]
+                    rc, err, stopped = run_binary(args.exe, cur, nxt, model, args.tile, args.gpu,
+                                                  stop=None if gentle else should_stop, gentle=gentle)
+                    if rc != 0 and not stopped:
+                        tail = err.strip().splitlines()[-3:]
                         print("  stderr: " + " | ".join(tail), file=sys.stderr)
                 else:  # onnx-dml
                     scale = MODELS.get(model, {}).get("scale", 4)
                     run_onnx_dir(sessions[model], scale, cur, nxt,
                                  args.onnx_tile, args.onnx_overlap)
                     rc = 0
+                if stopped:
+                    break
                 n_out = sum(1 for _ in nxt.glob("*.png"))
-                print(f"{backend}:{model} p{passes} pass {i}: {n_out} files "
-                      f"in {time.time() - t0:.0f}s (rc={rc})")
+                print(f"  {backend}:{model} p{passes} pass {i}: {n_out} files "
+                      f"in {time.time() - t0:.0f}s (rc={rc})", flush=True)
                 cur = nxt
-            for job in staged:
-                missing = [s for s in expected_stems(job)
-                           if not (cur / f"{s}.png").is_file()]
-                if missing:
-                    errors.append((job.srcs[0].relpath,
-                                   f"{backend} produced no output ({missing})"))
-                else:
-                    finish(job, cur)
-            if not args.keep_work:
+            if stopped:  # (the game started: this batch again, once it may)
                 shutil.rmtree(gdir, ignore_errors=True)
+                continue
+            if pending:
+                pending.result()
+            pending = finisher.submit(finish_batch, staged, cur, gdir)
+            bi += 1
+        if pending:
+            pending.result()
+    finisher.shutdown()
 
+    status("upscaled" if not errors else "upscaled_with_errors", done_before + done)
     total_outputs = sum(len(j.relpaths) for j in todo) - len(errors)
     print(f"upscaled {done}/{len(todo)} uniques -> ~{total_outputs} files, "
           f"{len(errors)} errors")
