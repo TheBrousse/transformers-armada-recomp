@@ -1,0 +1,79 @@
+Subject: [PATCH] GS GPU renderer: a load into a buffer kept as field pictures keeps the pictures (TODO 205)
+
+After a state load in Antarctica the GPU renderer showed, now and then for a frame, the whole picture under red and
+green bands (the depth buffer's bytes as colours). With both fields as moments the display buffers are kept as their
+field pictures alone; their own textures are not drawn. The game's trail reads the previous display buffer at 1024
+rows, so that buffer's rows past 448 share pages with the other display buffer - the scene's depth buffer every
+second frame - and those depth draws made it stale. Reading it then loaded the stale cells (rows the pictures never
+show) and made every field picture invalid, so the trail sampled the buffer's own texture: local memory as it was at
+the last load (after a state load, an old depth buffer), blended over the frame.
+
+The cells a load brings in now go into the buffer's valid field pictures too, which stay its pictures. A load of the
+whole buffer (one not at a page boundary) still makes them invalid, as before.
+
+Checked on the user's state user_199 (Antarctica), GPU alone, 7 shots in the window where it showed (+90 to +210
+VBlanks after the load), 10 runs each way on this PC: scrambled frames 0 of 70 with the fix, 4 of 70 (plus several
+milder ones) with PS2X_GPU_KEEP_PICTURES=0; every shot with the fix within 2 of the median picture.
+PS2X_GPU_KEEP_PICTURES=0: all made invalid, as before.
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index f21cb80..e1661f6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -1610,6 +1610,8 @@ struct GSGpuRenderer::Impl
+     bool stats = false;
+     uint64_t statBatches = 0u, statDraws = 0u, statPrims = 0u, statVertices = 0u, statSkipped = 0u, statCulled = 0u, statUploads = 0u,
+              statLoadRows = 0u, statWriteRows = 0u, statFeedback = 0u, statSyncs = 0u, statDownloads = 0u, statReadbacks = 0u, statReadbackPages = 0u;
++    uint64_t statPicturesKept = 0u;                // (TODO 205) loads whose cells went into the field pictures too
++    std::vector<std::array<int, 4>> loadedRects; // (ensureLoaded: the GL rectangles it loaded)
+     std::chrono::steady_clock::time_point statStart = std::chrono::steady_clock::now();
+     // GPU time of the passes (elapsed-time queries, read when they are done): draws, field
+     // pictures, loads from local memory, write-backs, presentation.
+@@ -2939,6 +2941,7 @@ void GSGpuRenderer::Impl::ensureLoaded(Target &t)
+             const int x1 = std::min(static_cast<int>(end) * pw, t.width);
+             glScissor(x0 * t.sx, static_cast<int>(cy) * ph * t.sy, (x1 - x0) * t.sx, ph * t.sy);
+             glDrawArrays(GL_TRIANGLES, 0, 3);
++            loadedRects.push_back({x0 * t.sx, static_cast<int>(cy) * ph * t.sy, (x1 - x0) * t.sx, ph * t.sy});
+             rowsLoaded += static_cast<uint64_t>(ph) * static_cast<uint64_t>(x1 - x0) / static_cast<uint64_t>(t.width);
+             cx = end;
+         }
+@@ -2946,7 +2949,29 @@ void GSGpuRenderer::Impl::ensureLoaded(Target &t)
+     timeEnd();
+     std::fill(t.staleCells.begin(), t.staleCells.end(), uint8_t{0u});
+     t.anyStale = false;
+-    std::fill(std::begin(t.shadowValid), std::end(t.shadowValid), false); // (the buffer changed under its field pictures)
++    // The buffer changed under its field pictures: (TODO 205) the cells loaded go into the pictures that hold it as well,
++    // which stay its pictures. Before, any load made them all invalid, and what read the buffer then had its own texture -
++    // with both fields as moments never drawn (local memory's content at the last load: after a state load, the depth
++    // buffer of the scene before). Transformers' display buffer is read by its trail at 1024 rows: its rows past 448 share
++    // pages with the other display buffer, the scene's depth buffer every second frame, and those draws made it stale -
++    // the trail then blended in that old memory, a frame of red and green bands now and then after a state load.
++    // PS2X_GPU_KEEP_PICTURES=0: all made invalid, as before.
++    static const bool keepPictures = envFlag("PS2X_GPU_KEEP_PICTURES", true);
++    bool anyPicture = false;
++    for (int k = 0; k < kShadows; ++k)
++        anyPicture = anyPicture || (t.shadowValid[k] && t.shadow[k]);
++    if (keepPictures && anyPicture && !whole)
++    {
++        glMemoryBarrier(GL_ALL_BARRIER_BITS); // (the load's image stores finished before the copies)
++        for (int k = 0; k < kShadows; ++k)
++            if (t.shadowValid[k] && t.shadow[k])
++                for (const auto &r : loadedRects)
++                    glCopyImageSubData(t.tex, GL_TEXTURE_2D, 0, r[0], r[1], 0, t.shadow[k], GL_TEXTURE_2D, 0, r[0], r[1], 0, r[2], r[3], 1);
++        ++statPicturesKept;
++    }
++    else
++        std::fill(std::begin(t.shadowValid), std::end(t.shadowValid), false);
++    loadedRects.clear();
+     for (uint32_t cy = 0; cy < t.cellsY && cy < t.depthRows.size(); ++cy)
+         if (cellRowLoaded[cy])
+             t.depthRows[cy] = kDepthTexture; // (and under its native depth)
+@@ -6665,6 +6690,8 @@ void GSGpuRenderer::Impl::printStats()
+                  static_cast<unsigned long long>(statLoadRows), static_cast<unsigned long long>(statWriteRows),
+                  static_cast<unsigned long long>(statFeedback), static_cast<unsigned long long>(statSyncs),
+                  static_cast<unsigned long long>(statDownloads), targets.size());
++    std::fprintf(stderr, "[gpu]   field pictures kept through a load: %llu\n", static_cast<unsigned long long>(statPicturesKept));
++    statPicturesKept = 0u;
+     std::fprintf(stderr, "[gpu]   read-backs and local copies: %llu, %llu of their pages drawn by the GPU\n",
+                  static_cast<unsigned long long>(statReadbacks), static_cast<unsigned long long>(statReadbackPages));
+     statReadbacks = statReadbackPages = 0u;

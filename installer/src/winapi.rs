@@ -66,6 +66,17 @@ unsafe extern "system" {
     fn RegGetValueW(key: isize, sub_key: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(key: i32) -> i16;
+}
+
+/// The Shift key held down right now (a launcher's start with Shift held: the setup's window instead of the game).
+pub fn shift_held() -> bool {
+    const VK_SHIFT: i32 = 0x10;
+    unsafe { GetAsyncKeyState(VK_SHIFT) < 0 }
+}
+
 #[link(name = "shell32")]
 unsafe extern "system" {
     fn ShellExecuteW(hwnd: *mut c_void, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> isize;

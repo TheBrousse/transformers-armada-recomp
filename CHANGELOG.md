@@ -1,5 +1,11 @@
 # What's new
 
+## 0.2.9
+
+**New**
+- Once the game is built, starting the setup again starts the game straight away, so a game launcher (for example
+  Quiver) can use the setup as its Play button. Hold Shift while starting it to open the setup's window instead.
+
 ## 0.2.8
 
 **Fixed**

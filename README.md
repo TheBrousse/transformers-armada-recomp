@@ -152,7 +152,11 @@ Prefer the command line, or want to build it yourself? See **[docs/BUILDING.md](
 
 ## Play from Steam, another launcher, or a Steam Deck
 
-The game can be started straight from its program file, so any launcher can start it:
+Once the game is built, starting `tfa-setup.exe` again starts the game itself, so a launcher such as
+[Quiver](https://quiverlauncher.com) that keeps the setup can use it as the game's Play button. Hold **Shift** while
+starting it to open the setup's window instead (updates, repair).
+
+The game can also be started straight from its program file, so any launcher can start it:
 
 `<install folder>/transformers-armada-recomp/out/build/transformers/RelWithDebInfo/TransformersRecomp.exe`
 

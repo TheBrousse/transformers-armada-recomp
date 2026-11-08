@@ -436,6 +436,7 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
             match self.exec("powershell", &refs, Some(&repo), &path_env, tx, STEP_TOOLS, &log) {
                 Ok(()) => {
                     copy_self(&self.folder);
+                    remember_folder(&self.folder);
                     return Ok(());
                 }
                 Err(e) if attempt == 0 && e.contains("prerequisites installed") => {
@@ -623,6 +624,31 @@ fn compile_progress(text: &str) -> Option<f32> {
         return None;
     }
     Some(0.40 + 0.20 * (done / total).clamp(0.0, 1.0))
+}
+
+/// Where the install finished last, so a setup started from somewhere else (a launcher's own copy, Quiver) finds it.
+fn remembered_folder_file() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA").ok().map(|v| Path::new(&v).join("TransformersArmadaSetup").join("install_folder.txt"))
+}
+
+fn remember_folder(folder: &Path) {
+    if let Some(f) = remembered_folder_file() {
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(f, folder.to_string_lossy().as_bytes());
+    }
+}
+
+fn remembered_folder() -> Option<String> {
+    let text = std::fs::read_to_string(remembered_folder_file()?).ok()?;
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// The built game's exe in an install.
+fn game_exe(repo: &Path) -> PathBuf {
+    game_folder(repo).join("out").join("build").join("transformers").join("RelWithDebInfo").join("TransformersRecomp.exe")
 }
 
 /// A copy of this program in the install folder (tfa-setup.exe), for the game's own "Update now".
@@ -960,8 +986,7 @@ fn play(repo: &Path) {
     if !settings.exists() && example.exists() {
         let _ = std::fs::copy(&example, &settings);
     }
-    let exe = game.join("out").join("build").join("transformers").join("RelWithDebInfo").join("TransformersRecomp.exe");
-    let _ = Command::new(exe).current_dir(&game).spawn();
+    let _ = Command::new(game_exe(repo)).current_dir(&game).spawn();
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1278,11 +1303,27 @@ fn main() -> eframe::Result {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let repo_arg = all.iter().position(|a| a == "--repo").and_then(|i| all.get(i + 1).cloned());
     app.set_flavour(repo_arg, all.iter().any(|a| a == "--mods"));
-    // (the copy a setup leaves in the install folder opens on that folder)
+    // (the copy a setup leaves in the install folder opens on that folder; a copy elsewhere - a launcher's
+    // own, Quiver - on the folder the last install finished in)
+    let mut found = false;
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         if dir.join(repo_name(&app.repo_url)).join(".git").exists() {
             app.folder = dir.to_string_lossy().to_string();
+            found = true;
         }
+    }
+    if !found {
+        if let Some(dir) = remembered_folder() {
+            if Path::new(&dir).join(repo_name(&app.repo_url)).join(".git").exists() {
+                app.folder = dir;
+            }
+        }
+    }
+    // Started with nothing on its command line on a finished install (a launcher's Play button, a shortcut to
+    // the setup): the game starts, no setup window. Shift held while starting, or --setup: the setup's window.
+    if all.is_empty() && app.installed() && game_exe(&app.repo()).exists() && !winapi::shift_held() {
+        play(&app.repo());
+        return Ok(());
     }
     let mut start = false;
     let mut update = false;
@@ -1302,6 +1343,7 @@ fn main() -> eframe::Result {
             "--check" => check = true,
             "--out" => out = args.next(),
             "--shot" => app.shot = args.next(),
+            "--setup" => {} // (the setup's window on a finished install: see above)
             "--repo" => {
                 let _ = args.next(); // (read above)
             }
