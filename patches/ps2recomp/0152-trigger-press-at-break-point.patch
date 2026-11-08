@@ -1,0 +1,71 @@
+Subject: [PATCH] Runtime: a trigger with an adaptive effect counts as pressed at the effect's break point (TODO 211)
+
+TriggerRequest gains pressLeft / pressRight: the pull (0..255) at which the guest sees L2 / R2 pressed while the
+game's effect is on that trigger. A weapon effect's click is its break point, so the shot now comes with the click
+(before, the pad's own L2 / R2 bit, set at the slightest pull, fired long before the click). 0 = as before. The
+pad mapping logs the pull at which a gated press is first seen ("[sonypad] R2 pressed at pull N (break point M)").
+
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+index 34de019..3d86f16 100644
+--- a/ps2xRuntime/include/runtime/ps2_sony_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -176,6 +176,9 @@ namespace ps2x::sonypad
+     {
+         bool active = false;
+         uint8_t left[11] = {}, right[11] = {};
++        // The pull (0..255) at which the guest sees the trigger pressed while the effect is on it: the effect's break
++        // point, so a weapon fires with its click (0: as usual, a sixth of the travel or the pad's own button bit).
++        uint8_t pressLeft = 0u, pressRight = 0u;
+         bool operator==(const TriggerRequest &o) const;
+         bool operator!=(const TriggerRequest &o) const { return !(*this == o); }
+     };
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+index 9e394d6..5a2f00c 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -424,7 +424,8 @@ namespace ps2x::sonypad
+ 
+     bool TriggerRequest::operator==(const TriggerRequest &o) const
+     {
+-        return active == o.active && std::memcmp(left, o.left, 11) == 0 && std::memcmp(right, o.right, 11) == 0;
++        return active == o.active && pressLeft == o.pressLeft && pressRight == o.pressRight &&
++               std::memcmp(left, o.left, 11) == 0 && std::memcmp(right, o.right, 11) == 0;
+     }
+ 
+     void setLightbarRequest(const LightbarRequest &request)
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index cbbb432..9a50e70 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -713,9 +713,28 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_UP), PAD_TRIANGLE);
+         press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_1), PAD_L1);
+         press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_1), PAD_R1);
+-        // The analog triggers count as pressed past a sixth of their travel.
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2) || sony.l2 > 0x2Au, PAD_L2);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2) || sony.r2 > 0x2Au, PAD_R2);
++        // The analog triggers count as pressed past a sixth of their travel. While the game has an adaptive-trigger
++        // effect on one (setTriggerRequest) with a break point, only past that point: the shot comes with the click.
++        {
++            const TriggerRequest effects = triggerRequest();
++            static bool wasLeft = false, wasRight = false;
++            const auto trigger = [&](bool button, uint8_t pull, uint8_t at, bool &was, const char *name)
++            {
++                if (!effects.active || at == 0u)
++                {
++                    was = false;
++                    return button || pull > 0x2Au;
++                }
++                const bool down = pull >= at;
++                if (down && !was)
++                    std::fprintf(stderr, "[sonypad] %s pressed at pull %d (break point %d)\n", name, static_cast<int>(pull),
++                                 static_cast<int>(at));
++                was = down;
++                return down;
++            };
++            press(trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2), sony.l2, effects.pressLeft, wasLeft, "L2"), PAD_L2);
++            press(trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2), sony.r2, effects.pressRight, wasRight, "R2"), PAD_R2);
++        }
+         press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_RIGHT), PAD_START);    // Options
+         press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_LEFT), PAD_SELECT);    // Create / Share
+         press((sony.buttons & kTouchpad) != 0u, PAD_SELECT);                       // the touchpad click too

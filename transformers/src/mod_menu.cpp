@@ -37,6 +37,7 @@
 #endif
 #include <mutex>
 #include <sstream>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1131,7 +1132,7 @@ namespace mod_menu
             {"TF_SPEEDRUN_TIMER", "Speedrun timer", "A timer with a split for each level."},
             {"TF_RENDERER", "Renderer", "Native is faster and sharper. Takes a restart."},
             {"PS2X_GPU_SCALE", "Resolution", "The resolution the game renders at."},
-            {"TF_DRAW_DISTANCE", "Draw distance", "How far you can see detail."},
+            {"TF_DRAW_DISTANCE", "Draw distance", "How far you can see detail: scenery, trees, grass and the ground."},
             {"TF_SCENERY_DISTANCE", "Scenery distance", "How far buildings and ruins keep their detail."},
             {"TF_FOREST_DISTANCE", "Forest distance", "How far the trees are full 3D models."},
             {"TF_FOREST_SPRITES", "Far trees", "The farthest trees: 3D models or flat pictures."},
@@ -1153,6 +1154,11 @@ namespace mod_menu
             {"PS2X_SONYPAD_RUMBLE", "Vibration", "Controller vibration strength."},
             {"PS2X_SONYPAD_LIGHTBAR", "Light bar", "The DualSense or DualShock 4 light colour. Your Autobot's: Optimus red, Hot Shot yellow, Red Alert blue."},
             {"TF_LIGHTBAR_ALERTS", "Light bar warnings", "The light blinks blue and red when your health is low, and blinks your Autobot's colour when he is destroyed."},
+            {"TF_ADAPTIVE_TRIGGERS", "Adaptive triggers", "L2 or R2 pushes back while a weapon Mini-Con is on it: missiles click, cannons kick harder, beam rifles resist. Off in car mode."},
+            {"TF_TRIGGER_STRENGTH", "Trigger strength", "How hard the adaptive triggers push back. Light is the softest."},
+            {"TF_PAD_SPEAKER", "Controller speaker", "Game alerts: transforming, enemies spotting you, the low-health beep and the HQ's calls play on the DualSense instead of the PC. Surround: everything on both."},
+            {"TF_PAD_SPEAKER_VOLUME", "Controller speaker volume", "How loud the DualSense's speaker plays."},
+            {"TF_PAD_SPEAKER_DELAY", "Speaker delay (Bluetooth)", "Surround over Bluetooth: holds the PC's sound back so it plays together with the controller's. Raise it if the PC is heard first. Over a USB cable the game measures it by itself."},
             {"PS2X_GAMEPAD_BACKEND", "Controller support", "Others only leaves a Sony pad to Steam Input."},
             {"PS2X_STICK_RESPONSE", "Stick response", "Modern: a light touch walks, a third of the stick runs. Off: as before."},
             {"PS2X_STICK_VEHICLE_MODE", "Car steering", "Original: the car steers as before. Tuned: gentler near the centre."},
@@ -1229,8 +1235,9 @@ namespace mod_menu
             labels.reserve(r.choices.size());
             for (const auto &c : r.choices)
                 labels.push_back(choiceLabel(r, c));
+            // (TODO 217: a dimmed row says why it is dimmed - its unavailable help - not what it would do)
             const int chosen = menu_style::choiceRow(r.key.c_str(), label, labels, r.selected, r.available,
-                                                     r.pending ? "RESTART" : nullptr, w ? std::string(w->help) : r.help);
+                                                     r.pending ? "RESTART" : nullptr, w && r.available ? std::string(w->help) : r.help);
             if (chosen >= 0 && chosen < static_cast<int>(r.choices.size()))
             {
                 ps2_settings::detail::choose(r.entry, r.choices[static_cast<size_t>(chosen)].value);
@@ -1458,7 +1465,7 @@ namespace mod_menu
             "TF_DRAW_DISTANCE", "TF_SCENERY_DISTANCE", "TF_FOREST_DISTANCE", "TF_FOREST_SPRITES", "TF_GRASS_DISTANCE",
             "TF_TERRAIN_DETAIL", "TF_FOREST_ADAPTIVE", "TF_FOREST_FULL_DETAIL", "TF_ENEMY_DETAIL", "TF_NATIVE_AA", "PS2X_GPU_AA", "PS2X_GPU_MSAA",
             "TF_NATIVE_SSAA", "TF_NATIVE_QUALITY", "TF_SHARP_TEXTURES", "PS2X_TEXTURE_PACK", "PS2X_GPU_ANISOTROPY",
-            "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "TF_LIGHTBAR_ALERTS", "PS2X_GAMEPAD_BACKEND",
+            "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "TF_LIGHTBAR_ALERTS", "TF_ADAPTIVE_TRIGGERS", "TF_TRIGGER_STRENGTH", "TF_PAD_SPEAKER", "TF_PAD_SPEAKER_VOLUME", "TF_PAD_SPEAKER_DELAY", "PS2X_GAMEPAD_BACKEND",
             "PS2X_STICK_RESPONSE", "PS2X_STICK_VEHICLE_MODE", "PS2X_STICK_LEFT_LIFT", "PS2X_STICK_LEFT_SENSITIVITY",
             "PS2X_STICK_RIGHT_LIFT", "PS2X_STICK_VEHICLE_LIFT", "PS2X_STICK_VEHICLE_RESPONSE",
             "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_NATIVE_SOUND", "TF_CFG_showHUD", "TF_START_SCREENS",
@@ -1577,6 +1584,11 @@ namespace mod_menu
             keyRow("PS2X_SONYPAD_RUMBLE");
             keyRow("PS2X_SONYPAD_LIGHTBAR");
             keyRow("TF_LIGHTBAR_ALERTS");
+            keyRow("TF_ADAPTIVE_TRIGGERS");
+            keyRow("TF_TRIGGER_STRENGTH");
+            keyRow("TF_PAD_SPEAKER");
+            keyRow("TF_PAD_SPEAKER_VOLUME");
+            keyRow("TF_PAD_SPEAKER_DELAY");
             keyRow("PS2X_STICK_RESPONSE");
             keyRow("PS2X_STICK_VEHICLE_MODE");
             if (advanced("controls-pad"))
@@ -1779,6 +1791,240 @@ namespace mod_menu
             g_listRows.clear();
         }
 
+        // (TODO 212) The menu with a controller. Two levels: the tabs (Up / Down pick one, Cross opens it, Circle closes
+        // the menu) and the page (menu_style's focus: Up / Down move it, Cross flips, holds or presses, Circle lets a held
+        // row go, then goes back to the tabs). A pad's frames show from its first press until the mouse moves; that first
+        // press only shows where the focus is. Directions repeat while held, by real time (any frame rate).
+        int g_navLevel = 0;      // 0 the tabs, 1 the page
+        bool g_navPad = false;   // the pad drives the menu now (its frames drawn)
+        bool g_navEnter = false; // a page just entered: its focus reset inside its window
+        bool g_holdBlock = false; // closed with a pad button: the game's input stays blocked until it is let go
+        menu_style::NavInput g_navIn;
+
+        struct MenuPad
+        {
+            bool up = false, down = false, left = false, right = false, cross = false, circle = false, any = false;
+            bool xbox = false; // (the button names to show)
+        };
+
+        int64_t navNowMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        // TF_MENU_PAD_SCRIPT=down,down,cross,right,cross,circle,... (a test aid): those presses, one every 250 ms once
+        // the menu is open, each held 100 ms, in place of the pad (logged "[mod menu] pad script: ...").
+        bool scriptedPad(MenuPad &out)
+        {
+            static const std::vector<std::string> steps = [] {
+                std::vector<std::string> list;
+                if (const char *env = std::getenv("TF_MENU_PAD_SCRIPT"))
+                {
+                    std::string s = env, item;
+                    std::stringstream in(s);
+                    while (std::getline(in, item, ','))
+                        if (!item.empty())
+                            list.push_back(item);
+                }
+                return list;
+            }();
+            if (steps.empty())
+                return false;
+            static int64_t start = 0;
+            static size_t logged = 0;
+            if (!g_open)
+                return true; // (nothing pressed until the menu is open)
+            if (start == 0)
+                start = navNowMs() + 1000; // (a second for the menu to settle)
+            const int64_t t = navNowMs() - start;
+            if (t < 0)
+                return true;
+            const size_t step = static_cast<size_t>(t / 250);
+            if (step >= steps.size() || t % 250 >= 100)
+                return true;
+            const std::string &b = steps[step];
+            if (logged <= step)
+            {
+                logged = step + 1;
+                std::fprintf(stderr, "[mod menu] pad script: %s\n", b.c_str());
+            }
+            out.up = b == "up";
+            out.down = b == "down";
+            out.left = b == "left";
+            out.right = b == "right";
+            out.cross = b == "cross";
+            out.circle = b == "circle";
+            out.any = true;
+            return true;
+        }
+
+        MenuPad readMenuPad()
+        {
+            MenuPad p;
+            if (scriptedPad(p))
+                return p;
+            if (!IsWindowFocused())
+                return p;
+            const auto stick = [](float v, bool positive) { return positive ? v > 0.6f : v < -0.6f; };
+            ps2x::sonypad::InputState s;
+            if (ps2x::sonypad::readHostPad(s))
+            {
+                using namespace ps2x::sonypad;
+                const float lx = (static_cast<float>(s.lx) - 128.0f) / 128.0f, ly = (static_cast<float>(s.ly) - 128.0f) / 128.0f;
+                p.up = (s.buttons & kUp) != 0u || stick(ly, false);
+                p.down = (s.buttons & kDown) != 0u || stick(ly, true);
+                p.left = (s.buttons & kLeft) != 0u || stick(lx, false);
+                p.right = (s.buttons & kRight) != 0u || stick(lx, true);
+                p.cross = (s.buttons & kCross) != 0u;
+                p.circle = (s.buttons & kCircle) != 0u;
+                p.any = (s.buttons & 0x7FFFFu) != 0u || p.up || p.down || p.left || p.right;
+                return p;
+            }
+            if (!ps2x::sonypad::glfwGamepadsAllowed())
+                return p;
+            for (int i = 0; i < 4; ++i)
+            {
+                if (!IsGamepadAvailable(i))
+                    continue;
+                const float lx = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_X), ly = GetGamepadAxisMovement(i, GAMEPAD_AXIS_LEFT_Y);
+                p.up = IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_UP) || stick(ly, false);
+                p.down = IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_DOWN) || stick(ly, true);
+                p.left = IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_LEFT) || stick(lx, false);
+                p.right = IsGamepadButtonDown(i, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) || stick(lx, true);
+                p.cross = IsGamepadButtonDown(i, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);   // (Xbox A)
+                p.circle = IsGamepadButtonDown(i, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT); // (Xbox B)
+                for (int b = GAMEPAD_BUTTON_LEFT_FACE_UP; b <= GAMEPAD_BUTTON_RIGHT_THUMB && !p.any; ++b)
+                    p.any = IsGamepadButtonDown(i, b);
+                p.any = p.any || p.up || p.down || p.left || p.right;
+                p.xbox = true;
+                return p;
+            }
+            return p;
+        }
+
+        // This frame's presses: Cross and Circle once per press, a direction at its press and then every 90 ms after
+        // it has been held for 350 ms.
+        menu_style::NavInput navPresses(const MenuPad &p)
+        {
+            menu_style::NavInput in;
+            static MenuPad was;
+            static int64_t heldSince[4] = {0, 0, 0, 0}, lastRepeat[4] = {0, 0, 0, 0};
+            const int64_t now = navNowMs();
+            const bool dirs[4] = {p.up, p.down, p.left, p.right};
+            const bool wasDirs[4] = {was.up, was.down, was.left, was.right};
+            bool fire[4] = {false, false, false, false};
+            for (int i = 0; i < 4; ++i)
+            {
+                if (dirs[i] && !wasDirs[i])
+                {
+                    fire[i] = true;
+                    heldSince[i] = lastRepeat[i] = now;
+                }
+                else if (dirs[i] && now - heldSince[i] >= 350 && now - lastRepeat[i] >= 90)
+                {
+                    fire[i] = true;
+                    lastRepeat[i] = now;
+                }
+            }
+            in.up = fire[0];
+            in.down = fire[1];
+            in.left = fire[2];
+            in.right = fire[3];
+            in.confirm = p.cross && !was.cross;
+            in.back = p.circle && !was.circle;
+            was = p;
+            return in;
+        }
+
+        bool anyPress(const menu_style::NavInput &in)
+        {
+            return in.up || in.down || in.left || in.right || in.confirm || in.back;
+        }
+
+        // The tabs, one up or down among the shown ones.
+        void stepPage(int direction)
+        {
+            const int n = static_cast<int>(std::size(kPages));
+            for (int k = 1; k <= n; ++k)
+            {
+                const int i = ((g_page + direction * k) % n + n) % n;
+                if (pageShown(kPages[i].page))
+                {
+                    g_page = i;
+                    return;
+                }
+            }
+        }
+
+        // Once a frame the menu is open (draw, before drawMenu): the pad's presses for the tabs; the page's go to
+        // menu_style in drawMenu.
+        void navFrame()
+        {
+            const MenuPad pad = readMenuPad();
+            menu_style::NavInput in = navPresses(pad);
+            if (ImGui::GetCurrentContext())
+            {
+                const ImGuiIO &io = ImGui::GetIO();
+                if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                    g_navPad = false;
+            }
+            if (anyPress(in) && !g_navPad)
+            {
+                g_navPad = true; // (the first press shows the focus; it does nothing else)
+                in = menu_style::NavInput{};
+            }
+            g_navIn = menu_style::NavInput{};
+            if (!g_navPad)
+                return;
+            if (g_navLevel == 0)
+            {
+                if (in.up)
+                    stepPage(-1);
+                if (in.down)
+                    stepPage(1);
+                if (in.confirm)
+                {
+                    g_navLevel = 1;
+                    g_navEnter = true;
+                }
+                else if (in.back)
+                {
+                    g_open = false;
+                    g_holdBlock = true; // (Circle is still down: the game must not take it)
+                }
+                return;
+            }
+            g_navIn = in; // (the page's: drawMenu)
+        }
+
+        // With TF_MENU_PAD_SCRIPT (tests): where the pad is, each time it changes.
+        void navLog()
+        {
+            static const bool on = std::getenv("TF_MENU_PAD_SCRIPT") != nullptr;
+            static std::string was;
+            if (!on)
+                return;
+            char now[160];
+            std::snprintf(now, sizeof(now), "open %d, %s, page \"%s\"%s", g_open ? 1 : 0, g_navLevel == 0 ? "the tabs" : "the page",
+                          kPages[g_page].name, menu_style::navHolding() ? ", a row held" : "");
+            if (was != now)
+            {
+                was = now;
+                std::fprintf(stderr, "[mod menu] pad: %s\n", now);
+            }
+        }
+
+        // The keys named in the header: the pad's when one is connected.
+        const char *menuKeys()
+        {
+            ps2x::sonypad::InputState s;
+            if (ps2x::sonypad::readHostPad(s))
+                return "PS  CLOSE     CROSS  SELECT     CIRCLE  BACK";
+            if (IsGamepadAvailable(0))
+                return "VIEW + MENU  CLOSE     A  SELECT     B  BACK";
+            return "F1  CLOSE     ESC  BACK";
+        }
+
         // The whole menu: a full-window screen over the game (its picture dimmed behind).
         void drawMenu(PS2Runtime &runtime)
         {
@@ -1796,6 +2042,8 @@ namespace mod_menu
                 ImGui::End();
                 return;
             }
+            // (TODO 212) The pad's presses for the page this frame (the tabs took theirs in navFrame).
+            navBegin(g_navPad && g_navLevel == 1 && !g_navEnter, g_navIn);
             ImDrawList *dl = ImGui::GetWindowDrawList();
             // The backdrop: the game dimmed, darker to the left where the menu is.
             dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(w, h), IM_COL32(6, 8, 12, 238), IM_COL32(6, 8, 12, 200),
@@ -1813,10 +2061,7 @@ namespace mod_menu
             {
                 char fps[48];
                 std::snprintf(fps, sizeof(fps), "%.0f FPS", ImGui::GetIO().Framerate);
-                ps2x::sonypad::InputState sonyState;
-                const char *keys = ps2x::sonypad::readHostPad(sonyState) ? "F1 / PS  CLOSE     ESC  BACK"
-                                   : IsGamepadAvailable(0)          ? "F1 / VIEW + MENU  CLOSE     ESC  BACK"
-                                                                    : "F1  CLOSE     ESC  BACK";
+                const char *keys = menuKeys();
                 const ImVec2 ke = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, keys);
                 dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - ke.x, pad * 0.8f), colour("dim"), keys);
                 const ImVec2 fe = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, fps);
@@ -1847,7 +2092,12 @@ namespace mod_menu
                 if (!pageShown(kPages[i].page))
                     continue;
                 if (sideTab(kPages[i].name, i == g_page, sideWidth))
+                {
                     g_page = i;
+                    g_navLevel = 0;
+                }
+                if (g_navPad && g_navLevel == 0 && i == g_page) // (the pad's place among the tabs)
+                    ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), colour("blue"), 3.0f, 0, 2.0f);
                 ImGui::Dummy(ImVec2(0.0f, size * 0.15f));
             }
             ImGui::EndChild();
@@ -1859,6 +2109,12 @@ namespace mod_menu
             dl->AddRectFilled(ImVec2(pageX - size * 0.6f, top), ImVec2(w - pad, bottom), IM_COL32(14, 18, 24, 150));
             dl->AddRectFilled(ImVec2(pageX - size * 0.6f, top), ImVec2(pageX - size * 0.6f + 2.0f, bottom), colour("line"));
             ImGui::BeginChild("##page", ImVec2(pageWidth, bottom - top), ImGuiChildFlags_None, 0);
+            if (g_navEnter) // (a page opened with the pad: its first row has the focus, at the top)
+            {
+                g_navEnter = false;
+                navReset();
+                navBegin(g_navPad && g_navLevel == 1, menu_style::NavInput{});
+            }
             ImGui::PushFont(f.text, size);
             ImGui::PushTextWrapPos(pageWidth - size);
             drawPage(kPages[g_page].page, runtime);
@@ -1875,6 +2131,15 @@ namespace mod_menu
                                                         : help();
             dl->AddText(f.text, size * 0.85f, ImVec2(pad, bottom + size * 0.9f), colour("dim"), helpText.c_str(), nullptr,
                         w - pad * 2.0f - restartWidth);
+            {
+                // (TODO 212) The Restart button appearing takes the pad's focus (it is the next widget drawn); Circle
+                // gives the focus back to the row that made it appear.
+                static bool restartWas = false;
+                const bool restartNow = anyPending() && !ps2_settings::restarting() && !g_modRestarting;
+                if (restartNow && !restartWas && g_navPad && g_navLevel == 1)
+                    navFocusNext();
+                restartWas = restartNow;
+            }
             if (anyPending() || ps2_settings::restarting() || g_modRestarting)
             {
                 ImGui::SetCursorScreenPos(ImVec2(w - pad - restartWidth, bottom + size * 0.8f));
@@ -1908,6 +2173,8 @@ namespace mod_menu
             if (!g_modRestartError.empty())
                 dl->AddText(f.text, size * 0.75f, ImVec2(pad, bottom + size * 2.2f), colour("amber"), g_modRestartError.c_str());
             ext::restartGame(false); // (an extension's restart dialog, while it is open: port_ext.h)
+            if (navEnd()) // (Circle in the page, nothing held: back to the tabs)
+                g_navLevel = 0;
             ImGui::End();
         }
 #endif
@@ -2006,12 +2273,31 @@ namespace mod_menu
         if (g_open && IsKeyPressed(KEY_ESCAPE) && g_capturing < 0 && ImGui::GetCurrentContext() &&
             !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId))
             g_open = false;
+        // (TODO 212) The controller in the menu: the tabs' presses now (Circle at the tabs closes it), the page's in
+        // drawMenu. Closed: at the tabs again next time.
+        if (g_open)
+            navFrame();
+        if (!g_open)
+            g_navLevel = 0;
+        navLog();
+        if (g_holdBlock && !g_open)
+        {
+            // (closed with a pad button: until every button is let go, so the game does not take that press)
+            static int64_t since = 0;
+            if (since == 0)
+                since = navNowMs();
+            if (!readMenuPad().any || navNowMs() - since > 3000)
+            {
+                g_holdBlock = false;
+                since = 0;
+            }
+        }
         // The game gets no keys, pad or mouse while the menu is open (the cursor is the menu's).
         static bool wasOpen = false;
-        if (g_open != wasOpen)
+        if ((g_open || g_holdBlock) != wasOpen)
         {
-            ps2_host_input::setGameInputBlocked(g_open);
-            wasOpen = g_open;
+            ps2_host_input::setGameInputBlocked(g_open || g_holdBlock);
+            wasOpen = g_open || g_holdBlock;
         }
         updates::frame(runtime); // (an update's steps, a resume's outcome: updates.h)
         state_manager::frame(runtime); // (a save or load asked for in the Debug page: its answer - state_manager.h)
@@ -2123,6 +2409,7 @@ namespace mod_menu
                             g_page = i;
             }
             drawMenu(runtime);
+            navLog();
             ImGui::GetStyle() = saved;
         }
         rlImGuiEnd();

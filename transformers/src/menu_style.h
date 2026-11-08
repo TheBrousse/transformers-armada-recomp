@@ -47,6 +47,25 @@ namespace menu_style
     bool smallButton(const char *label);
     // A status chip: a word in a coloured frame ("blue", "red", "dim", "amber").
     void chip(const char *text, const char *colourName);
+    // ---- Controller navigation (TODO 212): a page's rows and buttons with a gamepad ----
+    // One focus moves over the page's widgets in the order they are drawn (choiceRow / toggleRow, button,
+    // smallButton). Cross on an On / Off row flips it, on a row of more choices it takes hold of the row (Left /
+    // Right step it, Cross again sets it, Circle lets go unchanged); on a button it presses it.
+    struct NavInput
+    {
+        bool up = false, down = false, left = false, right = false, confirm = false, back = false;
+    };
+    // Before the widgets, each frame the menu is drawn: whether the pad drives the page now and this frame's presses.
+    void navBegin(bool inPage, const NavInput &input);
+    // After them: true when Circle was pressed and nothing took it (the menu then goes back a level).
+    bool navEnd();
+    // Entering a page: the focus on its first widget, at the top.
+    void navReset();
+    // The next widget drawn takes the focus (a Restart button appearing); Circle then gives it back to where it was.
+    void navFocusNext();
+    // True while a row is held (Left / Right change it).
+    bool navHolding();
+
     // The help shown in the footer: what the pointer is on (set by the rows this frame).
     void setHelp(const std::string &help);
     const std::string &help();

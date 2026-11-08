@@ -4099,6 +4099,12 @@ namespace
     // from the next one on.
     void switchPictureLock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (followRates())
+        {
+            // (TODO 217) The frame rate cap decides the rates: F4's 60 / 120 lock would bring the hidden 60 back.
+            std::fprintf(stderr, "[tf] F4: the frame rate cap decides the rates (Graphics, Frame rate limit): no lock\n");
+            return;
+        }
         const bool showing120 = g_levelRate != 0 ? inBetweenNow() : (g_pictureLock != 0 ? g_pictureLock == 120 : g_inBetween);
         // (from the screen's refresh: 120, the nearest)
         g_pictureLock = showing120 && !g_moments.load() ? 60 : 120;
@@ -4143,7 +4149,8 @@ namespace
         g_lockShown.store(g_pictureLock);
         if (g_frameRate <= 30)
             return;
-        g_frameRate = g_pictureLock != 0 ? 60 : g_logicRate.load() > 0 ? g_logicRate.load() : g_rateSetting; // (TODO 161 a: the cap caps pictures)
+        // (TODO 161 a: the cap caps pictures; TODO 217: with the cap deciding the rates, a picture lock no longer means 60)
+        g_frameRate = g_pictureLock != 0 && !followRates() ? 60 : g_logicRate.load() > 0 ? g_logicRate.load() : g_rateSetting;
         std::fprintf(stderr, "[tf] settings: %d frames a second, %s\n", g_frameRate,
                      g_moments.load() ? "pictures at the screen's refresh"
                                       : (g_pictureLock != 0 ? (g_pictureLock == 120 ? "120 pictures" : "60 pictures") : "unlocked"));
@@ -4310,10 +4317,13 @@ namespace
         }
     }
 
-    // TF_TERRAIN_DETAIL: "" / "auto" 1 (the console's) for now, else the factor (1-8).
-    float terrainDetailOf(const std::string &value)
+    // TF_TERRAIN_DETAIL: the factor (1-8); "" / "auto" from the Draw distance preset (TODO 137: the preset's factor, at
+    // most 4 - 1 = the console's).
+    float terrainDetailOf(const std::string &value, float preset)
     {
-        return value.empty() || value == "auto" ? 1.0f : std::clamp(static_cast<float>(std::atof(value.c_str())), 1.0f, 8.0f);
+        if (value.empty() || value == "auto")
+            return preset <= 1.0f ? 1.0f : std::min(preset, 4.0f);
+        return std::clamp(static_cast<float>(std::atof(value.c_str())), 1.0f, 8.0f);
     }
     constexpr uint32_t kEcoScale = 0x0061DFE8u, kEcoScaleWord = 0x006CD298u;
 
@@ -4668,7 +4678,8 @@ namespace
     // The preset's values for the settings left on Auto.
     float presetScenery(float preset) { return preset == 1.0f ? 1.0f : std::max(preset, 4.0f); }
     float presetSprites(float preset) { return preset == 1.0f ? 0.0f : 1.0f; }
-    float presetGrass(float) { return 1.0f; } // (N8 6, TODO 139: the grass's own reach - Auto the game's until measured)
+    // (TODO 137: the grass's reach the preset's factor - 1 = the console's; measured cheap: 4x about +0.2 ms of GPU time)
+    float presetGrass(float preset) { return preset <= 1.0f ? 1.0f : std::min(preset, 16.0f); }
     // The four from the preset and the settings' values ("" or "auto": the preset's).
     struct DrawDistances
     {
@@ -7121,7 +7132,7 @@ namespace
         nr::setGrassReach(d.grass);
         nr::setTextureSharpness(textureSharpnessOf(envOf("TF_SHARP_TEXTURES")));
         g_enemyDetail.store(enemyDetailOf(envOf("TF_ENEMY_DETAIL")));
-        g_terrainDetail.store(terrainDetailOf(envOf("TF_TERRAIN_DETAIL")));
+        g_terrainDetail.store(terrainDetailOf(envOf("TF_TERRAIN_DETAIL"), preset));
         if ((g_staticSceneClear = runtime.lookupFunction(kStaticSceneClear)) != nullptr)
             runtime.registerFunction(kStaticSceneClear, staticSceneClear);
         g_drawPresetShown.store(preset);
@@ -7185,8 +7196,13 @@ namespace
                      "stay at the console's 30.";
             s.choices = {{"60", "60 a second"}, {"120", "120 a second"}, {"refresh", "The screen's refresh"}};
             s.defaultValue = "refresh";
+            // (TODO 217) With the frame rate cap deciding the rates the picture lock does nothing: dimmed, saying so.
+            s.available = []() { return !followRates(); };
+            s.unavailableHelp = "Follows the frame rate limit now: the game shows a picture each frame, up to the limit. Only with TF_RATE_LADDER=1.";
             s.makeChoices = [gpu]()
             {
+                if (followRates())
+                    return std::vector<Choice>{{"follow", "Follows the frame rate limit"}}; // (TODO 217: what is in effect)
                 std::vector<Choice> list = {{"60", "60 a second"}, {"120", "120 a second"}};
                 // (moments need the GPU's native pixel path; the label says the screen's rate when known)
                 if (g_momentsShown.load() || (gpu() && ps2_settings::choice("PS2X_GPU_NATIVE") != "0"))
@@ -7203,7 +7219,11 @@ namespace
                 return list;
             };
             s.current = []()
-            { return g_momentsShown.load() ? std::string("refresh") : std::to_string(g_lockShown.load()); };
+            {
+                if (followRates())
+                    return std::string("follow");
+                return g_momentsShown.load() ? std::string("refresh") : std::to_string(g_lockShown.load());
+            };
             s.apply = [](const std::string &value)
             {
                 if (!g_levelHooks)
@@ -7296,7 +7316,7 @@ namespace
             s.defaultValue = "60";
             s.current = []() { return std::to_string(g_rateSetting); };
             s.available = []() { return !followRates(); }; // (TODO 160: the cap decides, Graphics)
-            s.unavailableHelp = "The frame rate cap (Graphics) sets the game's rate now; this one only with TF_RATE_LADDER=1.";
+            s.unavailableHelp = "Follows the frame rate limit now: the game updates as often as the limit allows, shown here. Only with TF_RATE_LADDER=1.";
             ps2_settings::add(s);
         }
         {
@@ -7319,7 +7339,9 @@ namespace
             s.order = 40;
             s.help = "How far the detail reaches: 1x is the console's, everywhere. Above it the scenery's detail goes to 4x "
                      "(it costs almost nothing), the forest's trees to this factor (they are the cost: game time and graphics "
-                     "card), drawn 3D to the edge. The settings below set each one apart (Auto: from this).";
+                     "card), drawn 3D to the edge, and the grass and the ground's close-up texture reach this factor too "
+                     "(the ground at most 4x). Enemies, your Autobot and the pickups are drawn whole at any distance (Enemy "
+                     "detail). The settings below set each one apart (Auto: from this).";
             for (const char *value : {"1", "1.5", "2", "3", "4"})
                 s.choices.push_back(Choice{value, std::string(value) + times + (std::string(value) == "1" ? " (the console's)" : "")});
             s.defaultValue = "2";
@@ -7346,6 +7368,7 @@ namespace
                 g_forestDistance.store(d.forest);
                 g_forestSprites.store(d.sprites);
                 nr::setGrassReach(d.grass);
+                g_terrainDetail.store(terrainDetailOf(ps2_settings::choice("TF_TERRAIN_DETAIL"), preset)); // (TODO 137: Auto follows)
                 return true;
             };
             ps2_settings::add(s);
@@ -7461,7 +7484,8 @@ namespace
                 s.section = "Graphics";
                 s.label = "Grass distance";
                 s.order = 44;
-                s.help = "How far the grass's blades reach before they thin out: 1x is the console's (native renderer).";
+                s.help = "How far the grass's blades reach before they thin out: 1x is the console's (native renderer). Auto: "
+                         "the Draw distance's factor.";
                 s.choices.push_back(autoChoice());
                 for (const char *value : {"1", "1.5", "2", "3", "4"})
                     s.choices.push_back(Choice{value, std::string(value) + times});
@@ -7523,14 +7547,15 @@ namespace
                 s.section = "Graphics";
                 s.label = "Ground detail distance";
                 s.order = 47;
-                s.help = "How far the ground keeps its close-up detail texture before it fades out: 1x is the console's.";
-                s.choices.push_back(Choice{"", "Auto"});
+                s.help = "How far the ground keeps its close-up detail texture before it fades out: 1x is the console's. "
+                         "Auto: the Draw distance's factor, at most 4x.";
+                s.choices.push_back(autoChoice());
                 for (const char *value : {"1", "2", "3", "4"})
                     s.choices.push_back(Choice{value, std::string(value) + times});
                 s.defaultValue = "";
                 s.apply = [](const std::string &value)
                 {
-                    g_terrainDetail.store(terrainDetailOf(value));
+                    g_terrainDetail.store(terrainDetailOf(value, g_drawPresetShown.load()));
                     return true;
                 };
                 ps2_settings::add(s);
@@ -8720,8 +8745,11 @@ namespace
             const char *momentsEnv = std::getenv("TF_MOMENTS");
             // A game frame rate above 60 asked for (TF_FRAME_RATE, the panel's "Game frame rate") wins
             // over the picture lock: a picture a frame, no in-between moments (the game itself is as
-            // fast as the pictures or faster).
-            const bool fastGame = rateSet && *rateSet && g_frameRate > 60;
+            // fast as the pictures or faster). (TODO 217) So does the frame rate cap whenever it decides the rates
+            // (followRates: no TF_RATE_LADDER): the cap is THE setting, as in PC games - a picture rate kept in
+            // settings.ini from an older version (TF_FPS_LOCK=60 / 120 / refresh, the default "refresh" too) no longer
+            // pulls the levels and the HQ down to 60 (a player at a 165 cap stayed at 60).
+            const bool fastGame = (followRates() || (rateSet && *rateSet)) && g_frameRate > 60;
             g_moments.store(momentsEnv && *momentsEnv ? *momentsEnv != '0' : (refresh && !fastGame));
             g_momentsShown.store(g_moments.load());
             if (fastGame && !(std::getenv("TF_IN_BETWEEN") && *std::getenv("TF_IN_BETWEEN")))
@@ -8732,8 +8760,8 @@ namespace
                 g_inBetween = g_fastGameFallback;
             }
             if (fastGame && (pictures == 60 || pictures == 120))
-                std::fprintf(stderr, "[tf] TF_FRAME_RATE=%d: levels at %d frames, a picture each (the picture lock left out)\n",
-                             g_frameRate, g_frameRate);
+                std::fprintf(stderr, "[tf] %s%d: levels at %d frames, a picture each (the picture lock TF_FPS_LOCK left out)\n",
+                             rateSet && *rateSet ? "TF_FRAME_RATE=" : "the frame rate cap ", g_frameRate, g_frameRate);
             else if (g_frameRate > 30 && (pictures == 60 || pictures == 120))
             {
                 if (g_frameRate != 60)

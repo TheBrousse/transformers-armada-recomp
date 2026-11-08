@@ -37,6 +37,64 @@ namespace menu_style
 
         ImVec4 v(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 
+        // (TODO 212) The controller's focus over a page (navBegin .. navEnd).
+        struct Nav
+        {
+            bool inPage = false;
+            NavInput in;
+            int index = 0;          // widgets drawn so far this frame
+            int count = 0;          // ... and the frame before
+            int focus = 0;
+            bool scroll = false;    // bring the focused widget into view
+            bool hold = false;      // a row held: Left / Right step it
+            int holdId = -1, holdValue = 0;
+            bool backTaken = false;
+            bool focusNext = false; // navFocusNext
+            int returnFocus = -1;   // where Circle takes the focus back to
+        } g_nav;
+
+        // The widget being drawn: its place in the focus order, and whether it has the focus.
+        int navItem()
+        {
+            const int id = g_nav.index++;
+            if (g_nav.inPage && g_nav.focusNext)
+            {
+                g_nav.focusNext = false;
+                if (g_nav.focus != id)
+                {
+                    g_nav.returnFocus = g_nav.focus;
+                    g_nav.focus = id;
+                }
+            }
+            return id;
+        }
+
+        bool navFocused(int id) { return g_nav.inPage && id == g_nav.focus; }
+
+        // Cross for the focused widget: taken once.
+        bool navTakeConfirm()
+        {
+            if (!g_nav.in.confirm)
+                return false;
+            g_nav.in.confirm = false;
+            return true;
+        }
+
+        // The focused widget's frame (and the page scrolled to it).
+        void navMark(ImDrawList *dl, const ImVec2 &a, const ImVec2 &b, bool held)
+        {
+            dl->AddRect(ImVec2(a.x - 1.0f, a.y - 1.0f), ImVec2(b.x + 1.0f, b.y + 1.0f), held ? kAmber : kBlue, 3.0f, 0, 2.0f);
+            if (g_nav.scroll)
+            {
+                g_nav.scroll = false;
+                // (only when it is out of the page's view: then to its middle)
+                const ImVec2 at = ImGui::GetWindowPos();
+                const float top = at.y, bottom = at.y + ImGui::GetWindowHeight();
+                if (a.y < top || b.y > bottom)
+                    ImGui::SetScrollFromPosY((a.y + b.y) * 0.5f - at.y, 0.5f);
+            }
+        }
+
         fs::path findFont(const char *name)
         {
             std::error_code e;
@@ -236,6 +294,54 @@ namespace menu_style
         const ImVec2 b(a.x + width, a.y + height);
         ImGui::PushID(id);
         ImDrawList *dl = ImGui::GetWindowDrawList();
+        const int count = static_cast<int>(choices.size());
+        // (TODO 212) The controller: Cross flips an On / Off row, holds a row of more choices (Left / Right step it,
+        // Cross sets it, Circle lets go), Circle at a held row lets go unchanged.
+        int chosen = -1;
+        const int navId = navItem();
+        const bool focused = navFocused(navId);
+        const bool held = focused && g_nav.hold && g_nav.holdId == navId;
+        if (focused && enabled && count > 0)
+        {
+            if (held)
+            {
+                if (g_nav.in.left)
+                    g_nav.holdValue = std::max(0, g_nav.holdValue - 1);
+                if (g_nav.in.right)
+                    g_nav.holdValue = std::min(count - 1, g_nav.holdValue + 1);
+                if (navTakeConfirm())
+                {
+                    if (g_nav.holdValue != current)
+                        chosen = g_nav.holdValue;
+                    g_nav.hold = false;
+                }
+                else if (g_nav.in.back)
+                {
+                    g_nav.in.back = false;
+                    g_nav.backTaken = true;
+                    g_nav.hold = false;
+                }
+            }
+            else if (navTakeConfirm())
+            {
+                if (count == 2)
+                    chosen = 1 - std::clamp(current, 0, 1);
+                else
+                {
+                    g_nav.hold = true;
+                    g_nav.holdId = navId;
+                    g_nav.holdValue = std::clamp(current, 0, count - 1);
+                }
+            }
+        }
+        const bool holding = held && g_nav.hold;
+        if (holding)
+            current = g_nav.holdValue; // (shown as it would be set)
+        if (focused)
+        {
+            navMark(dl, a, b, holding);
+            setHelp(help);
+        }
         const bool rowHovered = ImGui::IsMouseHoveringRect(a, b);
         if (rowHovered)
         {
@@ -260,8 +366,6 @@ namespace menu_style
         }
 
         // The selector: < value >, on the right half.
-        int chosen = -1;
-        const int count = static_cast<int>(choices.size());
         const float selWidth = std::min(width * 0.46f, size * 17.0f);
         const float selX = b.x - selWidth - size * 0.6f;
         const float selH = height - size * 0.55f;
@@ -345,10 +449,16 @@ namespace menu_style
         const ImVec2 dim(extent.x + padding.x * 2.0f, extent.y + padding.y * 2.0f);
         const ImVec2 a = ImGui::GetCursorScreenPos();
         const ImVec2 b(a.x + dim.x, a.y + dim.y);
-        const bool clicked = ImGui::InvisibleButton(label, dim);
-        const bool hovered = ImGui::IsItemHovered();
+        bool clicked = ImGui::InvisibleButton(label, dim);
+        const int navId = navItem(); // (TODO 212: Cross presses the focused button)
+        const bool focused = navFocused(navId);
+        if (focused && navTakeConfirm())
+            clicked = true;
+        const bool hovered = ImGui::IsItemHovered() || focused;
         const bool disabled = false;
         ImDrawList *dl = ImGui::GetWindowDrawList();
+        if (focused)
+            navMark(dl, a, b, false);
         const float cut = size * 0.35f;
         if (primary)
             chamfered(dl, a, b, cut, disabled ? kRedDark : (hovered ? IM_COL32(236, 52, 66, 255) : kRed));
@@ -382,6 +492,71 @@ namespace menu_style
         dl->AddRect(a, ImVec2(a.x + dim.x, a.y + dim.y), c, 2.0f);
         dl->AddText(font, fs, ImVec2(a.x + size * 0.4f, a.y + size * 0.175f), c, t.c_str());
     }
+
+    void navBegin(bool inPage, const NavInput &input)
+    {
+        g_nav.inPage = inPage;
+        g_nav.in = inPage ? input : NavInput{};
+        g_nav.index = 0;
+        g_nav.backTaken = false;
+        if (!inPage)
+        {
+            g_nav.hold = false;
+            g_nav.focusNext = false;
+            return;
+        }
+        if (!g_nav.hold && g_nav.count > 0)
+        {
+            if (g_nav.in.up && g_nav.focus > 0)
+            {
+                --g_nav.focus;
+                g_nav.scroll = true;
+                g_nav.returnFocus = -1;
+            }
+            if (g_nav.in.down && g_nav.focus < g_nav.count - 1)
+            {
+                ++g_nav.focus;
+                g_nav.scroll = true;
+                g_nav.returnFocus = -1;
+            }
+        }
+        // Circle at a widget that took the focus by itself (the Restart button): back to where it was.
+        if (!g_nav.hold && g_nav.in.back && g_nav.returnFocus >= 0)
+        {
+            g_nav.focus = g_nav.returnFocus;
+            g_nav.returnFocus = -1;
+            g_nav.scroll = true;
+            g_nav.in.back = false;
+            g_nav.backTaken = true;
+        }
+    }
+
+    bool navEnd()
+    {
+        if (!g_nav.inPage)
+            return false;
+        g_nav.count = g_nav.index;
+        if (g_nav.focus >= g_nav.count)
+            g_nav.focus = std::max(0, g_nav.count - 1);
+        if (g_nav.hold && g_nav.holdId >= g_nav.count)
+            g_nav.hold = false;
+        return g_nav.in.back && !g_nav.backTaken;
+    }
+
+    void navReset()
+    {
+        g_nav.focus = 0;
+        g_nav.count = 0;
+        g_nav.hold = false;
+        g_nav.returnFocus = -1;
+        g_nav.focusNext = false;
+        g_nav.scroll = false;
+        ImGui::SetScrollY(0.0f); // (the page's window: called while it is the current one)
+    }
+
+    void navFocusNext() { g_nav.focusNext = true; }
+
+    bool navHolding() { return g_nav.hold; }
 
     void setHelp(const std::string &help) { g_help = help; }
     const std::string &help() { return g_help; }

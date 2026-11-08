@@ -22,6 +22,7 @@
 #include "native_sound_mixer.h"
 
 #include "native_sound_data.h"
+#include "pad_speaker.h"
 
 #include "runtime/ps2_audio_stream.h"
 
@@ -150,6 +151,7 @@ namespace native_sound::mixer
             Envelope envelope;
             float gainLeft = 0.0f, gainRight = 0.0f, send = 0.0f, dry = 1.0f;
             std::string toneName; // (as set: a save state's record)
+            bool toPad = false;   // (TODO 213: one of the game alerts the DualSense's speaker plays, pad_speaker.h)
             uint16_t volumeWords[2] = {0u, 0u}; // (as sent: TF_NATIVE_SOUND_KON)
             float pitch = 1.0f;
             int32_t priority = 0;
@@ -309,6 +311,7 @@ namespace native_sound::mixer
             float loudness = 1.0f, pitch = 1.0f;
             std::array<float, 8> left{}, right{};
             bool channelLoudness = false; // (tag 0x49 seen: the channels' own levels, the loudness not applied on top)
+            bool toPad = false;           // (TODO 213: an HQ call's voice message, for the DualSense's speaker)
             int32_t index = 0;
 
             // a file or an album
@@ -458,6 +461,8 @@ namespace native_sound::mixer
 
         void endStream(Stream &s)
         {
+            if (s.toPad && !s.finished)
+                pad_speaker::noteAlertStreamEnded(); // (TODO 213: the HQ call's next message may follow)
             s.playing = false;
             s.finished = true;
             s.index = -1;
@@ -608,7 +613,8 @@ namespace native_sound::mixer
         double g_mixedUntil = -1.0;
         double g_fraction = 0.0;
 
-        void mixVoices(float &dryL, float &dryR, float &sendL, float &sendR)
+        // (TODO 213) toPad: the game alerts go to padL / padR instead of the PC's mix (pad_speaker.h).
+        void mixVoices(float &dryL, float &dryR, float &sendL, float &sendR, bool toPad, float &padL, float &padR)
         {
             for (auto &[handle, v] : g_voices)
             {
@@ -637,6 +643,12 @@ namespace native_sound::mixer
                 const float l = sample * v.gainLeft, r = sample * v.gainRight;
                 if (reqLog())
                     v.peak = std::max(v.peak, v.level * std::max(std::fabs(v.gainLeft), std::fabs(v.gainRight)));
+                if (toPad && v.toPad)
+                {
+                    padL += l * v.dry;
+                    padR += r * v.dry;
+                    continue;
+                }
                 dryL += l * v.dry;
                 dryR += r * v.dry;
                 sendL += l * v.send;
@@ -644,7 +656,7 @@ namespace native_sound::mixer
             }
         }
 
-        void mixStreams(float &dryL, float &dryR)
+        void mixStreams(float &dryL, float &dryR, bool toPad, float &padL, float &padR)
         {
             for (auto &[handle, s] : g_streams)
             {
@@ -678,8 +690,8 @@ namespace native_sound::mixer
                 // (the SPU2 voices of a stream get the channel loudness as their volume words: the
                 // stream's loudness only where no channel loudness was sent)
                 const float g = s.channelLoudness ? 1.0f : s.loudness;
-                dryL += l * g;
-                dryR += r * g;
+                (toPad && s.toPad ? padL : dryL) += l * g;
+                (toPad && s.toPad ? padR : dryR) += r * g;
                 s.counter += pitchRegister(s.sampleRate, s.pitch);
                 while (s.counter >= 0x1000u)
                 {
@@ -805,6 +817,7 @@ namespace native_sound::mixer
         Voice &v = g_voices[handle];
         v.tone = nullptr;
         v.toneName = name;
+        v.toPad = pad_speaker::alertTone(name);
         v.envelope = kToneEnvelope;
         for (auto it = g_libraries.rbegin(); it != g_libraries.rend() && !v.tone; ++it)
         {
@@ -851,6 +864,15 @@ namespace native_sound::mixer
     void play(int32_t handle)
     {
         Voice &v = g_voices[handle];
+        if (handle >= 0)
+        {
+            pad_speaker::noteToneKeyed(v.toneName); // (TODO 213: an HQ call's beep and its answer)
+            // TF_PAD_SPEAKER_LOG=1: each game alert keyed, and every tone with it (to find the alerts' names).
+            static const char *padLog = std::getenv("TF_PAD_SPEAKER_LOG");
+            if (padLog && (v.toPad || *padLog == '2'))
+                std::fprintf(stderr, "[pad speaker] %.3f tone '%s'%s\n", g_mixedUntil, v.toneName.c_str(),
+                             v.toPad ? " -> the controller's speaker" : "");
+        }
         if (!v.tone)
         {
             if (reqLog() && handle >= 0)
@@ -1003,11 +1025,22 @@ namespace native_sound::mixer
         return handle;
     }
 
-    void destroyStream(int32_t handle) { g_streams.erase(handle); }
+    void destroyStream(int32_t handle)
+    {
+        if (auto it = g_streams.find(handle); it != g_streams.end() && it->second.toPad && !it->second.finished)
+            pad_speaker::noteAlertStreamEnded(); // (TODO 213)
+        g_streams.erase(handle);
+    }
 
     void openStream(int32_t handle, const std::string &name)
     {
         Stream &s = g_streams[handle];
+        if (s.toPad && !s.finished)
+            pad_speaker::noteAlertStreamEnded(); // (its last message replaced before it ended)
+        s.toPad = pad_speaker::alertStream(name); // (TODO 213: an HQ call's voice messages)
+        if (s.toPad)
+            std::fprintf(stderr, "[pad speaker] %.3f '%s': an HQ call's message, for the controller's speaker\n", g_mixedUntil,
+                         name.c_str());
         s.isAlbum = false;
         s.album = data::Album{}; // (TODO 85: the stream's previous album must not stay - see loadAlbum)
         s.pendingTune.clear();
@@ -1338,19 +1371,61 @@ namespace native_sound::mixer
         if (frames == 0)
             return;
         std::vector<int16_t> out(frames * 2u);
+        // (TODO 213) The DualSense's speaker, while one plays (pad_speaker.h): the game alerts instead of the PC.
+        const bool padLive = pad_speaker::live();
+        const pad_speaker::Mode padMode = pad_speaker::mode();
+        const bool alertsToPad = padLive && padMode == pad_speaker::Mode::Alerts;
+        const float padGain = pad_speaker::volume();
+        std::vector<int16_t> pad(padLive && padMode != pad_speaker::Mode::Off ? frames * 2u : 0u);
         for (size_t i = 0; i < frames; ++i)
         {
-            float dryL = 0.0f, dryR = 0.0f, sendL = 0.0f, sendR = 0.0f;
-            mixVoices(dryL, dryR, sendL, sendR);
-            mixStreams(dryL, dryR);
+            float dryL = 0.0f, dryR = 0.0f, sendL = 0.0f, sendR = 0.0f, padL = 0.0f, padR = 0.0f;
+            mixVoices(dryL, dryR, sendL, sendR, alertsToPad, padL, padR);
+            mixStreams(dryL, dryR, alertsToPad, padL, padR);
             int32_t revL = 0, revR = 0;
             g_reverb.process(static_cast<int32_t>(sendL), static_cast<int32_t>(sendR), revL, revR);
             const float l = (dryL + static_cast<float>(revL) * g_reverb.level) * kOutputGain;
             const float r = (dryR + static_cast<float>(revR) * g_reverb.level) * kOutputGain;
             out[i * 2u] = static_cast<int16_t>(std::clamp(std::lround(l), -32768L, 32767L));
             out[i * 2u + 1u] = static_cast<int16_t>(std::clamp(std::lround(r), -32768L, 32767L));
+            if (!pad.empty())
+            {
+                const float pl = (padMode == pad_speaker::Mode::Surround ? l : padL * kOutputGain) * padGain;
+                const float pr = (padMode == pad_speaker::Mode::Surround ? r : padR * kOutputGain) * padGain;
+                pad[i * 2u] = static_cast<int16_t>(std::clamp(std::lround(pl), -32768L, 32767L));
+                pad[i * 2u + 1u] = static_cast<int16_t>(std::clamp(std::lround(pr), -32768L, 32767L));
+            }
         }
-        ps2_audio_stream::push(out.data(), frames);
+        // (TODO 213 step 3) Surround: the PC's sound held back by the speaker delay, so it plays together with the
+        // controller's (later over Bluetooth). As many frames go out as came in: a longer delay starts with silence,
+        // a shorter one skips the frames it no longer needs.
+        static std::deque<int16_t> pcDelay;
+        const size_t delayFrames = padLive && padMode == pad_speaker::Mode::Surround
+                                       ? static_cast<size_t>(pad_speaker::surroundDelayMs(static_cast<int>(
+                                             ps2_audio_stream::targetFrames() * 1000u / static_cast<size_t>(kRate)))) *
+                                             static_cast<size_t>(kRate) / 1000u
+                                       : 0u;
+        if (delayFrames == 0u)
+        {
+            pcDelay.clear();
+            ps2_audio_stream::push(out.data(), frames);
+        }
+        else
+        {
+            pcDelay.insert(pcDelay.end(), out.begin(), out.end());
+            const size_t queued = pcDelay.size() / 2u;
+            if (queued > delayFrames + frames) // (the delay was shortened)
+                pcDelay.erase(pcDelay.begin(), pcDelay.begin() + static_cast<std::ptrdiff_t>((queued - delayFrames - frames) * 2u));
+            const size_t ready = pcDelay.size() / 2u > delayFrames ? pcDelay.size() / 2u - delayFrames : 0u;
+            const size_t silence = frames - std::min(frames, ready);
+            std::fill(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(silence * 2u), int16_t{0});
+            std::copy(pcDelay.begin(), pcDelay.begin() + static_cast<std::ptrdiff_t>((frames - silence) * 2u),
+                      out.begin() + static_cast<std::ptrdiff_t>(silence * 2u));
+            pcDelay.erase(pcDelay.begin(), pcDelay.begin() + static_cast<std::ptrdiff_t>((frames - silence) * 2u));
+            ps2_audio_stream::push(out.data(), frames);
+        }
+        if (!pad.empty())
+            pad_speaker::push(pad.data(), frames);
 
         // TF_NATIVE_SOUND_KON=2: also every 2 s of sound, what plays and how loud: each voice (tone,
         // volume words, envelope level) and each stream (file, loudness, the channels' left/right).

@@ -1,5 +1,21 @@
 # What's new
 
+## 0.3.1
+
+**Fixed**
+- The frame rate no longer stays at 60 in levels and the HQ when the frame rate limit is set higher (for example 144
+  or 165). The "Frame rate limit" setting now always decides.
+
+**New**
+- The settings menu (F1) works with a controller: open it with the PS button (on Xbox, hold View and Menu), move with
+  the D-pad, Cross (A) to choose, Circle (B) to go back.
+- DualSense and DualShock 4: the light bar shows your Autobot's colour (Optimus red, Hot Shot yellow, Red Alert blue).
+- DualSense: adaptive triggers for weapon Mini-Cons (missiles click, cannons click harder, the sniper rifle resists
+  steadily), off in car mode. The shot fires at the click. "Trigger strength" in F1 > Controls.
+- DualSense: the controller's speaker plays the transform sound, enemies spotting you, the low-health warning and HQ
+  calls (Bluetooth or cable). "Surround" plays all sound from both the PC and the controller, with a delay setting
+  for Bluetooth. Both are in F1 > Controls.
+
 ## 0.3.0
 
 **Fixed**

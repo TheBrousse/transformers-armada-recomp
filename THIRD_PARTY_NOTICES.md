@@ -12,6 +12,7 @@ It uses the components below. Each keeps its own licence.
 | [Dear ImGui](https://github.com/ocornut/imgui) | Omar Cornut | MIT | The settings menu (fetched) |
 | [rlImGui](https://github.com/raylib-extras/rlImGui) | Jeffery Myers | zlib | ImGui on raylib (fetched) |
 | [xbyak](https://github.com/herumi/xbyak) | MITSUNARI Shigeo | BSD-3-Clause | Code generation at run time (fetched) |
+| [Opus](https://opus-codec.org/) | Xiph.Org Foundation and others | BSD-3-Clause | The DualSense speaker's sound over Bluetooth (fetched by a PS2Recomp patch) |
 | [fmt](https://github.com/fmtlib/fmt) | Victor Zverovich | MIT | Text formatting (fetched) |
 | [toml11](https://github.com/ToruNiina/toml11) | Toru Niina | MIT | Config files (fetched) |
 | [sse2neon](https://github.com/DLTcollab/sse2neon) | DLTcollab | MIT | SIMD helpers (fetched) |

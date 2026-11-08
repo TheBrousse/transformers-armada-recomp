@@ -1,0 +1,404 @@
+Subject: [PATCH] Runtime: the DualSense's speaker over USB (TODO 216)
+
+Over USB a DualSense is also a sound card ("Wireless Controller", 4 channels: 1-2 audio, 3-4 the actuators). While
+the game wants its speaker (setSpeakerWanted) the device thread starts a WASAPI shared-mode stream to that device
+(found by its name) on a thread of its own: the game's sound for the speaker, left + right on channel 2, the other
+channels silent, a 20 ms cushion first. The 0x02 output report then routes the audio to the built-in speaker
+(OutputState::speakerRoute: valid_flag0 0x01|0x10|0x20|0x80 - bit 1 would take the actuators out of audio mode -,
+volumes, output path 0x30 = the right channel on the speaker, audio control 2 = the speaker's pre-gain; our earlier
+launcher's USB bytes). No device, another format, a failure: no USB speaker, the game's sound stays on the PC.
+speakerUsbLatencyMs: how long after the mix the pad is heard (the cushion, the buffer, the stream's latency,
+measured at the start; -1 otherwise), for the game's Surround delay. Both transports now drop the speaker's queue
+back to its cushion when it runs 100 ms over (the pad's clock and the PC's drift apart). Links ole32.
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index aa3a5f5..862e3f9 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -594,7 +594,7 @@ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+ if(WIN32)
+     # The screen's refresh: the window's screen's vertical blanks (DXGI), or the desktop
+     # compositor's (ps2_host_display.cpp).
+-    target_link_libraries(ps2_runtime PRIVATE dwmapi dxgi d3d11 hid setupapi) # (hid, setupapi: ps2_sony_pad_host.cpp)
++    target_link_libraries(ps2_runtime PRIVATE dwmapi dxgi d3d11 hid setupapi ole32) # (hid, setupapi, ole32: ps2_sony_pad_host.cpp)
+     if(TARGET opus)
+         target_link_libraries(ps2_runtime PRIVATE opus)
+         target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_OPUS=1)
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+index bbad0ef..fce7b99 100644
+--- a/ps2xRuntime/include/runtime/ps2_sony_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -116,6 +116,9 @@ namespace ps2x::sonypad
+         // writing one again restarts it.
+         bool triggers = false;
+         uint8_t rightTrigger[11] = {}, leftTrigger[11] = {};
++        // DualSense over USB: its audio to the built-in speaker (the output path, volumes and audio control bytes), for
++        // the USB speaker stream (the pad's own audio device: channel 2 plays on the speaker).
++        bool speakerRoute = false;
+     };
+ 
+     // The output report for a pad. outputLength: the collection's OutputReportByteLength (USB only; a Bluetooth report
+@@ -210,6 +213,10 @@ namespace ps2x::sonypad
+     size_t takeSpeaker(int16_t *out, size_t count);
+     size_t speakerQueued();
+     void setSpeakerLive(bool live);
++    // Over USB: how long the speaker's sound takes to be heard (ms: the cushion, the sound device's buffer and its
++    // latency, measured when the stream starts); -1 over Bluetooth or with no USB speaker.
++    int speakerUsbLatencyMs();
++    void setSpeakerUsbLatencyMs(int ms);
+ 
+     // ---- The PS2 pad report ----
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+index 26dfc31..2b9435c 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -285,6 +285,20 @@ namespace ps2x::sonypad
+                 buf[c + 38] = 0x02u; // valid_flag2: light-bar setup control
+                 buf[c + 41] = 0x02u; // light out: fade the start-up glow so the colour shows
+             }
++            if (state.speakerRoute)
++            {
++                // The USB speaker (our earlier launcher's USB audio bytes): valid_flag0 compatible vibration only (bit 1,
++                // the haptics select, would take the actuators out of audio mode) + headphone volume, speaker volume,
++                // audio control; valid_flag1's high bits gate the extended audio fields; the output path 0x30 = the
++                // right channel on the speaker; audio control 2 = the speaker's pre-gain; valid_flag2 0x07.
++                buf[c + 0] = 0x01u | 0x10u | 0x20u | 0x80u;
++                buf[c + 1] |= 0xE0u;
++                buf[c + 4] = 0x7Fu;
++                buf[c + 5] = 0x7Fu;
++                buf[c + 7] = 0x30u;
++                buf[c + 37] = 0x0Au;
++                buf[c + 38] |= 0x07u;
++            }
+             if (state.triggers)
+             {
+                 // valid_flag0 0x04 right trigger, 0x08 left trigger (our earlier launcher's pad code: set only in a write that
+@@ -561,6 +575,15 @@ namespace ps2x::sonypad
+ 
+     bool speakerLive() { return g_speakerLive.load(std::memory_order_relaxed); }
+ 
++    namespace
++    {
++        std::atomic<int> g_speakerUsbLatency{-1};
++    }
++
++    int speakerUsbLatencyMs() { return g_speakerUsbLatency.load(std::memory_order_relaxed); }
++
++    void setSpeakerUsbLatencyMs(int ms) { g_speakerUsbLatency.store(ms); }
++
+     void setSpeakerLive(bool live)
+     {
+         if (g_speakerLive.exchange(live) != live && !live)
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+index 196a1d6..1e8c214 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+@@ -16,6 +16,11 @@
+ #include <windows.h> // this file never includes raylib, whose names clash with it
+ #include <setupapi.h>
+ #include <hidsdi.h>
++#include <mmdeviceapi.h> // (the USB speaker: WASAPI)
++#include <audioclient.h>
++#ifdef small
++#undef small // (rpcndr.h, under the COM headers, defines it: Motors::small)
++#endif
+ 
+ #if defined(PS2X_HAS_OPUS)
+ #include <opus.h>
+@@ -213,6 +218,17 @@ namespace ps2x::sonypad::host
+             return ok;
+         }
+ 
++        // The game's sound for the speaker queued past `most` frames (the pad's clock a little slower than the PC's: it
++        // would lag more and more): the oldest dropped down to `keep`.
++        void trimSpeaker(size_t most, size_t keep)
++        {
++            const size_t queued = speakerQueued();
++            if (queued <= most)
++                return;
++            std::vector<int16_t> drop((queued - keep) * 2u);
++            takeSpeaker(drop.data(), queued - keep);
++        }
++
+         // The DualSense's speaker over Bluetooth (setSpeakerWanted): every 10.67 ms one audio report 0x36 carrying the
+         // pad's state and one 10 ms Opus frame of the game's sound for it (our earlier launcher's stream, its packet
+         // format proven by the DS5Dongle project). 512 frames of the game's 48 kHz sound make each report, squeezed
+@@ -294,6 +310,7 @@ namespace ps2x::sonypad::host
+ #if defined(PS2X_HAS_OPUS)
+                 int16_t block[kBlock * 2u] = {};
+                 bool have = false;
++                trimSpeaker(kPrime + 4800u, kPrime); // (more than 100 ms over the cushion: back to it)
+                 if (!primed && speakerQueued() >= kPrime)
+                     primed = true;
+                 if (primed && speakerQueued() >= kBlock)
+@@ -322,6 +339,217 @@ namespace ps2x::sonypad::host
+             }
+         };
+ 
++        // The DualSense's speaker over USB: the pad is also a USB sound card ("Wireless Controller", 4 channels:
++        // 1-2 the audio, 3-4 the actuators). With the output report's path set to the speaker (OutputState::
++        // speakerRoute: channel 2 plays on it), the game's sound for it is rendered there with WASAPI in shared mode,
++        // left + right mixed to that channel, the actuator channels silent (our earlier launcher's USB stream). The
++        // endpoint is found by its name; a thread of its own renders; any failure: no USB speaker (the PC plays).
++        // (from functiondiscoverykeys_devpkey.h / ksmedia.h, written out: no GUID definitions pulled into this file)
++        const PROPERTYKEY kFriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
++        const GUID kSubtypeFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++
++        class UsbSpeaker
++        {
++        public:
++            ~UsbSpeaker() { stop(); }
++
++            void start()
++            {
++                if (m_thread.joinable())
++                    return;
++                m_stop = false;
++                m_thread = std::thread([this]() { run(); });
++            }
++
++            void stop()
++            {
++                if (!m_thread.joinable())
++                    return;
++                m_stop = true;
++                m_thread.join();
++            }
++
++            bool running() const { return m_thread.joinable(); }
++
++        private:
++            template <typename T>
++            static void release(T *&p)
++            {
++                if (p)
++                    p->Release();
++                p = nullptr;
++            }
++
++            // The pad's render endpoint: an active one whose name has "Wireless Controller" (the DualSense's USB
++            // audio function, "Speakers (2- DualSense Wireless Controller)" and the like).
++            static IMMDevice *findEndpoint(std::string &name)
++            {
++                IMMDeviceEnumerator *enumerator = nullptr;
++                if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
++                                            reinterpret_cast<void **>(&enumerator))))
++                    return nullptr;
++                IMMDeviceCollection *devices = nullptr;
++                IMMDevice *found = nullptr;
++                if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices)))
++                {
++                    UINT count = 0;
++                    devices->GetCount(&count);
++                    for (UINT i = 0; i < count && !found; ++i)
++                    {
++                        IMMDevice *device = nullptr;
++                        if (FAILED(devices->Item(i, &device)))
++                            continue;
++                        IPropertyStore *props = nullptr;
++                        if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)))
++                        {
++                            PROPVARIANT v;
++                            PropVariantInit(&v);
++                            if (SUCCEEDED(props->GetValue(kFriendlyName, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
++                            {
++                                std::wstring w(v.pwszVal);
++                                std::wstring lowered = w;
++                                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
++                                               [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
++                                if (lowered.find(L"wireless controller") != std::wstring::npos)
++                                {
++                                    found = device;
++                                    device = nullptr;
++                                    name = narrow(w);
++                                }
++                            }
++                            PropVariantClear(&v);
++                            props->Release();
++                        }
++                        release(device);
++                    }
++                    devices->Release();
++                }
++                enumerator->Release();
++                return found;
++            }
++
++            void run()
++            {
++                const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++                bool announcedMissing = false;
++                while (!m_stop)
++                {
++                    if (!session(announcedMissing))
++                        for (int i = 0; i < 40 && !m_stop; ++i) // (not there, or it failed: look again in 2 s)
++                            Sleep(50);
++                }
++                setSpeakerLive(false);
++                if (SUCCEEDED(com))
++                    CoUninitialize();
++            }
++
++            // One stream to the endpoint; false when it could not start.
++            bool session(bool &announcedMissing)
++            {
++                std::string name;
++                IMMDevice *device = findEndpoint(name);
++                if (!device)
++                {
++                    if (!announcedMissing)
++                        logLine("[sonypad] the DualSense's USB speaker: no \"Wireless Controller\" sound device found (yet)");
++                    announcedMissing = true;
++                    return false;
++                }
++                IAudioClient *client = nullptr;
++                IAudioRenderClient *render = nullptr;
++                WAVEFORMATEX *format = nullptr;
++                HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++                bool ok = SUCCEEDED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client))) &&
++                          SUCCEEDED(client->GetMixFormat(&format)) && ready;
++                bool isFloat = false;
++                if (ok)
++                {
++                    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++                        isFloat = true;
++                    else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= 22)
++                        isFloat = reinterpret_cast<WAVEFORMATEXTENSIBLE *>(format)->SubFormat == kSubtypeFloat;
++                    ok = (isFloat && format->wBitsPerSample == 32) || (!isFloat && format->wBitsPerSample == 16);
++                    ok = ok && format->nChannels >= 1u && format->nSamplesPerSec == 48000u;
++                    if (!ok)
++                        logLine("[sonypad] the DualSense's USB speaker: its sound device's format is not one this stream writes");
++                }
++                const REFERENCE_TIME bufferTime = 400000; // 40 ms
++                ok = ok && SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, bufferTime, 0, format,
++                                                        nullptr)) &&
++                     SUCCEEDED(client->SetEventHandle(ready)) &&
++                     SUCCEEDED(client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void **>(&render)));
++                UINT32 bufferFrames = 0;
++                ok = ok && SUCCEEDED(client->GetBufferSize(&bufferFrames)) && SUCCEEDED(client->Start());
++                if (ok)
++                {
++                    const unsigned channels = format->nChannels;
++                    // How long until the pad is heard: the cushion, the buffer kept full, the stream's own latency.
++                    REFERENCE_TIME streamLatency = 0;
++                    client->GetStreamLatency(&streamLatency);
++                    const int latencyMs = 20 + static_cast<int>(static_cast<int64_t>(bufferFrames) * 1000 / 48000) +
++                                          static_cast<int>(streamLatency / 10000);
++                    setSpeakerUsbLatencyMs(latencyMs);
++                    logLine("[sonypad] the DualSense's speaker: the game's sound plays on it over USB (\"" + name + "\", " +
++                            std::to_string(channels) + " channels, heard about " + std::to_string(latencyMs) + " ms after it is mixed)");
++                    setSpeakerLive(true);
++                    bool primed = false;
++                    std::vector<int16_t> frames;
++                    while (!m_stop)
++                    {
++                        if (WaitForSingleObject(ready, 100) != WAIT_OBJECT_0)
++                            continue;
++                        UINT32 padding = 0;
++                        if (FAILED(client->GetCurrentPadding(&padding)))
++                            break; // (the device went away: unplugged)
++                        const UINT32 room = bufferFrames - padding;
++                        if (room == 0u)
++                            continue;
++                        BYTE *data = nullptr;
++                        if (FAILED(render->GetBuffer(room, &data)))
++                            break;
++                        trimSpeaker(960u + 4800u, 960u); // (more than 100 ms over the cushion: back to it)
++                        if (!primed && speakerQueued() >= 960u)
++                            primed = true; // (20 ms held first: a jitter cushion)
++                        frames.assign(static_cast<size_t>(room) * 2u, 0);
++                        size_t have = primed ? takeSpeaker(frames.data(), room) : 0u;
++                        if (primed && have < room)
++                            primed = false; // (ran dry: silence until the cushion is back)
++                        for (UINT32 i = 0; i < room; ++i)
++                        {
++                            // left + right on channel 2 (the speaker's), the rest silent
++                            const float mono = std::clamp((frames[i * 2u] + frames[i * 2u + 1u]) * 0.75f / 32768.0f, -1.0f, 1.0f);
++                            for (unsigned c = 0; c < channels; ++c)
++                            {
++                                const float v = (c == 1u || channels == 1u) ? mono : 0.0f;
++                                if (isFloat)
++                                    reinterpret_cast<float *>(data)[i * channels + c] = v;
++                                else
++                                    reinterpret_cast<int16_t *>(data)[i * channels + c] = static_cast<int16_t>(v * 32767.0f);
++                            }
++                        }
++                        render->ReleaseBuffer(room, 0);
++                    }
++                    client->Stop();
++                    setSpeakerLive(false);
++                    setSpeakerUsbLatencyMs(-1);
++                    logLine("[sonypad] the DualSense's USB speaker stops");
++                }
++                else
++                    logLine("[sonypad] the DualSense's USB speaker cannot start: its sound stays on the PC");
++                release(render);
++                release(client);
++                if (format)
++                    CoTaskMemFree(format);
++                if (ready)
++                    CloseHandle(ready);
++                release(device);
++                return ok;
++            }
++
++            std::thread m_thread;
++            std::atomic<bool> m_stop{false};
++        };
++
+         class Host
+         {
+         public:
+@@ -565,6 +793,9 @@ namespace ps2x::sonypad::host
+                 bool triggersSent = false; // (the first write clears any effect a pad still holds)
+                 std::string endReason = "stopping";
+                 SpeakerStream speaker;
++                UsbSpeaker usbSpeaker; // (over USB: the pad's own sound device)
++                const bool usbSpeakerPossible = canWrite && device.model == Model::DualSense && device.link == Link::Usb;
++                bool writtenRoute = false;
+                 bool speakerRefused = false; // (the encoder would not start, or the pad refused its reports: not again)
+                 const bool speakerPossible = canWrite && device.model == Model::DualSense && device.link == Link::Bluetooth;
+ 
+@@ -732,12 +963,25 @@ namespace ps2x::sonypad::host
+                         }
+                     }
+ 
++                    // The DualSense's speaker over USB: its sound device, and the output path in the 0x02 reports.
++                    if (usbSpeakerPossible && writesOn)
++                    {
++                        const bool wanted = speakerWanted();
++                        if (wanted && !usbSpeaker.running())
++                            usbSpeaker.start();
++                        else if (!wanted && usbSpeaker.running())
++                            usbSpeaker.stop();
++                        if (usbSpeaker.running() != writtenRoute)
++                            writtenGeneration = guestMotorsGeneration() - 1u; // (the path written at once)
++                    }
++
+                     // Output: the light-bar takeover once, then the state on every motor change and as a keep-alive.
+                     // (Not while the speaker streams: its reports carry the state.)
+                     if (writesOn && !speaker.on)
+                     {
+                         const uint64_t generation = guestMotorsGeneration();
+                         OutputState out = outputState(false, false);
++                        out.speakerRoute = usbSpeaker.running();
+                         const bool rumbling = out.weakMotor != 0u || out.strongMotor != 0u;
+                         // (the game's light bar and triggers: a new colour - a blink's turn too - or new effects)
+                         const bool colourChanged = out.lightbar && (out.red != writtenRgb[0] || out.green != writtenRgb[1] ||
+@@ -771,6 +1015,7 @@ namespace ps2x::sonypad::host
+                                 writtenGeneration = generation;
+                                 if (ok)
+                                 {
++                                    writtenRoute = out.speakerRoute;
+                                     writtenRgb[0] = out.red;
+                                     writtenRgb[1] = out.green;
+                                     writtenRgb[2] = out.blue;
+@@ -830,6 +1075,7 @@ namespace ps2x::sonypad::host
+                 }
+ 
+                 speaker.stop(stopping() ? "closing" : "the connection ended");
++                usbSpeaker.stop();
+                 const bool closing = stopping();
+                 if (pending)
+                 {

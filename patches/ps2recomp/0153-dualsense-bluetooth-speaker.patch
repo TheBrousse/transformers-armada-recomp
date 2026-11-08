@@ -1,0 +1,483 @@
+Subject: [PATCH] Runtime: the DualSense's speaker over Bluetooth (TODO 213)
+
+The game hands its sound for the controller's speaker to the runtime (ps2_sony_pad.h: setSpeakerWanted,
+submitSpeaker, speakerLive). On a DualSense over Bluetooth the device thread then sends an audio report 0x36
+every 10.67 ms: the audio set-up, the pad's state (motors, light bar, player LEDs, trigger effects when they
+change, the speaker's volume bytes it needs in every report), an empty haptics block and one 10 ms Opus frame
+(200 bytes, constant bit rate) of 512 frames of the game's 48 kHz sound squeezed to 480 - the layout and cadence
+of our earlier launcher's stream (its packet format proven by the DS5Dongle project). While it streams the 0x31
+reports stop (the state rides the audio reports). A 1024-frame cushion before the first frame; silence while the
+game's sound runs dry. 50 refused reports in a row: the stream stops for that connection and the sound stays on
+the PC. libopus 1.5.2 (BSD) comes in through FetchContent (Windows).
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 456c030..aa3a5f5 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -165,6 +165,21 @@ else()
+ 
+         set(PS2X_XBYAK_INCLUDE_DIR "${xbyak_SOURCE_DIR}")
+     endif()
++
++    # libopus (BSD licence): the DualSense's speaker over Bluetooth takes Opus frames (ps2_sony_pad_host.cpp).
++    if(WIN32 AND NOT PS2X_IS_ANDROID)
++        set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
++        set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
++        set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
++        set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
++        FetchContent_Declare(
++            opus
++            GIT_REPOSITORY https://github.com/xiph/opus.git
++            GIT_TAG "v1.5.2"
++            GIT_SHALLOW TRUE
++        )
++        FetchContent_MakeAvailable(opus)
++    endif()
+ endif()
+ 
+ add_library(ps2_host_backend INTERFACE)
+@@ -580,6 +595,10 @@ if(WIN32)
+     # The screen's refresh: the window's screen's vertical blanks (DXGI), or the desktop
+     # compositor's (ps2_host_display.cpp).
+     target_link_libraries(ps2_runtime PRIVATE dwmapi dxgi d3d11 hid setupapi) # (hid, setupapi: ps2_sony_pad_host.cpp)
++    if(TARGET opus)
++        target_link_libraries(ps2_runtime PRIVATE opus)
++        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_OPUS=1)
++    endif()
+ endif()
+ if(DEFINED raylib_SOURCE_DIR)
+     # The GPU renderer (gs_gpu.cpp) uses raylib's GL loader and its GLFW.
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+index 3d86f16..bbad0ef 100644
+--- a/ps2xRuntime/include/runtime/ps2_sony_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -125,6 +125,15 @@ namespace ps2x::sonypad
+     // The feature report whose read switches a Bluetooth pad from its basic to its full input report.
+     uint8_t fullReportFeatureId(Model model);
+ 
++    // A DualSense's Bluetooth audio report 0x36 (398 bytes, CRC32 included): the audio set-up, the pad's state (as
++    // the 0x31 report carries it: motors, light bar, player LEDs, the trigger effects when state.triggers, plus the
++    // speaker's volume and audio bytes the speaker needs in every one), an empty haptics block and one speaker
++    // Opus frame (up to kSpeakerOpusBytes). seq counts 0..15, counter 0..255; bufferMs: the pad's own audio buffer.
++    constexpr size_t kSpeakerReportLength = 398u;
++    constexpr size_t kSpeakerOpusBytes = 200u;
++    std::vector<uint8_t> buildSpeakerReport(const OutputState &state, const uint8_t *opus, size_t opusBytes, uint8_t seq,
++                                            uint8_t counter, uint8_t bufferMs);
++
+     // ---- The game's vibration ----
+ 
+     // As the guest wrote it: the small motor is on/off (only bit 0 counts, as on a DualShock 2), the large one 0..255.
+@@ -187,6 +196,21 @@ namespace ps2x::sonypad
+     // Increases with every change of either request (the device thread writes on a change).
+     uint64_t padRequestGeneration();
+ 
++    // ---- The DualSense's own speaker ----
++    // The game wants its speaker (its sound for it follows through submitSpeaker); false: no stream, the pad's own
++    // audio untouched. Any thread.
++    void setSpeakerWanted(bool wanted);
++    bool speakerWanted();
++    // A speaker plays the game's sound now: a DualSense over Bluetooth with its audio stream running.
++    bool speakerLive();
++    // The game's sound for the speaker: 48 kHz stereo frames, interleaved. Kept for the device thread (the oldest
++    // dropped past a quarter of a second); without a live speaker they are dropped.
++    void submitSpeaker(const int16_t *frames, size_t count);
++    // The device thread: up to `count` frames; how many there were. And the speaker's state for speakerLive.
++    size_t takeSpeaker(int16_t *out, size_t count);
++    size_t speakerQueued();
++    void setSpeakerLive(bool live);
++
+     // ---- The PS2 pad report ----
+ 
+     // data[1] of the pad backend's 32-byte report when data[8..19] carry real pressures (DualShock 2 pressure mode).
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+index 5a2f00c..26dfc31 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
+ #include <iostream>
+ #include <mutex>
+ 
+@@ -333,6 +334,76 @@ namespace ps2x::sonypad
+ 
+     uint8_t fullReportFeatureId(Model model) { return model == Model::DualSense ? 0x05u : 0x02u; }
+ 
++    std::vector<uint8_t> buildSpeakerReport(const OutputState &state, const uint8_t *opus, size_t opusBytes, uint8_t seq,
++                                            uint8_t counter, uint8_t bufferMs)
++    {
++        // The layout of our earlier launcher's Bluetooth speaker stream (its packet format proven by the DS5Dongle
++        // project): [0] 0x36, [1] seq << 4, [2..10] sub-report 0x91 (7 bytes: mic off, the pad's audio buffer x5, a
++        // counter), [11..75] sub-report 0x90 (the 63-byte state), [76..141] 0x92 haptics (64 bytes, left silent),
++        // [142..343] 0x93 the speaker's Opus frame (0x96 would be the headset jack), CRC32 (seed 0xA2) at the end.
++        std::vector<uint8_t> b(kSpeakerReportLength, 0u);
++        b[0] = 0x36u;
++        b[1] = static_cast<uint8_t>((seq & 0x0Fu) << 4);
++        b[2] = 0x91u;
++        b[3] = 7u;
++        b[4] = 0xFEu; // (bit 0: the microphone, off)
++        for (size_t i = 5; i <= 9; ++i)
++            b[i] = bufferMs;
++        b[10] = counter;
++        b[11] = 0x90u;
++        b[12] = 63u;
++        // The state block. The volume and audio bytes are needed in every report or the speaker falls silent; the
++        // rest is the 0x31 report's common block (motors, LEDs), the trigger effects only in a report that changes
++        // them (a written effect restarts).
++        static const uint8_t kBase[47] = {
++            0xF1, 0xF7, 0, 0,       // valid flags: rumble, volumes, audio control / LEDs, player LEDs, audio control 2
++            0x7F, 0x64, 0x40, 0x09, // headphone, speaker, microphone volume; audio control
++            0, 0,                   // mute LED, power save (none: they gate the audio off)
++            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // R2 effect
++            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // L2 effect
++            0, 0, 0, 0,             // host timestamp
++            0, 0x0A,                // motor power, audio control 2 (the speaker's pre-gain)
++            0x07, 0, 0,             // valid flags 2, haptic low-pass
++            0x02, 0x01, 0,          // light fade, brightness, player LEDs
++            0, 0, 0,                // colour
++        };
++        uint8_t *s = &b[13];
++        std::memcpy(s, kBase, sizeof(kBase));
++        s[2] = state.weakMotor;
++        s[3] = state.strongMotor;
++        if (state.triggers)
++        {
++            s[0] |= 0x04u | 0x08u;
++            std::memcpy(&s[10], state.rightTrigger, 11u);
++            std::memcpy(&s[21], state.leftTrigger, 11u);
++        }
++        if (state.lightbar)
++        {
++            s[43] = state.playerLeds;
++            s[44] = state.red;
++            s[45] = state.green;
++            s[46] = state.blue;
++        }
++        else
++            s[1] &= static_cast<uint8_t>(~(0x04u | 0x10u)); // (the LEDs left to the pad)
++        b[76] = 0x92u;
++        b[77] = 64u;
++        if (opus && opusBytes)
++        {
++            const size_t n = std::min(opusBytes, kSpeakerOpusBytes);
++            b[142] = 0x13u | 0x80u;
++            b[143] = static_cast<uint8_t>(n);
++            std::memcpy(&b[144], opus, n);
++        }
++        const size_t n = b.size() - 4u;
++        const uint32_t crc = bluetoothCrc(kCrcSeedOutput, b.data(), n);
++        b[n + 0] = static_cast<uint8_t>(crc);
++        b[n + 1] = static_cast<uint8_t>(crc >> 8);
++        b[n + 2] = static_cast<uint8_t>(crc >> 16);
++        b[n + 3] = static_cast<uint8_t>(crc >> 24);
++        return b;
++    }
++
+     Motors decodeActDirect(const uint8_t align[6], const uint8_t data[6])
+     {
+         Motors motors;
+@@ -472,6 +543,59 @@ namespace ps2x::sonypad
+ 
+     uint64_t padRequestGeneration() { return g_requestGeneration.load(std::memory_order_acquire); }
+ 
++    namespace
++    {
++        std::atomic<bool> g_speakerWanted{false}, g_speakerLive{false};
++        std::mutex g_speakerMutex;
++        std::deque<int16_t> g_speakerFrames; // interleaved stereo
++        constexpr size_t kSpeakerMaxFrames = 48000u / 4u;
++    }
++
++    void setSpeakerWanted(bool wanted)
++    {
++        if (g_speakerWanted.exchange(wanted) != wanted)
++            host::wake();
++    }
++
++    bool speakerWanted() { return g_speakerWanted.load(std::memory_order_relaxed); }
++
++    bool speakerLive() { return g_speakerLive.load(std::memory_order_relaxed); }
++
++    void setSpeakerLive(bool live)
++    {
++        if (g_speakerLive.exchange(live) != live && !live)
++        {
++            std::lock_guard<std::mutex> lock(g_speakerMutex);
++            g_speakerFrames.clear();
++        }
++    }
++
++    void submitSpeaker(const int16_t *frames, size_t count)
++    {
++        if (!g_speakerLive.load(std::memory_order_relaxed) || !frames)
++            return;
++        std::lock_guard<std::mutex> lock(g_speakerMutex);
++        g_speakerFrames.insert(g_speakerFrames.end(), frames, frames + count * 2u);
++        if (g_speakerFrames.size() > kSpeakerMaxFrames * 2u)
++            g_speakerFrames.erase(g_speakerFrames.begin(),
++                                  g_speakerFrames.begin() + static_cast<std::ptrdiff_t>(g_speakerFrames.size() - kSpeakerMaxFrames * 2u));
++    }
++
++    size_t takeSpeaker(int16_t *out, size_t count)
++    {
++        std::lock_guard<std::mutex> lock(g_speakerMutex);
++        const size_t n = std::min(count, g_speakerFrames.size() / 2u);
++        std::copy(g_speakerFrames.begin(), g_speakerFrames.begin() + static_cast<std::ptrdiff_t>(n * 2u), out);
++        g_speakerFrames.erase(g_speakerFrames.begin(), g_speakerFrames.begin() + static_cast<std::ptrdiff_t>(n * 2u));
++        return n;
++    }
++
++    size_t speakerQueued()
++    {
++        std::lock_guard<std::mutex> lock(g_speakerMutex);
++        return g_speakerFrames.size() / 2u;
++    }
++
+     bool gamepadButtonDown(const InputState &state, int raylibButton)
+     {
+         uint32_t mask = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+index 4152245..196a1d6 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+@@ -17,9 +17,14 @@
+ #include <setupapi.h>
+ #include <hidsdi.h>
+ 
++#if defined(PS2X_HAS_OPUS)
++#include <opus.h>
++#endif
++
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -208,6 +213,115 @@ namespace ps2x::sonypad::host
+             return ok;
+         }
+ 
++        // The DualSense's speaker over Bluetooth (setSpeakerWanted): every 10.67 ms one audio report 0x36 carrying the
++        // pad's state and one 10 ms Opus frame of the game's sound for it (our earlier launcher's stream, its packet
++        // format proven by the DS5Dongle project). 512 frames of the game's 48 kHz sound make each report, squeezed
++        // to the 480 an Opus frame holds: the pad plays a frame per 10.67 ms (the launcher's measurement - feeding it
++        // every 10 ms overflows its buffer). While it streams, the state rides these reports (no 0x31 writes).
++        struct SpeakerStream
++        {
++            static constexpr int64_t kPeriodUs = 10667;   // 512 frames at 48 kHz
++            static constexpr size_t kBlock = 512u, kOpusFrames = 480u;
++            static constexpr size_t kPrime = 1024u;       // frames held before the first report (a jitter cushion)
++            static constexpr uint8_t kPadBufferMs = 64u;  // the pad's own buffer (the launcher's default)
++            bool on = false, primed = false;
++            int64_t nextUs = 0;
++            uint8_t seq = 0u, counter = 0u;
++            int failuresInRow = 0;
++            uint64_t sent = 0u, silent = 0u;
++#if defined(PS2X_HAS_OPUS)
++            OpusEncoder *encoder = nullptr;
++#endif
++            ~SpeakerStream() { release(); }
++
++            static int64_t nowUs()
++            {
++                return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++            }
++
++            bool start()
++            {
++#if defined(PS2X_HAS_OPUS)
++                if (!encoder)
++                {
++                    int error = 0;
++                    encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &error);
++                    if (!encoder || error != OPUS_OK)
++                    {
++                        logLine("[sonypad] the speaker's Opus encoder cannot start (error " + std::to_string(error) + ")");
++                        encoder = nullptr;
++                        return false;
++                    }
++                    // (a constant bit rate: exactly kSpeakerOpusBytes a 10 ms frame)
++                    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(static_cast<opus_int32>(kSpeakerOpusBytes * 8u * 100u)));
++                    opus_encoder_ctl(encoder, OPUS_SET_VBR(0));
++                    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
++                }
++                on = true;
++                primed = false;
++                nextUs = nowUs();
++                failuresInRow = 0;
++                setSpeakerLive(true);
++                logLine("[sonypad] the DualSense's speaker: the game's sound streams to it over Bluetooth");
++                return true;
++#else
++                return false;
++#endif
++            }
++
++            void stop(const char *why)
++            {
++                if (!on)
++                    return;
++                on = false;
++                setSpeakerLive(false);
++                logLine(std::string("[sonypad] the DualSense's speaker stops (") + why + "): " + std::to_string(sent) +
++                        " reports, " + std::to_string(silent) + " of them silent");
++            }
++
++            void release()
++            {
++#if defined(PS2X_HAS_OPUS)
++                if (encoder)
++                    opus_encoder_destroy(encoder);
++                encoder = nullptr;
++#endif
++            }
++
++            // One Opus frame of the next 512 frames of the game's sound (silence while there are not enough).
++            size_t encodeNext(uint8_t *opus)
++            {
++#if defined(PS2X_HAS_OPUS)
++                int16_t block[kBlock * 2u] = {};
++                bool have = false;
++                if (!primed && speakerQueued() >= kPrime)
++                    primed = true;
++                if (primed && speakerQueued() >= kBlock)
++                    have = takeSpeaker(block, kBlock) == kBlock;
++                else if (primed)
++                    primed = false; // (ran dry: hold off until the cushion is back)
++                if (!have)
++                    ++silent;
++                // 512 frames squeezed to 480, linearly
++                int16_t frame[kOpusFrames * 2u];
++                for (size_t i = 0; i < kOpusFrames; ++i)
++                {
++                    const double at = static_cast<double>(i) * static_cast<double>(kBlock - 1u) / static_cast<double>(kOpusFrames - 1u);
++                    const size_t j = static_cast<size_t>(at);
++                    const size_t k = std::min(j + 1u, kBlock - 1u);
++                    const double f = at - static_cast<double>(j);
++                    for (size_t c = 0; c < 2u; ++c)
++                        frame[i * 2u + c] = static_cast<int16_t>(std::lround(block[j * 2u + c] * (1.0 - f) + block[k * 2u + c] * f));
++                }
++                const opus_int32 n = opus_encode(encoder, frame, static_cast<int>(kOpusFrames), opus, static_cast<opus_int32>(kSpeakerOpusBytes));
++                return n > 0 ? static_cast<size_t>(n) : 0u;
++#else
++                (void)opus;
++                return 0u;
++#endif
++            }
++        };
++
+         class Host
+         {
+         public:
+@@ -450,6 +564,9 @@ namespace ps2x::sonypad::host
+                 TriggerRequest writtenTriggers;
+                 bool triggersSent = false; // (the first write clears any effect a pad still holds)
+                 std::string endReason = "stopping";
++                SpeakerStream speaker;
++                bool speakerRefused = false; // (the encoder would not start, or the pad refused its reports: not again)
++                const bool speakerPossible = canWrite && device.model == Model::DualSense && device.link == Link::Bluetooth;
+ 
+                 if (!canWrite)
+                     logLine("[sonypad] the " + std::string(modelName(device.model)) +
+@@ -526,7 +643,8 @@ namespace ps2x::sonypad::host
+                     if (pending)
+                     {
+                         HANDLE waits[3] = {readEvent, m_wakeEvent, m_stopEvent};
+-                        const DWORD signalled = WaitForMultipleObjects(3, waits, FALSE, kWaitSliceMs);
++                        // (the speaker's reports are due every 10.67 ms: then a short wait)
++                        const DWORD signalled = WaitForMultipleObjects(3, waits, FALSE, speaker.on ? 2u : kWaitSliceMs);
+                         if (signalled == WAIT_OBJECT_0)
+                         {
+                             DWORD length = 0;
+@@ -545,8 +663,78 @@ namespace ps2x::sonypad::host
+                     }
+ 
+                     const int64_t now = nowMs();
++                    // The DualSense's speaker over Bluetooth: its reports carry the pad's state too, every 10.67 ms.
++                    if (speakerPossible && writesOn && !speakerRefused)
++                    {
++                        const bool wanted = speakerWanted();
++                        if (wanted && !speaker.on && !speaker.start())
++                            speakerRefused = true;
++                        else if (!wanted && speaker.on)
++                        {
++                            speaker.stop("not wanted");
++                            writtenGeneration = guestMotorsGeneration() - 1u; // (the 0x31 state at once again)
++                        }
++                        int64_t nowUs = SpeakerStream::nowUs();
++                        if (speaker.on && nowUs - speaker.nextUs > 100000)
++                            speaker.nextUs = nowUs; // (far behind - a stall: no burst to catch up)
++                        while (speaker.on && nowUs >= speaker.nextUs)
++                        {
++                            OutputState out = outputState(false, false);
++                            const TriggerRequest triggers = triggerRequest();
++                            const bool triggersChanged = !triggersSent || triggers != writtenTriggers;
++                            if (triggersChanged)
++                            {
++                                out.triggers = true;
++                                if (triggers.active)
++                                {
++                                    std::memcpy(out.leftTrigger, triggers.left, 11u);
++                                    std::memcpy(out.rightTrigger, triggers.right, 11u);
++                                }
++                            }
++                            uint8_t opus[kSpeakerOpusBytes];
++                            const size_t bytes = speaker.encodeNext(opus);
++                            const std::vector<uint8_t> report =
++                                buildSpeakerReport(out, opus, bytes, speaker.seq, speaker.counter, SpeakerStream::kPadBufferMs);
++                            DWORD error = 0;
++                            const bool ok = write(h, device, report, error);
++                            speaker.seq = static_cast<uint8_t>((speaker.seq + 1u) & 0x0Fu);
++                            ++speaker.counter;
++                            ++speaker.sent;
++                            speaker.nextUs += SpeakerStream::kPeriodUs;
++                            lastWrite = now;
++                            writtenGeneration = guestMotorsGeneration();
++                            if (ok)
++                            {
++                                speaker.failuresInRow = 0;
++                                writtenRgb[0] = out.red;
++                                writtenRgb[1] = out.green;
++                                writtenRgb[2] = out.blue;
++                                if (triggersChanged)
++                                {
++                                    writtenTriggers = triggers;
++                                    triggersSent = true;
++                                }
++                            }
++                            else if (++speaker.failuresInRow >= 50)
++                            {
++                                // (the pad will not take them: its sound back on the PC, the 0x31 reports again)
++                                logLine("[sonypad] the DualSense refuses the speaker's reports (error " + std::to_string(error) +
++                                        "): its sound stays on the PC");
++                                speaker.stop("refused");
++                                speakerRefused = true;
++                                writtenGeneration = guestMotorsGeneration() - 1u;
++                            }
++                            if (m_config.trace && (speaker.sent <= 3u || speaker.sent % 1000u == 0u))
++                                logLine("[sonypad] speaker report " + std::to_string(speaker.sent) + " (" + std::to_string(bytes) +
++                                        " Opus bytes, " + std::to_string(speakerQueued()) + " frames queued): " +
++                                        (ok ? "ok" : "error " + std::to_string(error)));
++                            nowUs = SpeakerStream::nowUs();
++                        }
++                    }
++
+                     // Output: the light-bar takeover once, then the state on every motor change and as a keep-alive.
+-                    if (writesOn)
++                    // (Not while the speaker streams: its reports carry the state.)
++                    if (writesOn && !speaker.on)
+                     {
+                         const uint64_t generation = guestMotorsGeneration();
+                         OutputState out = outputState(false, false);
+@@ -641,6 +829,7 @@ namespace ps2x::sonypad::host
+                     }
+                 }
+ 
++                speaker.stop(stopping() ? "closing" : "the connection ended");
+                 const bool closing = stopping();
+                 if (pending)
+                 {
