@@ -353,6 +353,9 @@ impl Job {
         let log_path = self.folder.join(if self.update { "update-setup.log" } else { "setup.log" });
         let log = Arc::new(Mutex::new(std::fs::File::create(&log_path).ok()));
         let mut path_env = std::env::var("PATH").unwrap_or_default();
+        // (a run that does not finish - closed half way - leaves this mark: the setup opens again next time,
+        // not the game; a player's report. Installs from before the mark have none: finished.)
+        let _ = std::fs::write(self.folder.join(UNFINISHED_MARK), b"");
 
         if self.update {
             // update.ps1 does it all (and, for the game's own update, starts it again: -Play).
@@ -377,6 +380,7 @@ impl Job {
             self.exec("powershell", &refs, Some(&repo), &path_env, tx, STEP_DOWNLOAD, &log)
                 .map_err(|e| format!("{e}\n\nThe full log: {}", log_path.display()))?;
             copy_self(&self.folder);
+            let _ = std::fs::remove_file(self.folder.join(UNFINISHED_MARK));
             return Ok(());
         }
 
@@ -437,6 +441,8 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
                 Ok(()) => {
                     copy_self(&self.folder);
                     remember_folder(&self.folder);
+                    let _ = std::fs::remove_file(self.folder.join(UNFINISHED_MARK));
+                    desktop_shortcut_once(&self.folder, &repo);
                     return Ok(());
                 }
                 Err(e) if attempt == 0 && e.contains("prerequisites installed") => {
@@ -626,6 +632,9 @@ fn compile_progress(text: &str) -> Option<f32> {
     Some(0.40 + 0.20 * (done / total).clamp(0.0, 1.0))
 }
 
+/// The mark a setup run keeps in the install folder until it has finished every step.
+const UNFINISHED_MARK: &str = ".setup_unfinished";
+
 /// Where the install finished last, so a setup started from somewhere else (a launcher's own copy, Quiver) finds it.
 fn remembered_folder_file() -> Option<PathBuf> {
     std::env::var("LOCALAPPDATA").ok().map(|v| Path::new(&v).join("TransformersArmadaSetup").join("install_folder.txt"))
@@ -644,6 +653,32 @@ fn remembered_folder() -> Option<String> {
     let text = std::fs::read_to_string(remembered_folder_file()?).ok()?;
     let t = text.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+/// A "Transformers Armada" shortcut on the desktop, made once after the first finished install (deleted by the
+/// player, it stays deleted). It starts the setup's copy in the install folder, which starts the game when the
+/// install is finished and carries on the setup when it is not; its icon is the game's own.
+fn desktop_shortcut_once(folder: &Path, repo: &Path) {
+    let Some(flag) = remembered_folder_file().and_then(|f| f.parent().map(|d| d.join("desktop_shortcut_made"))) else { return };
+    if flag.exists() {
+        return;
+    }
+    let script = "$d=[Environment]::GetFolderPath('Desktop'); $s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Transformers Armada.lnk'));                   $s.TargetPath=$env:TFA_TARGET; $s.WorkingDirectory=$env:TFA_DIR; $s.IconLocation=$env:TFA_ICON+',0';                   $s.Description='Transformers Armada (PC)'; $s.Save()";
+    let ok = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("TFA_TARGET", folder.join("tfa-setup.exe"))
+        .env("TFA_DIR", folder)
+        .env("TFA_ICON", game_exe(repo))
+        .env_remove("PSModulePath")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags_no_window()
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        let _ = std::fs::write(flag, b"");
+    }
 }
 
 /// The built game's exe in an install.
@@ -1081,6 +1116,12 @@ impl App {
         ui.label(RichText::new("Transformers Armada - PC version").size(26.0).color(Color32::WHITE));
         ui.add_space(4.0);
         ui.label(RichText::new(format!("Installed in {}", self.folder)).color(DIM));
+        let unfinished = Path::new(&self.folder).join(UNFINISHED_MARK).exists();
+        if unfinished {
+            ui.add_space(8.0);
+            ui.label(RichText::new("The setup did not finish last time. Press \"Finish the setup\" to carry on: finished steps are kept.")
+                .color(Color32::from_rgb(240, 180, 0)));
+        }
         ui.add_space(20.0);
         let c = self.check.clone();
         if !c.current.is_empty() {
@@ -1131,7 +1172,12 @@ impl App {
                 if ui.add_enabled(self.check_rx.is_none(), egui::Button::new("Check again").min_size(Vec2::new(150.0, 40.0))).clicked() {
                     self.start_check();
                 }
-                if ui.add_sized([150.0, 40.0], egui::Button::new("Set up again...")).on_hover_text("The setup form: other discs, the HD textures").clicked() {
+                let again = if unfinished {
+                    egui::Button::new(RichText::new("Finish the setup").size(16.0)).fill(ACCENT)
+                } else {
+                    egui::Button::new("Set up again...")
+                };
+                if ui.add_sized([150.0, 40.0], again).on_hover_text("The setup form: other discs, the HD textures").clicked() {
                     self.phase = Phase::Form;
                 }
             });
@@ -1321,7 +1367,9 @@ fn main() -> eframe::Result {
     }
     // Started with nothing on its command line on a finished install (a launcher's Play button, a shortcut to
     // the setup): the game starts, no setup window. Shift held while starting, or --setup: the setup's window.
-    if all.is_empty() && app.installed() && game_exe(&app.repo()).exists() && !winapi::shift_held() {
+    if all.is_empty() && app.installed() && game_exe(&app.repo()).exists() && !Path::new(&app.folder).join(UNFINISHED_MARK).exists()
+        && !winapi::shift_held()
+    {
         play(&app.repo());
         return Ok(());
     }

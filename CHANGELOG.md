@@ -1,5 +1,14 @@
 # What's new
 
+## 0.3.2
+
+**Fixed**
+- Closing the setup before it finished and starting it again no longer opens the game. The setup opens instead,
+  with a "Finish the setup" button that carries on where it stopped.
+
+**New**
+- The setup puts a "Transformers Armada" shortcut on your desktop after the first install (it starts the game).
+
 ## 0.3.1
 
 **Fixed**
