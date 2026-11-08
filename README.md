@@ -150,6 +150,41 @@ back where you were.
 
 Prefer the command line, or want to build it yourself? See **[docs/BUILDING.md](docs/BUILDING.md)**.
 
+## Play from Steam, another launcher, or a Steam Deck
+
+The game can be started straight from its program file, so any launcher can start it:
+
+`<install folder>/transformers-armada-recomp/out/build/transformers/RelWithDebInfo/TransformersRecomp.exe`
+
+(`<install folder>` is the folder you picked in the setup.)
+
+**Steam on Windows**
+
+1. In Steam: **Games > Add a Non-Steam Game to My Library > Browse**, pick `TransformersRecomp.exe` above, then
+   **Add Selected Programs**.
+2. Start it from your Steam library like any other game.
+
+**Steam Deck**
+
+The game has to be built on a Windows PC first: the setup needs Windows to compile it from your disc.
+
+1. On your Windows PC, install the game with the setup as described above, and play it once.
+2. Copy the whole install folder to the Steam Deck, for example with a USB drive, a microSD card or a network
+   share. Keep everything inside it.
+3. On the Deck, switch to **Desktop Mode**, open **Steam**, then **Games > Add a Non-Steam Game to My Library >
+   Browse**. Set the file type to **All Files**, pick `TransformersRecomp.exe` in the copied folder, then
+   **Add Selected Programs**.
+4. In your Steam library, open the game's **Properties > Compatibility**, tick **Force the use of a specific Steam
+   Play compatibility tool** and choose **Proton Experimental** (or the newest Proton).
+5. Go back to **Gaming Mode** and start the game.
+
+Tips for the Deck:
+
+- The settings menu opens with **F1**. The Deck has no F1 key: in the game's **Controller settings**, set one of
+  the back buttons (L4, R4, L5 or R5) to the keyboard key **F1**.
+- In **F1 > Graphics**, the **Low** or **Medium** preset suits the Deck best.
+- A native Linux and Steam Deck version is planned; until then the game runs through Proton.
+
 ## Controls
 
 A controller, the keyboard and the mouse all work at the same time. Click into the game window to use the mouse.
