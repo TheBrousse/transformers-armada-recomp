@@ -44,6 +44,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tier_rules
@@ -323,6 +324,9 @@ def job_done(job, recs, out_root, settings, also_good=()):
     r = recs.get(job.sha1)
     if not r:
         return False
+    # (TODO 241: a texture this card could not make well is left to the game's own image, not tried each run)
+    if r.get("fallback") == "none" and r.get("settings") == settings:
+        return True
     # (A Fast run keeps the images a Best run made already: better ones, not made again.)
     if (r.get("settings") in also_good and sorted(r.get("relpaths", [])) == job.relpaths
             and all((out_root / rp).is_file() for rp in r["relpaths"])):
@@ -551,7 +555,189 @@ def run_onnx_dir(session, scale, in_dir, out_dir, tile, pad):
     return n
 
 
-def finalize(job, last_dir, out_root, settings):
+# ---- The output check (TODO 219 / 241: a player's set with black and junk-striped images) ----
+# On some graphics cards the upscaler gives broken images: all black, black with a row of coloured junk at the top
+# (a GTX 1660 SUPER, nearly every image of its run; likely the 16-series' half-precision maths in
+# realesrgan-ncnn-vulkan, which has no switch to turn that off and no CPU mode), or red and blue exchanged.
+# A black image even passes the renderer's own check for a dark texture (Hot Shot's dark-red thighs: off by about
+# 19, the renderer allows 20), so his red parts showed navy. Every image is judged against its source, box-averaged
+# to the source's size, over the texels the game draws (alpha >= 16):
+#  - red and blue exchanged when that copy is clearly closer (exchanged back; once most clear cases on this card were,
+#    the unclear ones too);
+#  - broken when, against a source with something in it, it is nearly black (under 20% of its brightness) or nearly
+#    flat (under 10% of its variation): what a broken upscale gives, never a good one.
+# The card is tried first (probe_card): a few bright, varied textures upscaled and judged before the run. When they
+# come out broken, the safer ways are tried on them, in order: a small tile (32), each other graphics card the
+# upscaler sees (a processor's built-in one), the lighter network with a small tile. The first that gives good
+# images makes the whole run. When none does, nothing is made on this card (exit 3, the status says so) and the
+# game's own textures are drawn; every later run (F1 > Check HD textures, an update) tries the card again, so a
+# new graphics driver can fix it. A batch that still comes out mostly broken tries the card again the same way.
+# A single broken image is made again: a small tile, then the lighter network; failing both, it gets no HD image.
+COLOUR_BAD = 20.0
+SWAP_CLEAR = 8.0
+COLOUR_STATS = {"swapped": 0, "ok": 0, "broken": 0, "good": 0}
+CARD_BROKEN_EXIT = 3
+PROBE_N = 4
+
+
+def _src_stats(path):
+    """(brightness, variation) of a source over the texels the game draws."""
+    with Image.open(path) as im:
+        s = im.convert("RGBA")
+    mask = s.getchannel("A").point(lambda v: 255 if v >= 16 else 0)
+    if ImageStat.Stat(mask).mean[0] < 1.0:
+        mask = None
+    st = ImageStat.Stat(s.convert("RGB"), mask)
+    return 0.299 * st.mean[0] + 0.587 * st.mean[1] + 0.114 * st.mean[2], sum(st.stddev[:3]) / 3.0
+
+
+def pick_probe_jobs(jobs, n=PROBE_N):
+    """A few small textures with plenty in them (bright and varied: what a broken upscale cannot pass), of the
+    network most of the run uses."""
+    cands = [j for j in jobs if j.backend == "ncnn" and j.passes >= 1 and j.alpha_mode in ("rgb", "direct")
+             and j.srcs[0].w * j.srcs[0].h >= 32 * 32]
+    if not cands:
+        return []
+    model = Counter(j.model for j in cands).most_common(1)[0][0]
+    picked = []
+    for job in sorted((j for j in cands if j.model == model), key=lambda j: (j.srcs[0].w * j.srcs[0].h, j.sha1)):
+        try:
+            luma, std = _src_stats(job.srcs[0].path)
+        except Exception:  # noqa: BLE001
+            continue
+        if luma >= 40.0 and std >= 12.0:
+            picked.append(job)
+            if len(picked) >= n:
+                break
+    return picked
+
+
+def parse_gpus(err):
+    """{index: name} of the graphics cards the upscaler lists in its log ("[0 NVIDIA GeForce ...]  queueC=...")."""
+    gpus = {}
+    for ln in err.splitlines():
+        m = re.match(r"^\[(\d+) ([^\]]+)\]", ln)
+        if m:
+            gpus.setdefault(int(m.group(1)), m.group(2).strip())
+    return gpus
+
+
+def probe_once(exe, jobs, workdir, model, tile, gpu):
+    """The probe textures upscaled once this way: (good, broken, made any output, upscaler log)."""
+    shutil.rmtree(workdir, ignore_errors=True)
+    in_dir, out_dir = workdir / "in", workdir / "out"
+    in_dir.mkdir(parents=True)
+    out_dir.mkdir()
+    for j in jobs:
+        stage_job(j, in_dir)
+    _rc, err, _ = run_binary(exe, in_dir, out_dir, model, tile, gpu)
+    good = bad = 0
+    made = False
+    for j in jobs:
+        p = out_dir / f"{j.sha1}.png"
+        if not p.is_file():
+            bad += 1
+            continue
+        made = True
+        with Image.open(p) as im:
+            img = im.convert("RGBA")
+        bad, good = (bad + 1, good) if judge_output(img, j.srcs[0].path)[2] else (bad, good + 1)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return good, bad, made, err
+
+
+def probe_card(exe, jobs, workdir, tile, gpu, skip=()):
+    """(setup, card names, made any output): setup = None (the probe images are fine as the run is set, or there are
+    none to try), a dict {model, tile, gpu, what} (a safer way that gives good images), or False (no way does)."""
+    probes = pick_probe_jobs(jobs)
+    if not probes:
+        return None, {}, False
+    model = probes[0].model
+    good, bad, made, err = probe_once(exe, probes, workdir, model, tile, gpu)
+    gpus = parse_gpus(err)
+    if bad == 0 and "plain" not in skip:
+        return None, gpus, made
+    print(f"note: the upscaler's images on this graphics card ({gpus.get(gpu or 0, 'unknown')}) come out broken "
+          f"({bad} of {len(probes)} tried): trying safer ways", flush=True)
+    ways = [{"model": model, "tile": 32, "gpu": gpu, "what": "tile 32"}]
+    for g, name in sorted(gpus.items()):
+        if g != (gpu or 0):
+            ways.append({"model": model, "tile": 0, "gpu": g, "what": f"graphics card {g} ({name})"})
+    if model != "realesr-animevideov3":
+        ways.append({"model": "realesr-animevideov3", "tile": 32, "gpu": gpu,
+                     "what": "realesr-animevideov3, tile 32"})
+    for w in ways:
+        if w["what"] in skip:
+            continue
+        good, bad, m, _ = probe_once(exe, probes, workdir, w["model"], w["tile"], w["gpu"])
+        made = made or m
+        print(f"  {w['what']}: {good} good, {bad} broken", flush=True)
+        if bad == 0:
+            print(f"note: the rest is made with {w['what']}", flush=True)
+            return w, gpus, made
+    return False, gpus, made
+
+
+class BadColours(Exception):
+    pass
+
+
+def judge_output(out_rgba, src_path):
+    """(distance as it is, distance with red and blue exchanged, why it is broken or "") against the source."""
+    with Image.open(src_path) as im:
+        src = im.convert("RGBA")
+    small = out_rgba.convert("RGBA").resize(src.size, Image.BOX)
+    mask = src.getchannel("A").point(lambda v: 255 if v >= 16 else 0)
+    if ImageStat.Stat(mask).mean[0] < 1.0:
+        mask = None
+    src_rgb = src.convert("RGB")
+    r, g, b_ = small.convert("RGB").split()
+    as_is, swapped = Image.merge("RGB", (r, g, b_)), Image.merge("RGB", (b_, g, r))
+
+    def dist(img):
+        st = ImageStat.Stat(ImageChops.difference(img, src_rgb), mask)
+        return sum(st.mean[:3]) / 3.0 if st.count and st.count[0] else 0.0
+
+    d, d_swapped = dist(as_is), dist(swapped)
+    s_stat, o_stat = ImageStat.Stat(src_rgb, mask), ImageStat.Stat(as_is, mask)
+    luma = lambda m: 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2]  # noqa: E731
+    s_luma, o_luma = luma(s_stat.mean), luma(o_stat.mean)
+    s_std, o_std = sum(s_stat.stddev[:3]) / 3.0, sum(o_stat.stddev[:3]) / 3.0
+    best = min(d, d_swapped)
+    why = ""
+    # (Calibrated on a whole good set, 1,911 images made on another card: none of them broken by these two. Off by
+    # more than 20 alone is no sign - noisy ground and snow, redrawn art: the renderer judges those itself.)
+    if s_luma >= 10.0 and o_luma < 0.2 * s_luma:
+        why = f"dark ({o_luma:.0f} against the game's {s_luma:.0f})"
+    elif s_std >= 10.0 and o_std < 0.1 * s_std:
+        why = f"flat (variation {o_std:.1f} against {s_std:.1f})"
+    return d, d_swapped, why
+
+
+def check_colours(out, src_path):
+    """The image as the game's (red and blue exchanged back when they came out exchanged). Returns (image, note);
+    raises BadColours when it is broken."""
+    d, d_swapped, why = judge_output(out, src_path)
+    if why:
+        COLOUR_STATS["broken"] += 1
+        raise BadColours(f"broken: {why}")
+    COLOUR_STATS["good"] += 1
+    clear_swap = d >= SWAP_CLEAR and d_swapped < 0.6 * d
+    clear_ok = d_swapped >= SWAP_CLEAR and d < 0.6 * d_swapped
+    if clear_ok:
+        COLOUR_STATS["ok"] += 1
+    if clear_swap:
+        COLOUR_STATS["swapped"] += 1
+    card_swaps = COLOUR_STATS["swapped"] >= 3 and COLOUR_STATS["swapped"] > 4 * COLOUR_STATS["ok"]
+    note = ""
+    if clear_swap or (card_swaps and not clear_ok and d_swapped <= d + 1.0):
+        r, g, b_, a = out.split()
+        out = Image.merge("RGBA", (b_, g, r, a))
+        note = f"red and blue exchanged back ({d:.1f} -> {d_swapped:.1f})"
+    return out, note
+
+
+def finalize(job, last_dir, out_root, settings, fallback=""):
     """Recombine channels, restore exact target size + alpha semantics,
     write to every duplicate relpath atomically. Returns manifest record."""
     if job.alpha_mode == "pil":
@@ -585,6 +771,11 @@ def finalize(job, last_dir, out_root, settings):
         got = alpha_class(out)
     if got != job.alpha:
         raise RuntimeError(f"alpha class changed {job.alpha} -> {got}")
+    colour_note = ""
+    if job.alpha_mode != "pil":
+        out, colour_note = check_colours(out, job.srcs[0].path)
+        if colour_note:
+            print(f"  {job.srcs[0].relpath}: {colour_note}", flush=True)
 
     buf = io.BytesIO()
     out.save(buf, "PNG")
@@ -609,7 +800,114 @@ def finalize(job, last_dir, out_root, settings):
         "src": [job.srcs[0].w, job.srcs[0].h], "out": [job.out_w, job.out_h],
         "out_sha1": hashlib.sha1(data).hexdigest(), "settings": settings,
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **({"colour": colour_note} if colour_note else {}),
+        **({"fallback": fallback} if fallback else {}),
     }
+
+
+def no_image_record(job, settings, why):
+    """The record of a texture the upscaler could not make on this card: no HD image (the game's own is drawn); not
+    tried again by later runs with the same settings (job_done)."""
+    return {
+        "sha1": job.sha1, "relpaths": job.relpaths, "tier": job.tier,
+        "model": job.model, "backend": job.backend, "passes": job.passes,
+        "alpha": job.alpha, "alpha_mode": job.alpha_mode,
+        "src": [job.srcs[0].w, job.srcs[0].h], "out": [job.out_w, job.out_h],
+        "settings": settings, "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "fallback": "none", "why": why,
+    }
+
+
+def _judge_file(args):
+    """(rel, output, source) -> (rel, d, d_swapped, why) or (rel, None, None, error) - for check_set's workers."""
+    rel, judged, src = args
+    try:
+        with Image.open(judged) as im:
+            img = im.convert("RGBA")
+        d, d_swapped, why = judge_output(img, src)
+        return rel, d, d_swapped, why
+    except Exception as e:  # noqa: BLE001
+        return rel, None, None, str(e)
+
+
+def check_set(src_root, out_root, backup_root, status_path=None, lock=None):
+    """(TODO 241) An existing set checked as the maker now checks each image: red and blue exchanged back in place
+    (its colour-match original too, its ledger entry dropped so match_colour matches it again); a broken image (black,
+    flat, junk) removed with its manifest record, so the next run makes it again. Returns (fixed, removed)."""
+    errors = []
+    srcs = {s.relpath: s for s in scan_sources(src_root, errors)}
+    recs = load_manifest(out_root)
+    ledger_path = backup_root / "colour_gains.json"
+    ledger = {}
+    if ledger_path.exists():
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except ValueError:
+            ledger = {}
+    work = []
+    by_rel = {}
+    for sha1, r in sorted(recs.items()):
+        rels = r.get("relpaths") or []
+        if not rels or r.get("alpha_mode") == "pil" or r.get("fallback") == "none":
+            continue
+        src = srcs.get(rels[0])
+        out_path = out_root / rels[0]
+        if not src or not out_path.is_file():
+            continue
+        # (a level image's colour-match original is what the upscaler made: judged on that one)
+        judged = backup_root / rels[0]
+        judged = judged if judged.is_file() else out_path
+        work.append((rels[0], str(judged), str(src.path)))
+        by_rel[rels[0]] = (sha1, rels)
+    from concurrent.futures import ProcessPoolExecutor
+    # (two workers while the game runs: the check goes on beside it without taking its processor)
+    workers = 2 if lock is not None and game_running(lock) else max(1, min(8, (os.cpu_count() or 2) - 2))
+    results = []
+    print(f"check: {len(work)} images to check", flush=True)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for r in pool.map(_judge_file, work, chunksize=8):  # (in order, as they come)
+            results.append(r)
+            if len(results) % 100 == 0 or len(results) == len(work):
+                write_status(status_path, state="checking", done=len(results), total=len(work))
+                print(f"check: {len(results)} of {len(work)} checked", flush=True)
+    fixed = removed = 0
+    drop = set()
+    for rel, d, d_swapped, why in results:
+        sha1, rels = by_rel[rel]
+        if d is None:
+            print(f"check: {rel}: {why}", file=sys.stderr)
+            continue
+        if why:
+            for rp in rels:
+                for path in (out_root / rp, backup_root / rp):
+                    if path.is_file():
+                        path.unlink()
+                ledger.pop(rp, None)
+            drop.add(sha1)
+            removed += 1
+            print(f"check: {rel}: broken ({why}): made again", flush=True)
+        elif d >= SWAP_CLEAR and d_swapped < 0.6 * d:
+            for rp in rels:
+                for path in (out_root / rp, backup_root / rp):
+                    if path.is_file():
+                        with Image.open(path) as im:
+                            x = im.convert("RGBA")
+                        rr, gg, bb, aa = x.split()
+                        tmp = path.with_name(path.name + ".tmp.png")
+                        Image.merge("RGBA", (bb, gg, rr, aa)).save(tmp)
+                        os.replace(tmp, path)
+                ledger.pop(rp, None)
+            fixed += 1
+            print(f"check: {rel}: red and blue exchanged back ({d:.1f} -> {d_swapped:.1f})", flush=True)
+    if drop:
+        mf = out_root / MANIFEST_NAME
+        lines = [ln for ln in mf.read_text(encoding="utf-8").splitlines()
+                 if not any(f'"sha1": "{h}"' in ln for h in drop)]
+        mf.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    if (fixed or removed) and ledger_path.exists():
+        ledger_path.write_text(json.dumps(ledger, indent=0, sort_keys=True), encoding="utf-8")
+    print(f"check: {len(work)} images checked, {fixed} with red and blue exchanged back, {removed} broken (made again)")
+    return fixed, removed
 
 
 def print_plan(srcs, jobs):
@@ -724,6 +1022,9 @@ def main():
                          "upscale_status.json")
     ap.add_argument("--no-wait-for-game", action="store_true",
                     help="never wait while the game runs")
+    ap.add_argument("--check-colours", action="store_true",
+                    help="check an existing set's colours against the sources (red and blue exchanged back, far-off "
+                         "images removed to be made again), then exit")
     ap.add_argument("--match-colour", action="store_true",
                     help="match each image's colour to the game's as it is made (match_colour.py)")
     args = ap.parse_args()
@@ -738,6 +1039,11 @@ def main():
 
     if args.audit:
         sys.exit(audit(args.src, args.out))
+    if args.check_colours:
+        hd_dir = args.hd_dir or args.out.parent
+        check_set(args.src, args.out, args.out.parent / "upscaled_precolour", hd_dir / "upscale_status.json",
+                  None if args.no_wait_for_game else hd_dir / ".game_running")
+        sys.exit(0)
 
     errors = []
     srcs = scan_sources(args.src, errors)
@@ -833,12 +1139,21 @@ def main():
     pending = None
     t_start = time.time()
     paused_s = [0.0]  # (the time spent waiting for the game: not in the estimate)
+    gpu_name = [""]   # (the upscaler's card, from its own log: for the notes)
+    setup = [None]    # (probe_card's safer way for this card, once one was needed)
+    tried = set()     # (the safer ways tried so far)
+    probed = [False]
+    card_broken = [False]
+    batch_bad = [False]
     with open(args.out / MANIFEST_NAME, "a", encoding="utf-8") as mf:
+
+        redo = []
 
         def finish(job, last_dir):
             nonlocal done
             try:
-                rec = finalize(job, last_dir, args.out, settings)
+                rec = finalize(job, last_dir, args.out, settings,
+                               fallback=setup[0]["what"] if setup[0] and job.backend == "ncnn" else "")
                 if mc is not None:
                     for rp in job.relpaths:
                         mc.match_file(rp, str(args.out / rp), str(native_root), str(backup_root), ledger,
@@ -846,10 +1161,14 @@ def main():
                 mf.write(json.dumps(rec) + "\n")
                 mf.flush()
                 done += 1
+            except BadColours as e:
+                print(f"  {job.srcs[0].relpath}: {e}: made again another way", flush=True)
+                redo.append(job)
             except Exception as e:  # noqa: BLE001
                 errors.append((job.srcs[0].relpath, f"finalize: {e}"))
 
         def finish_batch(staged, cur, gdir):
+            n0 = len(redo)
             for job in staged:
                 missing = [s for s in expected_stems(job)
                            if not (cur / f"{s}.png").is_file()]
@@ -858,6 +1177,9 @@ def main():
                                    f"{job.backend} produced no output ({missing})"))
                 else:
                     finish(job, cur)
+            nb = len(redo) - n0
+            if nb >= 4 and 2 * nb >= len(staged):  # (mostly broken still: the card tried again before the next one)
+                batch_bad[0] = True
             if ledger is not None:
                 mc.save_ledger(str(backup_root), ledger)
             if not args.keep_work and gdir is not None:
@@ -906,7 +1228,34 @@ def main():
                 status("working", done_before + done)
                 bi += 1
                 continue
+            if card_broken[0]:  # (nothing this card makes is good: left for a later run, after a driver update)
+                bi += 1
+                continue
             gentle = wait_turn()
+            if backend == "ncnn" and (not probed[0] or batch_bad[0]):
+                again = batch_bad[0]
+                probed[0] = True
+                batch_bad[0] = False
+                left = [j for b in batches[bi:] for j in b]
+                got, gpus, made_any = probe_card(args.exe, left, args.work / "probe", args.tile, args.gpu,
+                                                 skip=({"plain"} | tried) if again else ())
+                if gpus and not gpu_name[0]:
+                    gpu_name[0] = gpus.get(args.gpu or 0, next(iter(gpus.values())))
+                if got:
+                    setup[0] = got
+                    tried.add(got["what"])
+                elif got is False and made_any:
+                    card_broken[0] = True
+                    print(f"note: this graphics card ({gpu_name[0] or 'unknown'}) gives broken images in every way "
+                          f"the upscaler has: no HD textures are made on it (the game's own are drawn). A newer "
+                          f"graphics driver may fix it: then F1 > Graphics > Check HD textures tries "
+                          f"again.", flush=True)
+                    write_status(status_path, state="card_broken", done=done_before + done, total=total,
+                                 quality=args.quality, gpu=gpu_name[0])
+                    bi += 1
+                    continue
+            if backend == "ncnn" and setup[0] and model != "realesr-animevideov3":
+                model = setup[0]["model"]
             gdir = args.work / f"{backend}_{model}_p{passes}_b{bi}"
             if gdir.exists():
                 shutil.rmtree(gdir)
@@ -926,8 +1275,13 @@ def main():
                 nxt.mkdir()
                 t0 = time.time()
                 if backend == "ncnn":
-                    rc, err, stopped = run_binary(args.exe, cur, nxt, model, args.tile, args.gpu,
+                    tile, gpu = (setup[0]["tile"], setup[0]["gpu"]) if setup[0] else (args.tile, args.gpu)
+                    rc, err, stopped = run_binary(args.exe, cur, nxt, model, tile, gpu,
                                                   stop=None if gentle else should_stop, gentle=gentle)
+                    if not gpu_name[0]:
+                        gpus = parse_gpus(err)
+                        if gpus:
+                            gpu_name[0] = gpus.get(args.gpu or 0, next(iter(gpus.values())))
                     if rc != 0 and not stopped:
                         tail = err.strip().splitlines()[-3:]
                         print("  stderr: " + " | ".join(tail), file=sys.stderr)
@@ -951,8 +1305,67 @@ def main():
             bi += 1
         if pending:
             pending.result()
-    finisher.shutdown()
 
+        # The broken images: again with a small tile (another path through the upscaler on the card), then with the
+        # lighter network; failing both, no HD image (the game's own texture is drawn).
+        # (A card that gives nothing good: they stay to be made by a later run.)
+        for job in [] if card_broken[0] else redo:
+            rec = None
+            gpu = setup[0]["gpu"] if setup[0] else args.gpu
+            tries = [(job.model, 32, "tile 32")]
+            if job.model != "realesr-animevideov3":
+                tries.append(("realesr-animevideov3", 32, "realesr-animevideov3, tile 32"))
+            tries = [t for t in tries if not (setup[0] and t[2] == setup[0]["what"])]
+            for model, tile, what in tries if job.backend == "ncnn" else []:
+                gdir = args.work / f"redo_{job.sha1}"
+                shutil.rmtree(gdir, ignore_errors=True)
+                in_dir = gdir / "in"
+                in_dir.mkdir(parents=True)
+                try:
+                    stage_job(job, in_dir)
+                    cur = in_dir
+                    for i in range(1, job.passes + 1):
+                        nxt = gdir / f"p{i}"
+                        nxt.mkdir()
+                        run_binary(args.exe, cur, nxt, model, tile, gpu)
+                        cur = nxt
+                    rec = finalize(job, cur, args.out, settings, fallback=what)
+                    print(f"  {job.srcs[0].relpath}: made again ({what})", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  {job.srcs[0].relpath}: again ({what}): {e}", flush=True)
+                shutil.rmtree(gdir, ignore_errors=True)
+                if rec is not None:
+                    break
+            if rec is None:
+                rec = no_image_record(job, settings, "broken on this graphics card")
+                for rp in job.relpaths:  # (an older broken image of it goes too)
+                    for path in (args.out / rp, backup_root / rp):
+                        if path.is_file():
+                            path.unlink()
+                    if ledger is not None:
+                        ledger.pop(rp, None)
+                print(f"  {job.srcs[0].relpath}: no HD image (this graphics card's upscales of it are broken): "
+                      f"the game's own is drawn", flush=True)
+            else:
+                if mc is not None:
+                    for rp in job.relpaths:
+                        mc.match_file(rp, str(args.out / rp), str(native_root), str(backup_root), ledger, note_checked=True)
+            mf.write(json.dumps(rec) + "\n")
+            mf.flush()
+            done += 1
+        if redo and ledger is not None:
+            mc.save_ledger(str(backup_root), ledger)
+    finisher.shutdown()
+    if COLOUR_STATS["swapped"]:
+        print(f"note: this graphics card's upscales came back with red and blue exchanged ({COLOUR_STATS['swapped']} "
+              f"clear cases): exchanged back")
+
+    if card_broken[0]:
+        write_status(status_path, state="card_broken", done=done_before + done, total=total, quality=args.quality,
+                     gpu=gpu_name[0])
+        print(f"upscaled {done}/{len(todo)} uniques: this graphics card gives broken images "
+              f"({gpu_name[0] or 'unknown'})")
+        sys.exit(CARD_BROKEN_EXIT)
     status("upscaled" if not errors else "upscaled_with_errors", done_before + done)
     total_outputs = sum(len(j.relpaths) for j in todo) - len(errors)
     print(f"upscaled {done}/{len(todo)} uniques -> ~{total_outputs} files, "

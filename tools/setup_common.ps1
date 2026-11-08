@@ -125,3 +125,31 @@ function New-HookContext($Root, $Port, $Python, $State, $HookArgs, $Changed = @(
 # as "dubious ownership" and the build stops (only for this script's own git commands, nothing global is changed).
 $env:GIT_CONFIG_COUNT = "2"; $env:GIT_CONFIG_KEY_0 = "core.longpaths"; $env:GIT_CONFIG_VALUE_0 = "true"
 $env:GIT_CONFIG_KEY_1 = "safe.directory"; $env:GIT_CONFIG_VALUE_1 = "*"
+
+# A "Transformers Armada" shortcut on the desktop, made once (the setup's own code does the same after a first
+# install; this covers installs whose setup copy is older than that). Deleted by the player, it stays deleted: the
+# mark in %LOCALAPPDATA% is shared with the setup. It starts the install folder's tfa-setup.exe (the game when the
+# install is finished) with the game's icon, else the game's exe itself.
+function Add-DesktopShortcutOnce([string]$Repo, [string]$Port) {
+    try {
+        $markDir = Join-Path $env:LOCALAPPDATA "TransformersArmadaSetup"
+        $mark = Join-Path $markDir "desktop_shortcut_made"
+        if (Test-Path $mark) { return }
+        $exe = Join-Path $Port "out\build\transformers\RelWithDebInfo\TransformersRecomp.exe"
+        if (-not (Test-Path $exe)) { return }
+        $setupExe = Join-Path (Split-Path $Repo -Parent) "tfa-setup.exe"
+        $target = if (Test-Path $setupExe) { $setupExe } else { $exe }
+        $desk = [Environment]::GetFolderPath("Desktop")
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desk "Transformers Armada.lnk"))
+        $s.TargetPath = $target
+        $s.WorkingDirectory = Split-Path $target -Parent
+        $s.IconLocation = "$exe,0"
+        $s.Description = "Transformers Armada (PC)"
+        $s.Save()
+        New-Item -ItemType Directory -Force $markDir | Out-Null
+        Set-Content $mark ""
+        Write-Host "A desktop shortcut was made: Transformers Armada."
+    } catch {
+        Write-Host "warning: the desktop shortcut could not be made: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}

@@ -77,7 +77,10 @@ function SetStatus([string]$State) {
     # (the upscaler keeps the counts in it; this marks the whole set's state: "done" once everything is made)
     $st = [ordered]@{ state = $State; done = 0; total = 0; quality = $Quality }
     if (Test-Path $StatusFile) {
-        try { $old = Get-Content $StatusFile -Raw | ConvertFrom-Json; $st.done = $old.done; $st.total = $old.total } catch {}
+        try {
+            $old = Get-Content $StatusFile -Raw | ConvertFrom-Json; $st.done = $old.done; $st.total = $old.total
+            if ($old.gpu) { $st.gpu = $old.gpu }
+        } catch {}
     }
     $st.updated = (Get-Date).ToUniversalTime().ToString("s")
     [System.IO.File]::WriteAllText($StatusFile, ($st | ConvertTo-Json))  # (UTF-8 without a BOM: the game reads it)
@@ -197,6 +200,18 @@ if (-not (Test-Path $exe)) {
     if (-not (Test-Path $exe)) { throw "the Real-ESRGAN download did not contain realesrgan-ncnn-vulkan.exe" }
 }
 
+# (TODO 241) A set made before the maker checked its images: every image checked once (a graphics card that gives
+# black, junk-striped or red-and-blue-exchanged images - a GTX 1660 SUPER did): exchanged ones put right, broken ones
+# removed and made again below. Again whenever "Check HD textures" (F1) runs this on a finished set.
+$checkedMark = Join-Path $Out ".images_checked_1"
+$finished = $false
+if (Test-Path $StatusFile) { try { $finished = ((Get-Content $StatusFile -Raw | ConvertFrom-Json).state -in @("done", "card_broken")) } catch {} }
+if ((Test-Path (Join-Path $Out "upscaled\upscale_manifest.jsonl")) -and (-not (Test-Path $checkedMark) -or ($Resume -and $finished))) {
+    Step "Checking the HD textures made so far (a few minutes)"
+    Run $Python @((Join-Path $Py "upscale_textures.py"), $converted, "--out", (Join-Path $Out "upscaled"), "--check-colours")
+    Set-Content -LiteralPath $checkedMark -Value "checked $(Get-Date -Format s)"
+}
+
 Step "Upscaling into $(Join-Path $Out 'upscaled') (resumable)"
 # A few textures failing is not a failed setup: the game keeps the original for each texture without
 # an upscale, and a run again tries only those. (Exit 1 with its "upscaled N/M" summary = some files
@@ -209,7 +224,15 @@ $ErrorActionPreference = "Continue"
 $code = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 $summary = $lines | Where-Object { $_ -match '^upscaled \d+/\d+ uniques' } | Select-Object -Last 1
-if ($code -ne 0) {
+# (TODO 242) Exit 3: this graphics card's upscales come out broken in every way the upscaler has (a GTX 1660 SUPER's
+# were all black). Nothing is made on it - the game draws its own textures - and the next run tries the card again.
+$cardBroken = ($code -eq 3)
+if ($cardBroken) {
+    Write-Host "`nwarning: this graphics card's HD images come out broken (black), in every way the upscaler can make them." -ForegroundColor Yellow
+    Write-Host "No HD textures are made on it; the game draws its own. A newer graphics driver may fix it:" -ForegroundColor Yellow
+    Write-Host "then F1 > Graphics > Check HD textures tries again." -ForegroundColor Yellow
+}
+elseif ($code -ne 0) {
     if ($code -eq 1 -and $summary) {
         Write-Host "`nwarning: some textures could not be upscaled ($summary); they keep their original look." -ForegroundColor Yellow
         Write-Host "Running make_hd_textures.ps1 (or setup.ps1) again retries only those." -ForegroundColor Yellow
@@ -231,5 +254,5 @@ else { Step "Matching the upscaled images' colour to the game's textures" }
 # (--only-new: the images matched as they were made are not measured again)
 Run $Python @((Join-Path $Py "match_colour.py"), "--upscaled", (Join-Path $Out "upscaled"), "--native", $converted, "--only-new")
 CrispFonts
-SetStatus "done"
+SetStatus $(if ($cardBroken) { "card_broken" } else { "done" })
 Write-Host "`nDone. Start the game from this folder (Play.bat): the log says '[native render] upscaled textures: N images'." -ForegroundColor Green

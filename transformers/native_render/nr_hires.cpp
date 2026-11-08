@@ -170,15 +170,20 @@ namespace nr
         void build()
         {
             g.ready = true;
-            if (const char *off = std::getenv("TF_HIRES"); off && *off == '0')
-                return;
+            // (TF_HIRES=0, F1 > Graphics > HD textures Off - TODO 243: the game's own textures; the sharp text still
+            // follows its own setting)
+            const char *off = std::getenv("TF_HIRES");
+            const bool hdOff = off && *off == '0';
             std::error_code ec;
             g.upscaled = resolveUpscaled();
             g.native = g.upscaled.empty() ? fs::path() : g.upscaled.parent_path() / "converted" / "textures";
             chooseCrisp();
-            if (!fs::is_directory(g.upscaled, ec) || !fs::is_directory(g.native, ec))
+            if (hdOff || !fs::is_directory(g.upscaled, ec) || !fs::is_directory(g.native, ec))
             {
-                std::fprintf(stderr, "[native render] no upscaled textures at %s\n", g.upscaled.string().c_str());
+                if (hdOff)
+                    std::fprintf(stderr, "[native render] HD textures off (TF_HIRES=0): the game's own textures\n");
+                else
+                    std::fprintf(stderr, "[native render] no upscaled textures at %s\n", g.upscaled.string().c_str());
                 g.fontsOnly = true;
                 if (g.native.empty() || !fs::is_directory(g.native / "TFA2" / "FONTS", ec)) return;
             }

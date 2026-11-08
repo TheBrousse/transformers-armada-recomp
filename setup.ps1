@@ -159,5 +159,6 @@ if (Get-Command Invoke-SetupHook -ErrorAction SilentlyContinue) {
 }
 
 $state | Add-Member -Force SetUpAt (& git -C $Root rev-parse HEAD)
+Add-DesktopShortcutOnce -Repo $Root -Port $Port
 $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 Write-Host "`nReady. Play with Play.bat in $Root. Settings: F5 in the game." -ForegroundColor Green

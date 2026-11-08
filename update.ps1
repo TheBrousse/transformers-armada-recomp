@@ -356,6 +356,7 @@ if ($kept) { Write-Host (Kept-Text $kept) -ForegroundColor Green }
 $spentOn = @($parts.Keys | Where-Object { $parts[$_] -ge 1 } | ForEach-Object { "$_ $(Format-Time $parts[$_])" })
 Write-Host ("`nUp to date ({0}), in {1}{2}. Play with Play.bat." -f (& git -C $Repo rev-parse --short HEAD), (Format-Time $took.TotalSeconds),
     $(if ($spentOn.Count -gt 1) { ": " + ($spentOn -join ", ") } else { "" })) -ForegroundColor Green
+Add-DesktopShortcutOnce -Repo $Repo -Port $Port
 Result "ok $((& git -C $Repo rev-parse HEAD).Trim())"
 Start-Game
 try { Stop-Transcript | Out-Null } catch {}

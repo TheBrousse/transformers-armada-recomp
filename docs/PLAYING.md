@@ -86,6 +86,11 @@ Xbox-style controllers.
 
 On a DualSense or DualShock 4, vibration and the light bar work too. Set them in **F1 > Controls**.
 
+To put the buttons elsewhere, use **F1 > Controls > Controller buttons**: click Change and press the button you want.
+**Triggers fire** puts Fire and Jump on the triggers and the Mini-Con abilities on the bumpers; **Reset to default**
+undoes it. The F1 menu's own buttons always stay the same. (The game's on-screen button pictures still show the
+original buttons.)
+
 ### Keyboard and mouse
 
 Click into the game window to give the mouse to the game. **Esc** gives it back.
@@ -160,10 +165,16 @@ Your choices are saved in `settings.ini` in the install folder.
 | Anti-aliasing | Smooths jagged edges: edge filter, multisampling (up to 8x) and supersampling (1.5x). |
 | Texture quality | Texture sharpness and filtering. Low suits 4 GB graphics cards. |
 | Sharp distant textures | Keeps textures sharp into the distance on high-resolution screens. |
+| HD textures | The HD textures made from your disc, on or off (native renderer; takes a restart). Its buttons open their folder and make or check them. |
+| Texture pack | Emulated renderer only: PCSX2 texture packs from a replacements folder. Not the HD textures. |
 
 The **Ultra** preset sets everything to its highest: the longest distances, every tree in full 3D, full enemy
 detail, 8x multisampling with 1.5x supersampling and Ultra textures. It needs a strong graphics card. If the
 frame rate drops, try **High**.
+
+If a graphics card makes the HD textures black (some GTX 16-series cards do), the maker notices, tries safer
+ways, and if none works it makes none: F1 says so and the game shows its own textures. After a graphics driver
+update, **Check HD textures** tries again.
 
 ### Controls
 

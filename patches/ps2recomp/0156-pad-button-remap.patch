@@ -1,0 +1,381 @@
+Subject: [PATCH] Runtime: the controller's buttons can be laid out again (TODO 240)
+
+ps2_host_input::setPadBindings / padBindings / defaultPadBindings (PS2X_PADMAP at start): for each of the game's
+pad buttons, the controller buttons that press it ("l1=l2;l2=l1;r1=r2;r2=r1"; a controller button named by its
+PlayStation place). The pad read (both the native Sony path and the GLFW gamepads) collects the controller's 16
+buttons, then sets the game's through the layout; the game's analog L2 / R2 (gamepadTriggers) come from the
+controller trigger behind them (0 or 1 from a button). The adaptive triggers follow: triggerRequest gives each
+controller trigger the effect and break point of the game trigger it presses (setTriggerRouting; an effect for a
+game trigger now on a bumper is dropped), so 0152's gating stays with the click. The port's own menus read the
+controller as it is.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_input.h b/ps2xRuntime/include/runtime/ps2_host_input.h
+--- a/ps2xRuntime/include/runtime/ps2_host_input.h
++++ b/ps2xRuntime/include/runtime/ps2_host_input.h
+@@ -68,6 +68,17 @@ namespace ps2_host_input
+     void setKeyBindings(const std::string &layout);
+     std::string keyBindings();
+     std::string defaultKeyBindings();
++
++    // The controller's buttons (patch 0156): for each of the game's pad buttons, the controller buttons that press
++    // it, as "l1=r2;r1=l2;r2=r1;l2=l1" (up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select;
++    // a controller button is named by its PlayStation place: an Xbox pad's A is cross, LB l1, RT r2, View select,
++    // Menu start). PS2X_PADMAP at start; setPadBindings from then on (a game button it names takes that list, the
++    // others keep their own button). The guest still sees PlayStation buttons; an adaptive trigger's effect and its
++    // break point go with the game button (a trigger effect for a button now on a bumper is dropped: no motor there).
++    // The port's own menus read the controller as it is (not through this).
++    void setPadBindings(const std::string &layout);
++    std::string padBindings();
++    std::string defaultPadBindings();
+     std::string keyName(int code);         // a raylib key code, or mouseButtonCode's
+     int keyCode(const std::string &name);  // -1: no such key
+     int mouseButtonCode(int button);       // a raylib mouse button as a code of the layout
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+--- a/ps2xRuntime/include/runtime/ps2_sony_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -195,7 +195,12 @@ namespace ps2x::sonypad
+         bool operator!=(const TriggerRequest &o) const { return !(*this == o); }
+     };
+     void setTriggerRequest(const TriggerRequest &request);
++    // The request as the triggers get it (patch 0156): the game's L2 / R2 effect and break point on the trigger that now
++    // presses that game button (setTriggerRouting), none on a trigger that presses neither.
+     TriggerRequest triggerRequest();
++    // Which game trigger each controller trigger presses (0 neither, 1 the game's L2, 2 its R2): ps2_pad's button
++    // layout (ps2_host_input::setPadBindings). The device thread writes the effects again.
++    void setTriggerRouting(int left, int right);
+     // Increases with every change of either request (the device thread writes on a change).
+     uint64_t padRequestGeneration();
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -431,6 +431,131 @@ namespace
+             return mouseLive && IsMouseButtonDown(code - kMouseCode);
+         return IsKeyDown(code);
+     }
++
++    // ---- The controller's buttons (patch 0156): the controller buttons that press each game button ----
++    constexpr int kPadButtons = kBindSelect + 1; // up .. select
++    std::mutex g_padMapMutex;
++    std::vector<int> g_padSources[kPadButtons]; // a game button's controller buttons
++    bool g_padMapLoaded = false;
++
++    int padButtonIndex(const std::string &name)
++    {
++        for (int i = 0; i < kPadButtons; ++i)
++            if (name == kBindingNames[i].name)
++                return i;
++        return -1;
++    }
++
++    void parsePadmap(const std::string &spec, std::vector<int> (&into)[kPadButtons])
++    {
++        size_t at = 0;
++        while (at < spec.size())
++        {
++            size_t end = spec.find(';', at);
++            if (end == std::string::npos)
++                end = spec.size();
++            const std::string item = spec.substr(at, end - at);
++            at = end + 1;
++            const size_t eq = item.find('=');
++            const int game = eq == std::string::npos ? -1 : padButtonIndex(item.substr(0, eq));
++            if (game < 0)
++                continue;
++            std::vector<int> list;
++            const std::string names = item.substr(eq + 1);
++            size_t p = 0;
++            while (p <= names.size())
++            {
++                size_t comma = names.find(',', p);
++                if (comma == std::string::npos)
++                    comma = names.size();
++                const int physical = padButtonIndex(names.substr(p, comma - p));
++                if (physical >= 0 && std::find(list.begin(), list.end(), physical) == list.end())
++                    list.push_back(physical);
++                p = comma + 1;
++            }
++            into[game] = list;
++        }
++    }
++
++    void padIdentity(std::vector<int> (&into)[kPadButtons])
++    {
++        for (int i = 0; i < kPadButtons; ++i)
++            into[i] = {i};
++    }
++
++    std::string formatPadmap(const std::vector<int> (&from)[kPadButtons])
++    {
++        std::string out;
++        for (int i = 0; i < kPadButtons; ++i)
++        {
++            if (!out.empty())
++                out += ';';
++            out += kBindingNames[i].name;
++            out += '=';
++            for (size_t c = 0; c < from[i].size(); ++c)
++                out += (c ? "," : "") + std::string(kBindingNames[from[i][c]].name);
++        }
++        return out;
++    }
++
++    // (with g_padMapMutex held) The triggers' routing for their adaptive effects: the game trigger each controller
++    // trigger presses (the game's L2 first).
++    void routeTriggersLocked()
++    {
++        const auto route = [](int physical)
++        {
++            for (int game : {kBindL2, kBindR2})
++                if (std::find(g_padSources[game].begin(), g_padSources[game].end(), physical) != g_padSources[game].end())
++                    return game == kBindL2 ? 1 : 2;
++            return 0;
++        };
++        ps2x::sonypad::setTriggerRouting(route(kBindL2), route(kBindR2));
++    }
++
++    void loadPadMapLocked()
++    {
++        if (g_padMapLoaded)
++            return;
++        g_padMapLoaded = true;
++        padIdentity(g_padSources);
++        if (const char *env = std::getenv("PS2X_PADMAP"); env && *env)
++        {
++            parsePadmap(env, g_padSources);
++            std::fprintf(stderr, "[pad] controller buttons: %s\n", formatPadmap(g_padSources).c_str());
++        }
++        routeTriggersLocked();
++    }
++
++    // The game's buttons from the controller's (pressed[i]: controller button i), and the game's analog L2 / R2 from the
++    // controller's triggers (a game trigger pressed by a button: 0 or 1).
++    uint16_t padToGame(const bool (&pressed)[kPadButtons], float physicalL2, float physicalR2, float &gameL2, float &gameR2)
++    {
++        std::vector<int> sources[kPadButtons];
++        {
++            std::lock_guard<std::mutex> lock(g_padMapMutex);
++            loadPadMapLocked();
++            for (int i = 0; i < kPadButtons; ++i)
++                sources[i] = g_padSources[i];
++        }
++        uint16_t down = 0u;
++        const auto analog = [&](int game)
++        {
++            float v = 0.0f;
++            for (int p : sources[game])
++                v = std::max(v, p == kBindL2 ? physicalL2 : p == kBindR2 ? physicalR2 : (pressed[p] ? 1.0f : 0.0f));
++            return v;
++        };
++        for (int game = 0; game < kPadButtons; ++game)
++            for (int p : sources[game])
++                if (pressed[p])
++                {
++                    down |= kBindingNames[game].mask;
++                    break;
++                }
++        gameL2 = analog(kBindL2);
++        gameR2 = analog(kBindR2);
++        return down;
++    }
+ }
+ 
+ namespace ps2_host_input
+@@ -460,6 +585,29 @@ namespace ps2_host_input
+         return formatKeymap(defaults);
+     }
+ 
++    void setPadBindings(const std::string &layout)
++    {
++        std::lock_guard<std::mutex> lock(g_padMapMutex);
++        g_padMapLoaded = true;
++        padIdentity(g_padSources);
++        parsePadmap(layout, g_padSources);
++        routeTriggersLocked();
++    }
++
++    std::string padBindings()
++    {
++        std::lock_guard<std::mutex> lock(g_padMapMutex);
++        loadPadMapLocked();
++        return formatPadmap(g_padSources);
++    }
++
++    std::string defaultPadBindings()
++    {
++        std::vector<int> defaults[kPadButtons];
++        padIdentity(defaults);
++        return formatPadmap(defaults);
++    }
++
+     std::string keyName(int code) { return keyNameOf(code); }
+     int keyCode(const std::string &name) { return keyCodeOf(name); }
+     int mouseButtonCode(int button) { return kMouseCode + button; }
+@@ -730,21 +878,24 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     const auto response = stickConfig();
+     ps2x::sonypad::InputState sony;
+     const bool sonyPad = live && ps2x::sonypad::readHostPad(sony);
++    // (patch 0156) The controller's buttons as pressed; the game's buttons from them through the layout (padToGame).
++    bool physical[kPadButtons] = {};
+     if (sonyPad)
+     {
+         using namespace ps2x::sonypad;
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_UP), PAD_UP);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_DOWN), PAD_DOWN);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_LEFT), PAD_LEFT);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_RIGHT), PAD_RIGHT);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_DOWN), PAD_CROSS);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT), PAD_CIRCLE);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_LEFT), PAD_SQUARE);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_UP), PAD_TRIANGLE);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_1), PAD_L1);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_1), PAD_R1);
++        physical[kBindUp] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_UP);
++        physical[kBindDown] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
++        physical[kBindLeft] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
++        physical[kBindRight] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
++        physical[kBindCross] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
++        physical[kBindCircle] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
++        physical[kBindSquare] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
++        physical[kBindTriangle] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_UP);
++        physical[kBindL1] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_1);
++        physical[kBindR1] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_1);
+         // The analog triggers count as pressed past a sixth of their travel. While the game has an adaptive-trigger
+         // effect on one (setTriggerRequest) with a break point, only past that point: the shot comes with the click.
++        // (patch 0156: triggerRequest gives each controller trigger the effect of the game button it presses.)
+         {
+             const TriggerRequest effects = triggerRequest();
+             static bool wasLeft = false, wasRight = false;
+@@ -762,14 +913,14 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+                 was = down;
+                 return down;
+             };
+-            press(trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2), sony.l2, effects.pressLeft, wasLeft, "L2"), PAD_L2);
+-            press(trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2), sony.r2, effects.pressRight, wasRight, "R2"), PAD_R2);
++            physical[kBindL2] = trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2), sony.l2, effects.pressLeft, wasLeft, "L2");
++            physical[kBindR2] = trigger(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2), sony.r2, effects.pressRight, wasRight, "R2");
+         }
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_RIGHT), PAD_START);    // Options
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_LEFT), PAD_SELECT);    // Create / Share
+-        press((sony.buttons & kTouchpad) != 0u, PAD_SELECT);                       // the touchpad click too
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_THUMB), PAD_L3);
+-        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_THUMB), PAD_R3);
++        physical[kBindStart] = gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_RIGHT); // Options
++        physical[kBindSelect] = gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_LEFT) || // Create / Share
++                                (sony.buttons & kTouchpad) != 0u;                    // the touchpad click too
++        physical[kBindL3] = gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_THUMB);
++        physical[kBindR3] = gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_THUMB);
+         const auto axis = [&](uint8_t value)
+         { return ps2_stick_response::sonyAxis(value, response.enabled); };
+         lx = axis(sony.lx);
+@@ -783,18 +934,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     ps2x::xinput::notePadRead(gamepad >= 0);
+     if (gamepad >= 0)
+     {
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP), PAD_UP);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN), PAD_DOWN);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT), PAD_LEFT);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT), PAD_RIGHT);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN), PAD_CROSS);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT), PAD_CIRCLE);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT), PAD_SQUARE);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP), PAD_TRIANGLE);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1), PAD_L1);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1), PAD_R1);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2), PAD_L2);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2), PAD_R2);
++        physical[kBindUp] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP);
++        physical[kBindDown] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
++        physical[kBindLeft] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
++        physical[kBindRight] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
++        physical[kBindCross] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
++        physical[kBindCircle] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
++        physical[kBindSquare] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
++        physical[kBindTriangle] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP);
++        physical[kBindL1] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1);
++        physical[kBindR1] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1);
++        physical[kBindL2] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
++        physical[kBindR2] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
+         // View + Menu held together (an Xbox pad's overlay shortcut: the port's menu opens) reach the game as
+         // neither Select nor Start, until both are let go.
+         static bool comboHeld = false;
+@@ -804,10 +955,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             comboHeld = true;
+         else if (!view && !menu)
+             comboHeld = false;
+-        press(menu && !comboHeld, PAD_START);
+-        press(view && !comboHeld, PAD_SELECT);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB), PAD_L3);
+-        press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB), PAD_R3);
++        physical[kBindStart] = menu && !comboHeld;
++        physical[kBindSelect] = view && !comboHeld;
++        physical[kBindL3] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB);
++        physical[kBindR3] = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB);
+         lx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);
+         ly = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
+         rx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
+@@ -840,8 +991,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             r2 = std::max(trigger(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER)),
+                           IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2) ? 1.0f : 0.0f);
+         }
+-        g_gamepadL2.store(l2, std::memory_order_relaxed);
+-        g_gamepadR2.store(r2, std::memory_order_relaxed);
++        // (patch 0156) The game's buttons and its analog L2 / R2 from the controller's, through the layout.
++        float gameL2 = 0.0f, gameR2 = 0.0f;
++        const uint16_t down = padToGame(physical, l2, r2, gameL2, gameR2);
++        btns = static_cast<uint16_t>(btns & ~down);
++        g_gamepadL2.store(gameL2, std::memory_order_relaxed);
++        g_gamepadR2.store(gameR2, std::memory_order_relaxed);
+         g_gamepadLive.store(sonyPad || gamepad >= 0, std::memory_order_relaxed);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -549,10 +549,44 @@ namespace ps2x::sonypad
+         host::wake();
+     }
+ 
++    namespace
++    {
++        std::atomic<int> g_routeLeft{1}, g_routeRight{2}; // (patch 0156: the game trigger each controller trigger presses)
++    }
++
+     TriggerRequest triggerRequest()
+     {
+-        std::lock_guard<std::mutex> lock(g_requestMutex);
+-        return g_triggerRequest;
++        TriggerRequest game;
++        {
++            std::lock_guard<std::mutex> lock(g_requestMutex);
++            game = g_triggerRequest;
++        }
++        const int left = g_routeLeft.load(std::memory_order_relaxed), right = g_routeRight.load(std::memory_order_relaxed);
++        if (left == 1 && right == 2)
++            return game;
++        TriggerRequest out = game;
++        const auto take = [&](int from, uint8_t (&effect)[11], uint8_t &press)
++        {
++            if (from == 1)
++                std::memcpy(effect, game.left, 11), press = game.pressLeft;
++            else if (from == 2)
++                std::memcpy(effect, game.right, 11), press = game.pressRight;
++            else
++                std::memset(effect, 0, 11), press = 0u; // (a bumper presses that game button now: no effect here)
++        };
++        take(left, out.left, out.pressLeft);
++        take(right, out.right, out.pressRight);
++        return out;
++    }
++
++    void setTriggerRouting(int left, int right)
++    {
++        const bool same = (g_routeLeft.exchange(left) == left) & (g_routeRight.exchange(right) == right); // (both stored)
++        if (same)
++            return;
++        std::fprintf(stderr, "[sonypad] trigger effects: the left trigger takes the game's %s, the right its %s\n", left == 1 ? "L2" : left == 2 ? "R2" : "nothing", right == 1 ? "L2" : right == 2 ? "R2" : "nothing");
++        g_requestGeneration.fetch_add(1u, std::memory_order_acq_rel);
++        host::wake();
+     }
+ 
+     uint64_t padRequestGeneration() { return g_requestGeneration.load(std::memory_order_acquire); }

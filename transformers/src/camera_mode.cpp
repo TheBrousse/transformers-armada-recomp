@@ -246,8 +246,8 @@ namespace camera_mode
             if (trace)
             {
                 const uint32_t state = id < 64u ? word(rdram, actor + kStates + 4u * id) : 0u;
-                std::fprintf(stderr, "[camera] SetState actor %08x id %u (state %08x vptr %08x)\n", actor, id, state,
-                             state ? word(rdram, state + kStateVptr) : 0u);
+                std::fprintf(stderr, "[camera] SetState actor %08x id %u (state %08x vptr %08x) from %08x\n", actor, id, state,
+                             state ? word(rdram, state + kStateVptr) : 0u, getRegU32(ctx, 31));
             }
             g_setState(rdram, ctx, runtime);
         }

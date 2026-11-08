@@ -1,5 +1,19 @@
 # What's new
 
+## 0.3.8
+
+**Fixed**
+- HD textures on graphics cards that make them black (some NVIDIA GTX 16 series): the HD texture maker now checks
+  every image and tries safer ways on such cards. Existing HD sets are checked once after this update; broken images
+  are made again (or, if the card cannot make them, the game's own textures are used).
+- The desktop shortcut is now made by the update too (it did not appear for installs updated from inside the game).
+
+**New**
+- Controller buttons can be changed: F1 > Controls > Controller buttons, with a "Triggers fire" preset (swaps the
+  bumpers and triggers) and "Reset to default". The adaptive triggers follow your layout.
+- F1 > Graphics: an "HD textures: On / Off" setting. The "Texture pack" settings only show with the Emulated
+  renderer, which they belong to.
+
 ## 0.3.7
 
 **Fixed**

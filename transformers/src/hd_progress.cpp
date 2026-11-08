@@ -86,10 +86,25 @@ namespace hd_progress
             return s;
         }
 
+        // (card_broken, TODO 242: this graphics card's upscales come out broken in every way the upscaler has, so
+        // nothing is made on it - finished as far as the game goes; F1 > Check HD textures tries the card again)
+        bool finished(const Status &s)
+        {
+            return s.ok && (s.state == "done" || s.state == "card_broken");
+        }
+
         void setLine(const Status &s)
         {
             std::string line;
-            if (s.ok && s.state != "done" && s.total > 0)
+            if (s.ok && s.state == "card_broken")
+                line = "HD TEXTURES: NOT MADE (THIS GRAPHICS CARD'S COME OUT BLACK)";
+            else if (s.ok && s.state == "checking" && s.total > 0)
+            {
+                char text[96];
+                std::snprintf(text, sizeof text, "CHECKING HD TEXTURES %lld OF %lld", s.done, s.total);
+                line = text;
+            }
+            else if (s.ok && s.state != "done" && s.total > 0)
             {
                 char text[96];
                 std::snprintf(text, sizeof text, "HD TEXTURES %lld OF %lld%s", s.done, s.total,
@@ -218,9 +233,11 @@ namespace hd_progress
                 const Status s = readStatus(status);
                 setLine(s);
                 g_generation.fetch_add(1, std::memory_order_relaxed);
-                if (s.ok && s.state == "done")
+                if (finished(s))
                 {
-                    std::fprintf(stderr, "[hd textures] the set is done (%lld images)\n", s.total);
+                    std::fprintf(stderr, s.state == "done" ? "[hd textures] the set is done (%lld images)\n"
+                                                           : "[hd textures] none made: this graphics card's come out broken (%lld images)\n",
+                                 s.total);
                     g_watching = false;
                     return;
                 }
@@ -266,10 +283,19 @@ namespace hd_progress
         holdRunningSign();
         const fs::path status = g_dir / "upscale_status.json";
         const Status s = readStatus(status);
-        if (!s.ok || s.state == "done")
-            return; // (a finished set, or one made before the status file: nothing to do)
+        if (!s.ok)
+            return; // (one made before the status file: nothing to do)
         setLine(s);
-        std::fprintf(stderr, "[hd textures] being made: %lld of %lld (%s)\n", s.done, s.total, s.state.c_str());
+        // (TODO 242) A finished set made before the maker checked its images (black ones from a GTX 16-series card):
+        // checked once, in the window that carries on - the maker's own .images_checked_1 says it was.
+        std::error_code ec;
+        const bool unchecked = s.state == "done" && fs::exists(g_dir / "upscaled" / "upscale_manifest.jsonl", ec) &&
+                               !fs::exists(g_dir / ".images_checked_1", ec);
+        if (finished(s) && !unchecked)
+            return; // (a finished set: nothing to do)
+        std::fprintf(stderr, unchecked ? "[hd textures] checking the set's images once (%lld of %lld, %s)\n"
+                                       : "[hd textures] being made: %lld of %lld (%s)\n",
+                     s.done, s.total, s.state.c_str());
         const char *off = std::getenv("TF_HD_HELPER");
         const bool helper = !(off && *off == '0');
 #if defined(_WIN32)
@@ -284,7 +310,7 @@ namespace hd_progress
         std::error_code ec;
         const fs::path dir = g_dir.empty() ? fs::absolute(fs::path("hd_textures"), ec) : g_dir;
         const Status s = readStatus(dir / "upscale_status.json");
-        const bool made = s.ok ? s.state == "done" : fs::is_directory(dir / "upscaled", ec);
+        const bool made = s.ok ? finished(s) : fs::is_directory(dir / "upscaled", ec);
         return made ? "Check HD textures" : "Make HD textures";
     }
 

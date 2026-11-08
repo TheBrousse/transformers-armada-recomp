@@ -998,6 +998,185 @@ namespace mod_menu
         }
 
         // ---------------------------------------------------------------------------------
+        // (TODO 240) The controller's buttons: which controller button presses each of the game's buttons
+        // (ps2_host_input::setPadBindings, patch 0156), kept in settings.ini as PS2X_PADMAP (only what differs from
+        // the default). Change waits for a press of a controller button (read as it is: the layout does not apply to
+        // the menu's own pad keys, which stay fixed). The controller buttons are named as the pad used last shows them.
+        struct PadRow
+        {
+            const char *input; // the game's button (the layout's name)
+            const char *label;
+        };
+        const PadRow kPadRows[] = {
+            {"l1", "Jump / movement Mini-Con (L1)"}, {"r1", "Fire (R1)"}, {"l2", "Mini-Con ability (L2)"},
+            {"r2", "Mini-Con ability (R2)"}, {"triangle", "Transform (Triangle)"}, {"r3", "Recon (R3)"},
+            {"cross", "Cross (menus: confirm)"}, {"circle", "Circle (menus: back)"}, {"square", "Square"}, {"l3", "L3"},
+            {"start", "Pause (Start)"}, {"select", "Select"}, {"up", "D-pad up"}, {"down", "D-pad down"},
+            {"left", "D-pad left"}, {"right", "D-pad right"}};
+        // The controller buttons, in the layout's order (up .. select), with the raylib button each is.
+        const char *const kPadNames[16] = {"up", "down", "left", "right", "cross", "circle", "square", "triangle",
+                                           "l1", "r1", "l2", "r2", "l3", "r3", "start", "select"};
+        const int kPadRaylib[16] = {GAMEPAD_BUTTON_LEFT_FACE_UP, GAMEPAD_BUTTON_LEFT_FACE_DOWN, GAMEPAD_BUTTON_LEFT_FACE_LEFT,
+                                    GAMEPAD_BUTTON_LEFT_FACE_RIGHT, GAMEPAD_BUTTON_RIGHT_FACE_DOWN, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT,
+                                    GAMEPAD_BUTTON_RIGHT_FACE_LEFT, GAMEPAD_BUTTON_RIGHT_FACE_UP, GAMEPAD_BUTTON_LEFT_TRIGGER_1,
+                                    GAMEPAD_BUTTON_RIGHT_TRIGGER_1, GAMEPAD_BUTTON_LEFT_TRIGGER_2, GAMEPAD_BUTTON_RIGHT_TRIGGER_2,
+                                    GAMEPAD_BUTTON_LEFT_THUMB, GAMEPAD_BUTTON_RIGHT_THUMB, GAMEPAD_BUTTON_MIDDLE_RIGHT,
+                                    GAMEPAD_BUTTON_MIDDLE_LEFT};
+        const char *const kPadPlayStation[16] = {"D-pad up", "D-pad down", "D-pad left", "D-pad right", "Cross", "Circle", "Square",
+                                                 "Triangle", "L1", "R1", "L2", "R2", "L3", "R3", "Options", "Create"};
+        const char *const kPadXbox[16] = {"D-pad up", "D-pad down", "D-pad left", "D-pad right", "A", "B", "X", "Y",
+                                          "LB", "RB", "LT", "RT", "LS", "RS", "Menu", "View"};
+        int g_padCapturing = -1;   // the row waiting for a controller button
+        bool g_padArmed = false;   // everything held at the click let go
+        double g_padCaptureAt = 0.0;
+
+        int padIndexOf(const std::string &name)
+        {
+            for (int i = 0; i < 16; ++i)
+                if (name == kPadNames[i])
+                    return i;
+            return -1;
+        }
+
+        // The controller buttons held now, read as they are (-1 none; `any`: something is held).
+        int padHeld(bool &any)
+        {
+            any = false;
+            int first = -1;
+            ps2x::sonypad::InputState s;
+            if (ps2x::sonypad::readHostPad(s))
+            {
+                for (int i = 0; i < 16; ++i)
+                {
+                    bool down = ps2x::sonypad::gamepadButtonDown(s, kPadRaylib[i]);
+                    if (i == 10)
+                        down = down || s.l2 > 0x2Au;
+                    if (i == 11)
+                        down = down || s.r2 > 0x2Au;
+                    if (i == 15)
+                        down = down || (s.buttons & ps2x::sonypad::kTouchpad) != 0u;
+                    if (down)
+                    {
+                        any = true;
+                        if (first < 0)
+                            first = i;
+                    }
+                }
+                return first;
+            }
+            if (!ps2x::sonypad::glfwGamepadsAllowed())
+                return -1;
+            for (int g = 0; g < 4; ++g)
+            {
+                if (!IsGamepadAvailable(g))
+                    continue;
+                for (int i = 0; i < 16; ++i)
+                    if (IsGamepadButtonDown(g, kPadRaylib[i]))
+                    {
+                        any = true;
+                        if (first < 0)
+                            first = i;
+                    }
+                break;
+            }
+            return first;
+        }
+
+        // The layout without what is as the default (each game button on its own controller button): what is saved.
+        std::string padChanges(const std::string &layout)
+        {
+            std::string out;
+            for (const char *name : kPadNames)
+            {
+                const std::string list = listFor(layout, name);
+                if (list != name)
+                    out += (out.empty() ? "" : ";") + std::string(name) + "=" + list;
+            }
+            return out;
+        }
+
+        void setPadLayout(const std::string &layout)
+        {
+            ps2_host_input::setPadBindings(layout);
+            ps2_settings::noteChanged("PS2X_PADMAP", padChanges(ps2_host_input::padBindings()));
+        }
+
+        void drawPadButtons()
+        {
+            const bool xbox = ps2_host_input::lastPadStyle() == ps2_host_input::PadStyle::Xbox;
+            const char *const *names = xbox ? kPadXbox : kPadPlayStation;
+            ImGui::TextWrapped("Which controller button does what. Click Change, then press the controller button (Esc, or "
+                               "waiting 8 seconds, cancels). The F1 menu's own buttons stay as they are.");
+            const std::string layout = ps2_host_input::padBindings();
+            if (g_padCapturing >= 0)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Press a controller button for: %s", kPadRows[g_padCapturing].label);
+                bool any = false;
+                const int held = padHeld(any);
+                if (!any)
+                    g_padArmed = true;
+                if (IsKeyPressed(KEY_ESCAPE) || ImGui::GetTime() - g_padCaptureAt > 8.0)
+                    g_padCapturing = -1;
+                else if (g_padArmed && held >= 0)
+                {
+                    std::string next;
+                    for (const char *name : kPadNames)
+                    {
+                        const std::string list = name == std::string(kPadRows[g_padCapturing].input) ? kPadNames[held] : listFor(layout, name);
+                        next += (next.empty() ? "" : ";") + std::string(name) + "=" + list;
+                    }
+                    setPadLayout(next);
+                    g_padCapturing = -1;
+                }
+            }
+            if (ImGui::BeginTable("padbuttons", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_PadOuterX))
+            {
+                for (int i = 0; i < static_cast<int>(sizeof(kPadRows) / sizeof(kPadRows[0])); ++i)
+                {
+                    ImGui::PushID(1000 + i);
+                    ImGui::TableNextRow(0, menu_style::textSize() * 2.0f);
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(kPadRows[i].label);
+                    ImGui::TableSetColumnIndex(1);
+                    std::string shown;
+                    const std::string list = listFor(layout, kPadRows[i].input);
+                    for (size_t at = 0; at <= list.size();)
+                    {
+                        size_t end = list.find(',', at);
+                        if (end == std::string::npos)
+                            end = list.size();
+                        const int p = padIndexOf(list.substr(at, end - at));
+                        if (p >= 0)
+                            shown += (shown.empty() ? "" : ", ") + std::string(names[p]);
+                        at = end + 1;
+                    }
+                    const bool moved = list != kPadRows[i].input;
+                    if (moved)
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s", shown.empty() ? "-" : shown.c_str());
+                    else
+                        ImGui::TextUnformatted(shown.empty() ? "-" : shown.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    if (menu_style::smallButton("Change"))
+                    {
+                        g_padCapturing = i;
+                        g_padArmed = false;
+                        g_padCaptureAt = ImGui::GetTime();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            if (menu_style::button("Triggers fire"))
+                setPadLayout("l1=l2;l2=l1;r1=r2;r2=r1");
+            if (ImGui::IsItemHovered())
+                menu_style::setHelp("Fire and jump on the triggers (R2, L2), the Mini-Con abilities on the bumpers (R1, L1).");
+            ImGui::SameLine();
+            if (menu_style::button("Reset to default"))
+                setPadLayout("");
+        }
+
+        // ---------------------------------------------------------------------------------
         // The settings pages: every setting of the registry (the runtime's and the game's, which
         // F5's panel used to show and now only this menu does), on the page it belongs to. A
         // setting of a section no page names goes to Other, so none is ever hidden.
@@ -1186,8 +1365,9 @@ namespace mod_menu
             {"TF_NATIVE_SSAA", "Supersampling", "Draws at a higher resolution, then scales down. Costly."},
             {"TF_NATIVE_QUALITY", "Texture quality", "Texture sharpness and filtering. Low suits 4 GB cards. Takes a restart."},
             {"TF_SHARP_TEXTURES", "Sharp distant textures", "Keeps textures sharp into the distance on high-resolution screens."},
-            {"PS2X_TEXTURE_PACK", "Texture pack", "PCSX2 texture packs from a replacements folder."},
-            {"PS2X_GPU_ANISOTROPY", "Texture pack filtering", "How sharp a texture pack stays at an angle."},
+            {"TF_HIRES", "HD textures", "The HD textures made from your disc. Off: the game's own. Takes a restart."},
+            {"PS2X_TEXTURE_PACK", "Texture pack", "Emulated renderer: PCSX2 texture packs from a replacements folder."},
+            {"PS2X_GPU_ANISOTROPY", "Texture pack filtering", "Emulated renderer: how sharp a texture pack stays at an angle."},
             {"PS2X_MOUSE_SENSITIVITY", "Mouse speed", "How fast the mouse turns the camera."},
             {"TF_MENU_MOUSE", "Mouse in menus", "Point and click in the game's menus."},
             {"PS2X_SONYPAD_RUMBLE", "Vibration", "Controller vibration strength."},
@@ -1503,7 +1683,7 @@ namespace mod_menu
             "TF_SMALL_CROSSHAIR", "TF_HQ_PANELS", "TF_DISTANCE_METER", "TF_SPEEDRUN_TIMER", "TF_RENDERER", "PS2X_GPU_SCALE",
             "TF_DRAW_DISTANCE", "TF_SCENERY_DISTANCE", "TF_FOREST_DISTANCE", "TF_FOREST_SPRITES", "TF_GRASS_DISTANCE",
             "TF_TERRAIN_DETAIL", "TF_FOREST_ADAPTIVE", "TF_FOREST_FULL_DETAIL", "TF_ENEMY_DETAIL", "TF_NATIVE_AA", "PS2X_GPU_AA", "PS2X_GPU_MSAA",
-            "TF_NATIVE_SSAA", "TF_NATIVE_QUALITY", "TF_SHARP_TEXTURES", "PS2X_TEXTURE_PACK", "PS2X_GPU_ANISOTROPY",
+            "TF_NATIVE_SSAA", "TF_NATIVE_QUALITY", "TF_SHARP_TEXTURES", "PS2X_TEXTURE_PACK", "PS2X_GPU_ANISOTROPY", "TF_HIRES",
             "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "TF_LIGHTBAR_ALERTS", "TF_ADAPTIVE_TRIGGERS", "TF_TRIGGER_STRENGTH", "TF_PAD_SPEAKER", "TF_PAD_SPEAKER_VOLUME", "TF_PAD_SPEAKER_DELAY", "PS2X_GAMEPAD_BACKEND",
             "PS2X_STICK_RESPONSE", "PS2X_STICK_VEHICLE_MODE", "PS2X_STICK_LEFT_LIFT", "PS2X_STICK_LEFT_SENSITIVITY",
             "PS2X_STICK_RIGHT_LIFT", "PS2X_STICK_VEHICLE_LIFT", "PS2X_STICK_VEHICLE_RESPONSE",
@@ -1608,11 +1788,11 @@ namespace mod_menu
             }
             advancedEnd();
             keyRow("TF_NATIVE_QUALITY");
-            if (advanced("graphics-textures"))
+            // (TODO 243) The HD textures (the native renderer's, made from the disc) on or off, with their buttons. The
+            // texture pack rows are the emulated renderer's PCSX2 packs, a different thing: shown only with it.
+            const bool native = ps2_settings::value("TF_RENDERER") == "native";
+            keyRow("TF_HIRES");
             {
-                keyRow("TF_SHARP_TEXTURES");
-                keyRow("PS2X_TEXTURE_PACK");
-                keyRow("PS2X_GPU_ANISOTROPY");
                 // (The folder the HD textures are loaded from, in Explorer: hd_progress.h)
                 if (!g_list)
                 {
@@ -1643,6 +1823,15 @@ namespace mod_menu
                 }
                 else
                     listItem("Open texture folder, Make HD textures (buttons)");
+            }
+            if (advanced("graphics-textures"))
+            {
+                keyRow("TF_SHARP_TEXTURES");
+                if (!native)
+                {
+                    keyRow("PS2X_TEXTURE_PACK");
+                    keyRow("PS2X_GPU_ANISOTROPY");
+                }
             }
             advancedEnd();
             settingRows(Page::Graphics);
@@ -1676,6 +1865,11 @@ namespace mod_menu
             }
             advancedEnd();
             settingRows(Page::Controls, "Controller");
+            pageHeading("Controller buttons");
+            if (!g_list)
+                drawPadButtons();
+            else
+                listItem("the controller's buttons (a table: Change, Triggers fire, Reset to default)");
             pageHeading("Keyboard");
             keyRow("TF_CAR_KEYS");
             settingRows(Page::Controls, "Keyboard");
@@ -1936,6 +2130,8 @@ namespace mod_menu
         {
             MenuPad p;
             if (scriptedPad(p))
+                return p;
+            if (g_padCapturing >= 0) // (a controller button being chosen: not the menu's)
                 return p;
             if (!IsWindowFocused())
                 return p;
@@ -2269,6 +2465,41 @@ namespace mod_menu
         distance_meter::addSettings(); // Mods & cheats: the prototype's distance meter (distance_meter.h)
         speedrun_timer::addSettings(); // Display, On screen: the speedrun timer (speedrun_timer.h)
         start_screens::addSettings();  // Gameplay: what the game shows from boot to its main menu (start_screens.h, TODO 110)
+        {
+            // (TODO 243) The native renderer's HD textures on or off (TF_HIRES, read when the renderer starts: a restart).
+            // Off draws the game's own textures; the sharp text keeps its own row (Sharp text).
+            ps2_settings::Setting hd;
+            hd.key = "TF_HIRES";
+            hd.section = "Graphics";
+            hd.label = "HD textures";
+            hd.help = "Native renderer: the HD textures made from your disc (hd_textures). Off: the game's own textures. "
+                      "Takes effect after a restart.";
+            hd.choices = {ps2_settings::Choice{"", "On"}, ps2_settings::Choice{"0", "Off"}};
+            hd.defaultValue = "";
+            hd.apply = [](const std::string &) { return false; };
+            hd.available = []()
+            {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            hd.unavailableHelp = "Only for the native renderer (Graphics: Renderer). The emulated one uses texture packs.";
+            ps2_settings::add(hd);
+        }
+        {
+            // (TODO 240) The controller's buttons (drawPadButtons): kept in settings.ini, no row of its own (no choices:
+            // the Controls page's table sets it). The runtime reads PS2X_PADMAP at start.
+            ps2_settings::Setting pad;
+            pad.key = "PS2X_PADMAP";
+            pad.section = "Controller";
+            pad.label = "Controller buttons";
+            pad.defaultValue = "";
+            pad.apply = [](const std::string &value)
+            {
+                ps2_host_input::setPadBindings(value);
+                return true;
+            };
+            ps2_settings::add(pad);
+        }
 #if defined(PS2X_ENABLE_DEBUG_UI)
         if (const char *env = std::getenv("TF_CAR_KEYS"); env && *env)
             g_carKeys.store(*env != '0');
