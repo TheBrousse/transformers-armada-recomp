@@ -114,6 +114,19 @@ Press **F1** at any time. Most settings change at once, while you play.
   <img src="docs/images/menu-graphics.jpg" width="100%" alt="The F1 menu, Graphics page">
 </p>
 
+## Original PS2 bugs fixed
+
+Some bugs are in the original game on the PlayStation 2 too. This version fixes them:
+
+- **Antarctica, played again after finishing it, has no music from the first warp gate.** The level music starts at
+  a spot on the cliff edge that the game places only on a first visit, so a finished Antarctica stays silent to the
+  end. Confirmed on the original game. Here a finished Antarctica keeps that spot, for the music only, without the
+  story's radio call. `TF_REVISIT_MUSIC=0` in settings.ini gives the PS2's behaviour back.
+- **Decepticlones dropped by a dropship can hang frozen in the air.** If a cutscene that freezes the enemies (for
+  example a Mini-Con's discovery) starts while a dropship is still carrying Decepticlones in, the game wipes their
+  "fall when dropped" instruction, so they stay in mid-air when the ship lets them go. Rare on the PS2 too. Here the
+  passengers keep that instruction through the cutscene, so they land and fight.
+
 ## Requirements
 
 - Windows 10 or 11, 64-bit.
