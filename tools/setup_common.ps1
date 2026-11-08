@@ -120,5 +120,8 @@ function New-HookContext($Root, $Port, $Python, $State, $HookArgs, $Changed = @(
 }
 
 # Long paths for every git command, the build's own downloads included: a dependency's test files
-# (toml11's doctest) pass Windows' 260-character limit in a nested install folder.
-$env:GIT_CONFIG_COUNT = "1"; $env:GIT_CONFIG_KEY_0 = "core.longpaths"; $env:GIT_CONFIG_VALUE_0 = "true"
+# (toml11's doctest) pass Windows' 260-character limit in a nested install folder. And the install's own folders as
+# safe git directories: on a drive that records no file owners (exFAT, FAT32 - a player's E: drive) git refuses them
+# as "dubious ownership" and the build stops (only for this script's own git commands, nothing global is changed).
+$env:GIT_CONFIG_COUNT = "2"; $env:GIT_CONFIG_KEY_0 = "core.longpaths"; $env:GIT_CONFIG_VALUE_0 = "true"
+$env:GIT_CONFIG_KEY_1 = "safe.directory"; $env:GIT_CONFIG_VALUE_1 = "*"

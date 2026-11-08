@@ -35,6 +35,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# (git on a drive that records no file owners - exFAT, FAT32 - refuses the repository as "dubious ownership":
+# this script's own git commands treat it as safe; setup_common.ps1 sets the same when the setup runs this)
+if (-not $env:GIT_CONFIG_COUNT) {
+    $env:GIT_CONFIG_COUNT = "2"; $env:GIT_CONFIG_KEY_0 = "core.longpaths"; $env:GIT_CONFIG_VALUE_0 = "true"
+    $env:GIT_CONFIG_KEY_1 = "safe.directory"; $env:GIT_CONFIG_VALUE_1 = "*"
+}
 $Root = $PSScriptRoot
 $Game = Join-Path $Root "game"
 $Work = Join-Path $Root "work"

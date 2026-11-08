@@ -483,7 +483,10 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
         // module folders and miss its own commands - Get-FileHash, found in the first test)
         // (long paths for git and the build's own downloads: 260 characters is not enough in a
         // nested install folder - toml11's test files, found in the first install test)
-        cmd.env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "core.longpaths").env("GIT_CONFIG_VALUE_0", "true");
+        cmd.env("GIT_CONFIG_COUNT", "2").env("GIT_CONFIG_KEY_0", "core.longpaths").env("GIT_CONFIG_VALUE_0", "true");
+        // (an install on a drive that records no file owners - exFAT, FAT32: git calls it "dubious ownership" and
+        // stops; a player's report. Safe for these git commands only, nothing global is changed.)
+        cmd.env("GIT_CONFIG_KEY_1", "safe.directory").env("GIT_CONFIG_VALUE_1", "*");
         // (update.ps1 on a failure: no 30 s pause in a window nobody sees)
         cmd.env("TFA_UPDATE_NO_PAUSE", "1");
         cmd.args(args).env("PATH", path_env).env_remove("PSModulePath").stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).creation_flags_no_window();

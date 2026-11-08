@@ -1,5 +1,11 @@
 # What's new
 
+## 0.2.8
+
+**Fixed**
+- The setup no longer stops at "Disc and game" with "detected dubious ownership" when the game is installed on a
+  drive formatted as exFAT or FAT32 (many external drives and memory cards).
+
 ## 0.2.7
 
 **New**
