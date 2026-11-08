@@ -52,13 +52,12 @@ PATTERNS = [
     (r"user_\d+\w*\.ps2state", "a user's save state"),
 ]
 # More names that must never be published (machines, people, other projects) live in the private tree only:
-# private/publish_patterns.py defines EXTRA = [(regex, what), ...]. Absent in the public repository.
-_extra = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "private", "publish_patterns.py")
+# private/publish_patterns.json, a list of [regex, what] pairs. Absent in the public repository.
+_extra = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "private", "publish_patterns.json")
 if os.path.isfile(_extra):
-    _ns: dict = {}
+    import json
     with open(_extra, encoding="utf-8") as _f:
-        exec(_f.read(), _ns)
-    PATTERNS += list(_ns.get("EXTRA", []))
+        PATTERNS += [(str(p), str(w)) for p, w in json.load(_f)]
 COMPILED = [(re.compile(p), what) for p, what in PATTERNS]
 # Files allowed to name these patterns (this checker itself, the ignore list).
 SELF = {"tools/check_publishable.py", ".gitignore"}
