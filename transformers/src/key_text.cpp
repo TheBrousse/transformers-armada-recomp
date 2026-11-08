@@ -146,7 +146,9 @@ namespace key_text
                 {"L1", "l1"}, {"R1", "r1"}, {"L2", "l2"}, {"R2", "r2"}, {"L3", "l3"}, {"R3", "r3"}, {"X", "cross"}, {"START", "start"}};
             for (const auto &[name, button] : buttons)
             {
-                const std::string key = shownKey(keys, button);
+                std::string key = shownKey(keys, button);
+                if (key.empty() && std::string(button) == "r3" && !ps2_host_input::mouseButtonBound(1))
+                    key = "right click"; // (TODO 224: R3 has no key by default, the right mouse button does recon mode)
                 if (key.empty())
                     continue;
                 replaceAll(s, std::string("the ") + name + " button", key);

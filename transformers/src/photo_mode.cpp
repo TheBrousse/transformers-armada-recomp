@@ -216,6 +216,7 @@ namespace photo_mode
                 g_seen.crosshairAt = std::chrono::steady_clock::now();
             }
             if (((g_on.load(std::memory_order_relaxed) && !g_hudOn.load(std::memory_order_relaxed)) ||
+                 game_config::hudOff() || // (TODO 228: the HUD setting Off hides it as photo mode does)
                  g_hideCrosshair.load(std::memory_order_relaxed) ||
                  ext::hideCrosshair(rdram)) && // (an extension's: none on the jet bike, TODO 92)
                 from >= kCrosshairCodeBegin && from < kCrosshairCodeEnd)
@@ -374,6 +375,8 @@ namespace photo_mode
     }
 
     bool active() { return g_on.load(std::memory_order_relaxed); }
+
+    bool hudHidden() { return g_on.load(std::memory_order_relaxed) && !g_hudOn.load(std::memory_order_relaxed); }
 
     void setHideCrosshair(bool hide) { g_hideCrosshair.store(hide); }
 

@@ -24,6 +24,8 @@ namespace photo_mode
     // pad, while photo mode is on.
     void frame(uint8_t *rdram, bool inLevel);
     bool active();
+    // Photo mode on with its HUD hidden (game_config's HUD switch hides the game's HUD while this is true).
+    bool hudHidden();
     // For the overlays (distance_meter's text): where the crosshair model was put this moment (world),
     // and a world point in the window's pixels as the game's camera shows it (pictureAspect: the
     // picture's shape in the window, ps2_host_display::displayAspect). False when there is none.

@@ -1,0 +1,97 @@
+Subject: [PATCH] Mouse button presses counted by the window loop; R3 without keys (recon mode on the right button)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 9a50e70..97e9d43 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -294,11 +294,13 @@ namespace
+         {"rup", 0},           {"rdown", 0},           {"rleft", 0},             {"rright", 0}};
+ 
+     // The Transformers layout (patch 0009's): L1 jumps and is the movement Mini-Con, Triangle
+-    // transforms, R1 fires, R2 and L2 are Mini-Con abilities, R3 the aiming view, Start pauses.
++    // transforms, R1 fires, R2 and L2 are Mini-Con abilities, Start pauses. R3 has no key (patch 0155):
++    // the right mouse button runs the game's recon mode itself (takeMouseButtonPresses), a player may
++    // still bind R3 to a key.
+     const char *const kDefaultKeymap =
+         "up=UP;down=DOWN;left=LEFT;right=RIGHT;cross=X;circle=C,BACKSPACE;square=R,KP_0;"
+         "triangle=T,V,F,KP_1;l1=SPACE,Q,MOUSE_MIDDLE;r1=LEFT_ALT,MOUSE_LEFT;l2=Z,LEFT_SHIFT;"
+-        "r2=E,LEFT_CONTROL,RIGHT_SHIFT;l3=G;r3=B,MOUSE_RIGHT;start=ENTER,ESCAPE,P;select=TAB;"
++        "r2=E,LEFT_CONTROL,RIGHT_SHIFT;l3=G;r3=;start=ENTER,ESCAPE,P;select=TAB;"
+         "lup=W;ldown=S;lleft=A;lright=D;rup=I;rdown=K;rleft=J;rright=L";
+ 
+     struct KeyName
+@@ -547,6 +549,10 @@ namespace ps2_host_input
+         constexpr int kMaxWatchedKeys = 8;
+         std::atomic<int> g_watchedKeys[kMaxWatchedKeys]; // (0: free)
+         std::atomic<int> g_keyPresses[kMaxWatchedKeys];
++        // (patch 0155) Mouse button presses, counted by the window loop as they come (a click shorter than a game
++        // frame between two pad reads is otherwise lost: the pad sees the button held or not only at the read).
++        constexpr int kCountedMouseButtons = 3; // left, right, middle
++        std::atomic<int> g_mousePresses[kCountedMouseButtons];
+ 
+         // IsKeyPressed only compares final held states, so a press and release
+         // received in the same PollInputEvents are otherwise lost. Raylib queues
+@@ -572,6 +578,22 @@ namespace ps2_host_input
+         }
+     }
+ 
++    int takeMouseButtonPresses(int button)
++    {
++        return button >= 0 && button < kCountedMouseButtons ? g_mousePresses[button].exchange(0, std::memory_order_relaxed) : 0;
++    }
++
++    bool mouseButtonBound(int button)
++    {
++        std::lock_guard<std::mutex> lock(g_bindingsMutex);
++        loadBindingsLocked();
++        for (const auto &list : g_bindings)
++            for (int code : list)
++                if (code == kMouseCode + button)
++                    return true;
++        return false;
++    }
++
+     int takeKeyPresses(int key)
+     {
+         for (int i = 0; i < kMaxWatchedKeys; ++i)
+@@ -609,8 +631,12 @@ namespace ps2_host_input
+             clearMouseMotion();
+             showMouseState(false);
+         }
+-        else if (!captured && focused && allowed && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++        else if (!captured && focused && allowed && (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)))
+         {
++            // (patch 0155: the right button takes the mouse too, and its click counts - the game's recon mode on it -
++            // where the left one's is only the click that takes the mouse, not a shot)
++            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
++                g_mousePresses[MOUSE_BUTTON_RIGHT].fetch_add(1, std::memory_order_relaxed);
+             DisableCursor();
+             captured = true;
+             clearMouseMotion();
+@@ -621,6 +647,10 @@ namespace ps2_host_input
+         g_mouseCaptured.store(captured, std::memory_order_relaxed);
+         if (!captured)
+             return;
++        if (g_mouseButtonsLive.load(std::memory_order_relaxed))
++            for (int b = 0; b < kCountedMouseButtons; ++b)
++                if (IsMouseButtonPressed(b))
++                    g_mousePresses[b].fetch_add(1, std::memory_order_relaxed);
+ 
+         if (!g_mouseButtonsLive.load(std::memory_order_relaxed) && !IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+             !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
+diff --git a/ps2xRuntime/include/runtime/ps2_host_input.h b/ps2xRuntime/include/runtime/ps2_host_input.h
+index 1f028a1..8aa1628 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_input.h
++++ b/ps2xRuntime/include/runtime/ps2_host_input.h
+@@ -52,6 +52,11 @@ namespace ps2_host_input
+     // them (takeKeyPresses: the presses since the last call) once per game frame.
+     void watchKey(int key);
+     int takeKeyPresses(int key);
++    // (patch 0155) A mouse button's presses since the last call (raylib's MOUSE_BUTTON_LEFT / RIGHT / MIDDLE), counted by the
++    // window loop while the mouse belongs to the game - every click, however short. mouseButtonBound: the layout binds it to
++    // a pad input (then the pad has it, as any key).
++    int takeMouseButtonPresses(int button);
++    bool mouseButtonBound(int button);
+ 
+     // The keyboard and mouse layout: for each pad button and stick direction, the keys and mouse
+     // buttons that press it, as "cross=X;circle=C,BACKSPACE;r1=LEFT_ALT,MOUSE_LEFT;lup=W;..."

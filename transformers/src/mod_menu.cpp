@@ -540,7 +540,7 @@ namespace mod_menu
         };
         const ControlRow kControls[] = {
             {"lup", "Move forward"},          {"ldown", "Move back"},          {"lleft", "Move left"},
-            {"lright", "Move right"},         {"r1", "Fire (R1)"},             {"r3", "Aiming view (R3, toggles)"},
+            {"lright", "Move right"},         {"r1", "Fire (R1)"},             {"r3", "R3 (recon zoom; the right mouse button runs recon mode)"},
             {"l1", "Jump / movement Mini-Con (L1)"}, {"triangle", "Transform (Triangle)"},
             {"r2", "Mini-Con ability (R2)"},  {"l2", "Mini-Con ability (L2)"}, {"start", "Pause (Start)"},
             {"select", "Select"},             {"cross", "Cross (menus: confirm)"}, {"circle", "Circle (menus: back)"},
@@ -741,7 +741,36 @@ namespace mod_menu
             std::ifstream in(controlsFile(), std::ios::binary);
             std::string layout;
             if (in && std::getline(in, layout) && !layout.empty())
+            {
+                // (TODO 224) R3 no longer has B and the right mouse button by default: the right button runs recon mode
+                // itself (camera_mode). A layout saved with the old default gets the new one; a right button the
+                // player put on R3 among his own keys is taken off it (his other keys stay).
+                const std::string r3 = listFor(layout, "r3");
+                std::string kept;
+                if (r3 != "B,MOUSE_RIGHT")
+                {
+                    size_t p = 0;
+                    while (p <= r3.size())
+                    {
+                        size_t comma = r3.find(',', p);
+                        if (comma == std::string::npos)
+                            comma = r3.size();
+                        const std::string key = r3.substr(p, comma - p);
+                        if (!key.empty() && key != "MOUSE_RIGHT")
+                            kept += (kept.empty() ? "" : ",") + key;
+                        p = comma + 1;
+                    }
+                }
+                if (kept != r3)
+                {
+                    std::fprintf(stderr, "[mod menu] controls.txt: R3's '%s' -> '%s' (the right mouse button is recon mode)\n", r3.c_str(),
+                                 kept.c_str());
+                    layout += ";r3=" + kept;
+                }
                 ps2_host_input::setKeyBindings(layout);
+                if (kept != r3)
+                    saveControls();
+            }
         }
 
         void setList(const std::string &input, const std::string &list)
@@ -1677,7 +1706,7 @@ namespace mod_menu
                 const int current = !first ? 0 : aim ? 2 : 1;
                 const int chosen = menu_style::choiceRow("camera", "Camera", {"Third person", "First person", "First person, aim on foot"},
                                                          current, true, nullptr,
-                                                         "Aim on foot: the game's own aiming view (strafe, R3 zooms, no run or jump).");
+                                                         "First person is for the robot; the car keeps its own camera. Aim on foot: the game's own aiming view (strafe, R3 zooms, no run or jump).");
                 if (chosen >= 0 && chosen != current)
                 {
                     camera_mode::setFirstPerson(chosen != 0);

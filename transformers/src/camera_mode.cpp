@@ -10,8 +10,8 @@
 // taThirdPersonCameraScriptThree, R3's aiming view taFirstPersonCameraScript, the car
 // taVehicleCameraScript.
 //
-// First person mode: a switch to the third-person or the car script goes to the first-person script
-// instead (given the replaced script's target, +0x80 the creature and +0x84 its node, which the game
+// First person mode: a switch to the third-person script goes to the first-person script (the car keeps its own: TODO 227)
+// (given the replaced script's target, +0x80 the creature and +0x84 its node, which the game
 // sets on the first-person script only for R3's view). Switching the mode while playing makes the
 // same 0.3 s cross-fade the switch makes, field by field, before the manager's next update.
 //
@@ -41,6 +41,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_host_input.h"
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace camera_mode
 {
@@ -132,7 +134,11 @@ namespace camera_mode
             return -1;
         }
 
-        bool replaceable(uint32_t vt) { return vt == kThirdPersonVtable || vt == kVehicleVtable; }
+        // (TODO 227) Only the robot's third-person view: in the car the first-person script, given the car's target, showed
+        // the world from inside the car's body with a broken projection (the user's screenshot: the sky's rays meeting on
+        // the horizon, the ground smeared, black below), so the car keeps the game's own car camera; back on foot the
+        // first person comes back with the switch to the third-person script.
+        bool replaceable(uint32_t vt) { return vt == kThirdPersonVtable; }
 
         void copyTarget(uint8_t *rdram, uint32_t from, uint32_t to)
         {
@@ -327,5 +333,131 @@ namespace camera_mode
     }
     void setFirstPerson(bool on) { g_firstPerson.store(on); }
 
-    void frame(uint8_t *, bool) {}
+    // (TODO 224) Recon mode on the right mouse button: one button for the whole of it, the game's own steps. The aiming
+    // view (taTransformerStateLook, the actor's state 9) is entered from standing, walking or running with Circle (action
+    // 0x35) - or R3 (0x36) when the game's option 3 is on - and its DoUpdate (0x474000) steps the zoom on R3 (0x36: the
+    // index +1, back to 0 after the last level; the levels are the Autobot's static data's, 1 / 1.75 / 3 for the three
+    // Autobots: the state's +0x20 = 1 / level, its index +0x90); L3 (0x3E) or Circle leaves it (its DoPostUpdate 0x473620).
+    // Measured with the actions an input answers (TF_JETBIKE_SCAN): R3 = 0x36, 0x45, 0x4C; Circle = 0x0C, 0x35; L3 = 0x3E.
+    // So a click: off the view, the enter button; in it, R3 (the next zoom); a click that brings the zoom back to the
+    // first level (or leaves it where it was) means it was the last: L3 then leaves the view. Elsewhere (the car, a jump)
+    // the click is R3, as the button was. Only while no pad input of the layout uses the right button (a player who
+    // binds it to something else gets that instead). The clicks are counted by the window loop (patch 0155), so a short
+    // click between two pad reads is no longer lost (the reported "sometimes right click does nothing").
+    namespace
+    {
+        constexpr uint32_t kLookState = 9u, kCurrentState = 0xF8u, kLookZoomIndex = 0x90u, kLookPhase = 0x94u;
+        constexpr uint32_t kOptionsPointer = 0x006CF244u, kOptionR3Look = 3u;
+        constexpr uint16_t kCircle = 1u << 13u, kL3 = 1u << 1u;
+        constexpr uint32_t kPlayerManager = 0x006CF498u;
+        constexpr int kPressFrames = 4;  // frames a button is held for the game to see the press
+        constexpr int kWatchFrames = 30; // frames to see the zoom step land
+        std::atomic<uint16_t> g_reconButton{0u};
+        std::atomic<int> g_reconFrames{0};
+        int g_reconWatch = 0;      // frames left to see what an R3 click did
+        uint32_t g_reconIndex = 0u; // the zoom index before it
+        bool g_reconTrace = false;
+
+        uint32_t playerActor(const uint8_t *rdram)
+        {
+            const uint32_t manager = word(rdram, kPlayerManager);
+            const uint32_t node = manager ? word(rdram, manager + 8u) : 0u;
+            if (!node || node == manager + 4u)
+                return 0u;
+            const uint32_t player = word(rdram, node + 8u), creature = player ? word(rdram, player + 8u) : 0u;
+            return creature ? word(rdram, creature + 0x54u) : 0u;
+        }
+
+        void reconPress(uint16_t button, const char *what)
+        {
+            g_reconButton.store(button, std::memory_order_relaxed);
+            g_reconFrames.store(kPressFrames, std::memory_order_relaxed);
+            if (g_reconTrace)
+                std::fprintf(stderr, "[recon] right click: %s\n", what);
+        }
+    }
+
+    uint16_t reconButtons()
+    {
+        const int left = g_reconFrames.load(std::memory_order_relaxed);
+        if (left <= 0)
+            return 0u;
+        g_reconFrames.store(left - 1, std::memory_order_relaxed);
+        return g_reconButton.load(std::memory_order_relaxed);
+    }
+
+    void frame(uint8_t *rdram, bool inLevel)
+    {
+        static const bool init = (g_reconTrace = std::getenv("TF_RECON_TRACE") != nullptr, true);
+        (void)init;
+        int clicks = ps2_host_input::takeMouseButtonPresses(1); // (raylib's MOUSE_BUTTON_RIGHT)
+        // TF_RECON_CLICKS=300,500,... (a testing aid): right clicks at those game frames of a level (counted from the first
+        // frame a level runs), for hidden runs where no mouse can click.
+        {
+            static std::vector<long> at;
+            static size_t next = 0;
+            static long frames = 0;
+            static const bool parsed = [] {
+                if (const char *e = std::getenv("TF_RECON_CLICKS"))
+                    for (const char *p = e; *p;)
+                    {
+                        char *end = nullptr;
+                        const long v = std::strtol(p, &end, 10);
+                        if (end == p)
+                            break;
+                        at.push_back(v);
+                        p = *end == ',' ? end + 1 : end;
+                    }
+                return true;
+            }();
+            (void)parsed;
+            if (inLevel && next < at.size() && ++frames >= at[next])
+            {
+                ++next;
+                ++clicks;
+            }
+        }
+        const uint32_t actor = inLevel && rdram ? playerActor(rdram) : 0u;
+        const uint32_t state = actor ? word(rdram, actor + kCurrentState) : ~0u;
+        const uint32_t look = actor ? word(rdram, actor + kStates + 4u * kLookState) : 0u;
+        if (g_reconWatch > 0 && g_reconFrames.load(std::memory_order_relaxed) <= 0)
+        {
+            const uint32_t index = look ? word(rdram, look + kLookZoomIndex) : 0u;
+            if (state != kLookState)
+                g_reconWatch = 0;
+            else if (index != g_reconIndex && index != 0u)
+                g_reconWatch = 0; // (zoomed in a level)
+            else if (index == 0u && g_reconIndex != 0u)
+            {
+                g_reconWatch = 0; // (round to the first level: that was the last - out)
+                reconPress(kL3, "past the last zoom level: leave recon mode (L3)");
+            }
+            else if (--g_reconWatch == 0 && g_reconIndex != 0u)
+                reconPress(kL3, "no zoom level further: leave recon mode (L3)");
+        }
+        if (clicks <= 0 || ps2_host_input::mouseButtonBound(1))
+            return;
+        if (!actor || g_reconFrames.load(std::memory_order_relaxed) > 0 || g_reconWatch > 0)
+            return; // (no level, or the last click still being done: one at a time)
+        if (state == kLookState)
+        {
+            const uint32_t phase = word(rdram, look + kLookPhase);
+            if (phase == 3u)
+                return; // (already leaving)
+            g_reconIndex = word(rdram, look + kLookZoomIndex);
+            g_reconWatch = kWatchFrames;
+            reconPress(kR3, "zoom in (R3)");
+        }
+        else if (state <= 2u) // (standing, walking, running: into recon mode)
+        {
+            const uint32_t options = word(rdram, kOptionsPointer);
+            const uint8_t *opt = options ? getConstMemPtr(rdram, options + kOptionR3Look) : nullptr;
+            if (opt && *opt)
+                reconPress(kR3, "into recon mode (R3)");
+            else
+                reconPress(kCircle, "into recon mode (Circle)");
+        }
+        else
+            reconPress(kR3, "R3 (not on foot)");
+    }
 }

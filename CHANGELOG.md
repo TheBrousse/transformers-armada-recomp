@@ -1,5 +1,15 @@
 # What's new
 
+## 0.3.6
+
+**Fixed**
+- HUD Off (F1 > Gameplay) now hides the whole HUD at once, with no restart: the bars, the Mini-Con ring, the insignia,
+  the messages and the crosshair. Photo mode hides it too.
+- Recon mode on the keyboard: the right mouse button goes in, zooms in two steps, then goes out. Quick clicks are no
+  longer missed, and B no longer does recon (you can still bind a key to it in F1 > Controls).
+- First person: the car now uses its normal car camera instead of a broken view from inside the car. First person
+  comes back when you transform back into the robot.
+
 ## 0.3.5
 
 **New**

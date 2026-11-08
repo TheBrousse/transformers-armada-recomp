@@ -17,6 +17,8 @@ namespace camera_mode
     // First person on foot as the game's own aiming view (R3: strafing, R3 zooms): the button it
     // presses for that, once a rendered frame (overrides.cpp, the pad override).
     uint16_t padButtons();
+    // (TODO 224) The right mouse button's recon mode: the pad button a click presses (in, zoom, out), once a rendered frame.
+    uint16_t reconButtons();
     void setAim(bool on);
     bool aim();
     // The current camera's transform (overrides.cpp, the listener update's 0x1AFD40 call): the free look's (TODO 190).

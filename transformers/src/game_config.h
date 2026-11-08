@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+class PS2Runtime;
+
 namespace game_config
 {
     // The tabs' settings: before the window loop starts.
@@ -60,6 +62,14 @@ namespace game_config
     // Where a setting's value is (a bool's byte, ...), by its label in 0_DEFS.TMD; 0 until frame has
     // found the table. On the game thread.
     uint32_t valueAddress(const char *label);
+    // (TODO 228) The HUD shown or not, at once: the game reads showHUD only when it makes the HUD (taPlayerHUD's
+    // constructor 0x2FBBC0 keeps it at the HUD's +0x74, which the HUD's draw 0x2FB190 checks: every part - the bars,
+    // the Mini-Con ring and its icons, the insignia, the HQ's calls, the context messages - is one of its components).
+    // So a change of the setting, or photo mode, showed only from the next level. The draw is wrapped: the HUD's own
+    // flag is set from the setting (or photo mode's hidden HUD) as it draws; "Game's own" leaves it as the game made
+    // it. installHud before the game runs; hudOff: the setting says Off (the crosshair goes too, as in photo mode).
+    void installHud(PS2Runtime &runtime);
+    bool hudOff();
     // A start movie the "When the game starts" setting skips (start_screens.h, TODO 110; it replaced the
     // "Intro screens" switch). The game's own runUIIntro is never written: it skips the title's whole
     // flow - the profile is never set up and the first level stops the game (TODO 80).

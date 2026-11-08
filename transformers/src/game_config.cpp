@@ -2,12 +2,14 @@
 
 #include "game_config.h"
 
+#include "photo_mode.h"
 #include "start_screens.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_settings.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -94,6 +96,41 @@ namespace game_config
         }
 
         std::map<std::string, uint32_t> g_entries; // label -> clData* (frame, on the game thread)
+
+        // (TODO 228) The HUD's own flag (taHUD +0x74) from the setting: -1 the game's own, 0 Off, 1 On (frame keeps it).
+        std::atomic<int> g_hudWant{-1};
+        constexpr uint32_t kHudDraw = 0x002FB190u;   // taHUD's draw (vtable slot 3): nothing of it while +0x74 is 0
+        constexpr uint32_t kHudShown = 0x74u;        // the flag taPlayerHUD's constructor sets from showHUD
+        PS2Runtime::RecompiledFunction g_hudDraw = nullptr;
+        uint32_t g_hudForced = 0u; // the HUD whose flag was set here (put back as the game had it for "Game's own")
+        uint8_t g_hudGameValue = 1u;
+
+        void hudDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc == kHudDraw) // (not a resumed call)
+            {
+                const uint32_t hud = getRegU32(ctx, 4);
+                const int want = photo_mode::hudHidden() ? 0 : g_hudWant.load(std::memory_order_relaxed);
+                if (uint8_t *flag = hud ? getMemPtr(rdram, hud + kHudShown) : nullptr)
+                {
+                    if (want >= 0)
+                    {
+                        if (g_hudForced != hud)
+                        {
+                            g_hudForced = hud;
+                            g_hudGameValue = *flag;
+                        }
+                        *flag = static_cast<uint8_t>(want);
+                    }
+                    else if (g_hudForced == hud)
+                    {
+                        *flag = g_hudGameValue;
+                        g_hudForced = 0u;
+                    }
+                }
+            }
+            g_hudDraw(rdram, ctx, runtime);
+        }
 
         // A plausible table: a count of a few hundred at most and a pointer into main memory.
         bool tableReady(const uint8_t *rdram, uint32_t &begin, uint32_t &count)
@@ -214,6 +251,10 @@ namespace game_config
             std::lock_guard<std::mutex> guard(g_lock);
             chosen = g_chosen;
         }
+        {
+            const std::string &hud = chosen["TF_CFG_showHUD"];
+            g_hudWant.store(hud == "0" ? 0 : hud == "1" ? 1 : -1, std::memory_order_relaxed);
+        }
         for (const Item &item : items())
         {
             const std::string &value = chosen[key(item)];
@@ -238,6 +279,14 @@ namespace game_config
             }
         }
     }
+
+    void installHud(PS2Runtime &runtime)
+    {
+        if ((g_hudDraw = runtime.lookupFunction(kHudDraw)) != nullptr)
+            runtime.registerFunction(kHudDraw, hudDraw);
+    }
+
+    bool hudOff() { return g_hudWant.load(std::memory_order_relaxed) == 0; }
 
     bool skipIntroMovie(const std::string &movieKey) { return start_screens::skipsMovie(movieKey.c_str()); }
 

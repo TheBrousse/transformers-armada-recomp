@@ -348,7 +348,18 @@ namespace dualsense
         float left = 0.0f;
         const bool alive = !readFloat(rdram, kEnergy, left) || left > 0.0f;
         const WeaponClass *onL2 = nullptr, *onR2 = nullptr;
-        if (g_triggers.load(std::memory_order_relaxed) && inLevel && actor && alive && !camera_mode::inVehicle() &&
+        // (TODO 225) On a seat - the jet bike (R2 its throttle) or a manned turret: the actor's state (+0xF8) is the turret
+        // state 0x13 - no trigger effect and no break-point gating, as in car mode: the throttle reads R2's whole travel.
+        uint32_t current = ~0u;
+        const bool seated = actor && readWord(rdram, actor + 0xF8u, current) && current == 0x13u;
+        static bool wasSeated = false;
+        if (seated != wasSeated)
+        {
+            std::fprintf(stderr, "[dualsense] adaptive triggers %s (%s)\n", seated ? "released" : "restored",
+                         seated ? "on a seat: the jet bike or a turret" : "off the seat");
+            wasSeated = seated;
+        }
+        if (g_triggers.load(std::memory_order_relaxed) && inLevel && actor && alive && !camera_mode::inVehicle() && !seated &&
             !mod_menu::isOpen())
         {
             onL2 = weaponIn(rdram, actor, kSlotL2);

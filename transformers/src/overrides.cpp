@@ -1336,7 +1336,8 @@ namespace
         uint8_t stickPercent = 100u;
         uint16_t pressed = static_cast<uint16_t>(fmvSkipButtons() | scriptedButtons(tick, sticks, stickPercent) |
                                                  mod_menu::padButtons(tick) | // (a cheat code the mod menu enters)
-                                                 camera_mode::padButtons()); // (first person: into the aiming view)
+                                                 camera_mode::padButtons() | // (first person: into the aiming view)
+                                                 camera_mode::reconButtons()); // (TODO 228: the right mouse button's recon mode)
         applyWarps(rdram, tick);
         // TF_RAM_SCAN=<tick> (debugging aid): at that tick, which 4 KB pages hold anything - the top 2 MB of the PS2's
         // 32 MB (the main thread's stack, the heap's first block's end) and the port's added data (N7: the top of the
@@ -8571,6 +8572,7 @@ namespace
         start_screens::install(runtime);  // boot straight to the main menu (start_screens.h, TODO 110)
         camera_mode::install(runtime);    // first / third person (camera_mode.cpp)
         photo_mode::install(runtime);     // the free camera, F8 (photo_mode.cpp)
+        game_config::installHud(runtime); // the HUD setting and photo mode's hidden HUD at once (game_config.h, TODO 228)
         if (!ext::install(ext::Phase::AfterPhotoMode, runtime)) runtime.requestStop(); // (the jet bike: its addresses stay put)
         actor_guard::install(runtime);    // freed actors' child walks left out (actor_guard.h, TODO 51)
         revisit_music::install(runtime);  // a finished Antarctica's cliff music (revisit_music.h, TODO 83: an original PS2 bug)
