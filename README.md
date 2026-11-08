@@ -243,6 +243,7 @@ Issues and pull requests are welcome. See **[docs/CONTRIBUTING.md](docs/CONTRIBU
 - **kayliox:** the PC port, the renderer and the sound.
 - **Jenvery:** the HQ frame-rate fix.
 - **TPepperoni666:** the stick response and the Xbox button prompts.
+- **SirCebollo:** testing, and finding and reporting bugs.
 - The approach follows [Project Amp](https://gitlab.com/ztpeditor/project-amp), which brought *Amplitude* to PC the same way.
 - Third-party components and their licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

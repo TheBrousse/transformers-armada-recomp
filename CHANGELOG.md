@@ -1,5 +1,12 @@
 # What's new
 
+## 0.3.7
+
+**Fixed**
+- Hot Shot's red parts (and other dark textures) no longer turn black or navy on some NVIDIA cards (GTX 16 series).
+  The HD texture maker can produce broken images on those cards; the game now notices a black, colour-missing or
+  colour-swapped HD image and uses the game's own texture instead. A repair for the HD set itself comes next.
+
 ## 0.3.6
 
 **Fixed**

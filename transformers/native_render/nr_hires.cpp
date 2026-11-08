@@ -292,7 +292,8 @@ namespace nr
         bool looksLikeGame(const std::vector<uint32_t> &avg, const Texture &texture, const std::string &name)
         {
             static const bool log = std::getenv("TF_NATIVE_NAMES") != nullptr;
-            double diff = 0.0, alphaDiff = 0.0;
+            double diff = 0.0, alphaDiff = 0.0, swappedDiff = 0.0;
+            double gameSum[3] = {}, largeSum[3] = {}; // (each channel's sum over the texels compared)
             double light = 0.0, kept = 0.0; // (the game's light, and how much of it the large image has there)
             size_t counted = 0;
             for (size_t i = 0; i < avg.size() && i < texture.pixels.size(); ++i)
@@ -305,12 +306,43 @@ namespace nr
                 {
                     const int gc = static_cast<int>((g0 >> (8 * k)) & 0xFFu), lc = static_cast<int>((a >> (8 * k)) & 0xFFu);
                     diff += std::abs(lc - gc);
+                    // (the large image's texel with its red and blue exchanged, against the same game texel)
+                    swappedDiff += std::abs(static_cast<int>((a >> (8 * (2 - k))) & 0xFFu) - gc);
                     light += gc;
                     kept += std::min(gc, lc);
+                    gameSum[k] += gc;
+                    largeSum[k] += lc;
                 }
                 ++counted;
             }
             const double mean = counted ? diff / (static_cast<double>(counted) * 3.0) : 0.0;
+            // (TODO 229) Red and blue exchanged: an HD image whose colours fit the game's texture far better with its
+            // red and blue swapped was made with its channels in the wrong order. A dark red texture swapped stays
+            // near enough to pass the 20 below (Hot Shot's chest: 17.6), its yellow parts would not. Such an image is
+            // not used: the game's own texture is drawn. It needs a clear mismatch first (over 8), so a right image -
+            // or a grey one, the same either way - is never taken for one (over the whole remaster set the lowest
+            // swapped-to-as-is ratio of a used image is 0.85). TF_HIRES_SWAPCHECK=0: not checked.
+            const double swappedMean = counted ? swappedDiff / (static_cast<double>(counted) * 3.0) : 0.0;
+            static const bool swapCheck = !(std::getenv("TF_HIRES_SWAPCHECK") && *std::getenv("TF_HIRES_SWAPCHECK") == '0');
+            const bool swapped = swapCheck && mean > 8.0 && swappedMean < mean * 0.5;
+            if (swapped)
+                std::fprintf(stderr, "[native render] upscale %s: its red and blue are exchanged (off the game's by %.2f, by %.2f swapped) - not used\n",
+                             name.c_str(), mean, swappedMean);
+            // (TODO 229) Black, or a colour missing: an upscaler that failed on the player's graphics card (Real-ESRGAN's
+            // black images on GTX 16xx cards) leaves a black image behind, and against a dark texture a black one
+            // passes the 20 below (Hot Shot's dark red HOTLEGU: 19.7, drawn black-navy). A colour the game's texture
+            // has (a channel's mean 24 or more) of which the large image keeps under a quarter: not used. Over the
+            // whole remaster set the lowest any image keeps is 38% (the redrawn STRIPGLOW), the next 69%.
+            // TF_HIRES_DARKCHECK=0: not checked.
+            static const bool darkCheck = !(std::getenv("TF_HIRES_DARKCHECK") && *std::getenv("TF_HIRES_DARKCHECK") == '0');
+            bool lost = false;
+            for (int k = 0; darkCheck && counted && k < 3; ++k)
+                if (gameSum[k] >= 24.0 * static_cast<double>(counted) && largeSum[k] < 0.25 * gameSum[k])
+                    lost = true;
+            if (lost)
+                std::fprintf(stderr, "[native render] upscale %s: black, or a colour missing (RGB %.0f %.0f %.0f where the game's has %.0f %.0f %.0f) - not used\n",
+                             name.c_str(), largeSum[0] / counted, largeSum[1] / counted, largeSum[2] / counted, gameSum[0] / counted, gameSum[1] / counted,
+                             gameSum[2] / counted);
             // (And its alpha: a translucent layer whose large image has other alpha than the game's -
             // colour under once-transparent texels let through - draws that colour (Alaska's snow
             // overlay showed purple blotches). Off by more than 24 of 255 on average: not used.
@@ -333,7 +365,7 @@ namespace nr
             if (log)
                 std::fprintf(stderr, "[native render] upscale %s: the large image differs from the game's by %.2f, alpha %.2f%s\n", name.c_str(),
                              mean, meanAlpha, mean > 20.0 ? " - redrawn art, not used" : alphaOff ? " - its alpha is not the game's, not used" : "");
-            return !(mean > 20.0 || alphaOff);
+            return !(mean > 20.0 || alphaOff || swapped || lost);
         }
 
         // (TODO 44) The large image's colour matched to the game's: per channel, the large image scaled so that,

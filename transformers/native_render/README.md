@@ -319,7 +319,10 @@ and interfaces (their names and addresses are the game's).
    remaster made them (a question for the images). The large images' check (box-filtered back to
    the game's size) now also compares alpha: a mean difference over 24 rejects the image ("its
    alpha is not the game's" - LOADINGSCREENTOPLEFT 221, STRIPGLOW 226, GRAYX16 28; `TF_HIRES_ALPHA=0`
-   keeps them). (4) Antarctica's
+   keeps them). (TODO 229) It also rejects a black image, or one missing a colour the game's texture has
+   (under a quarter of a channel whose mean is 24 or more: Real-ESRGAN's black images on GTX 16xx cards,
+   which against a dark texture stayed under the mean difference of 20), and one whose red and blue
+   exchanged fit far better; `TF_HIRES_DARKCHECK=0` / `TF_HIRES_SWAPCHECK=0` keep them. (4) Antarctica's
    warm snow streaks: the grass image's `0x0480` alone in the table is not the core's clip routine
    but vlShader_Drift - the ground's triangles sown with sprites drifting along the wind (q24, less
    its part along the normal) - drawn as a plain mesh before. Read off the microcode (RNEXT/RINIT
