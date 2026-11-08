@@ -1,0 +1,212 @@
+Subject: [PATCH] The disc's sectors, for the host
+
+A game whose disc server runs on the host (Transformers: TwoFish native) reads the disc by
+LSN through PS2Runtime::readDiscSectors: the same sectors the IOP's CD reads see (the disc
+image, or the virtual disc built over a directory), into a host buffer.
+---
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index ff1d6ce..04cc858 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -45,6 +45,8 @@ namespace ps2x::iop
+         [[nodiscard]] bool writeMemory(uint32_t address, const void *source, size_t size);
+         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
+         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
++        // The disc's sectors for the host (sectors * 2048 bytes), as the IOP's CD reads see them.
++        [[nodiscard]] bool readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination);
+ 
+         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+ 
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 9b25393..3ac7367 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -348,6 +348,8 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        bool readDiscSectors(uint32_t lsn, uint32_t sectors, uint8_t *bytes) { return readSectorsInto(lsn, sectors, bytes); }
++
+         std::optional<CompletionCallback> takeCompletionCallback() noexcept
+         {
+             std::optional<CompletionCallback> result = completionCallback;
+@@ -705,23 +707,10 @@ namespace ps2x::iop::detail
+             return host.readHostFile(node->handle, offset, destination, wanted, bytesRead) && bytesRead == wanted;
+         }
+ 
+-        bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        // The sectors into a host buffer (sectors * 2048 bytes): the image, else the virtual disc.
++        bool readSectorsInto(uint32_t lsn, uint32_t sectors, uint8_t *bytes)
+         {
+-            if (sectors == 0u)
+-            {
+-                lastError = kCdvdErrorNone;
+-                return true;
+-            }
+-            const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
+-            if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
+-            {
+-                lastError = kCdvdErrorRead;
+-                return false;
+-            }
+-            const size_t byteCount = static_cast<size_t>(byteCount64);
+-            std::vector<uint8_t> bytes(byteCount, 0u);
+-
+-            bool read = false;
++            const size_t byteCount = static_cast<size_t>(sectors) * kSectorSize;
+             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+             if (!imagePath.empty())
+             {
+@@ -730,29 +719,34 @@ namespace ps2x::iop::detail
+                 if (imageHandle != 0u)
+                 {
+                     size_t bytesRead = 0u;
+-                    read = host.readHostFile(imageHandle,
+-                                             static_cast<uint64_t>(lsn) * kSectorSize,
+-                                             bytes.data(),
+-                                             byteCount,
+-                                             bytesRead) &&
+-                           bytesRead == byteCount;
++                    if (host.readHostFile(imageHandle, static_cast<uint64_t>(lsn) * kSectorSize, bytes, byteCount, bytesRead) &&
++                        bytesRead == byteCount)
++                        return true;
+                 }
+             }
++            if (!buildVirtualIso())
++                return false;
++            for (uint32_t sector = 0u; sector < sectors; ++sector)
++                if (!readVirtualSector(lsn + sector, bytes + static_cast<size_t>(sector) * kSectorSize))
++                    return false;
++            return true;
++        }
+ 
+-            if (!read && buildVirtualIso())
++        bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        {
++            if (sectors == 0u)
+             {
+-                read = true;
+-                for (uint32_t sector = 0u; sector < sectors; ++sector)
+-                {
+-                    if (!readVirtualSector(lsn + sector, bytes.data() + static_cast<size_t>(sector) * kSectorSize))
+-                    {
+-                        read = false;
+-                        break;
+-                    }
+-                }
++                lastError = kCdvdErrorNone;
++                return true;
+             }
+-
+-            if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
++            const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
++            if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
++            {
++                lastError = kCdvdErrorRead;
++                return false;
++            }
++            std::vector<uint8_t> bytes(static_cast<size_t>(byteCount64), 0u);
++            if (!readSectorsInto(lsn, sectors, bytes.data()) || !memory.writeRam(destination, bytes.data(), bytes.size()))
+             {
+                 lastError = kCdvdErrorRead;
+                 return false;
+@@ -798,6 +792,11 @@ namespace ps2x::iop::detail
+         return m_impl->dispatchImport(ordinal, cpu);
+     }
+ 
++    bool IopCdvd::readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination)
++    {
++        return destination && (sectors == 0u || m_impl->readDiscSectors(lsn, sectors, static_cast<uint8_t *>(destination)));
++    }
++
+     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
+     {
+         return m_impl->takeCompletionCallback();
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 6819c70..fa6fc65 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -37,6 +37,9 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
++        // The disc's sectors, read for the host (a native file server): the same LSNs the IOP's
++        // own reads see (the disc image, or the virtual disc over a directory).
++        [[nodiscard]] bool readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination);
+ 
+         // Host file handles are not part of a state: they are reopened on use.
+         void saveState(StateWriter &out) const;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 1fd0f3b..9616ef2 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1411,6 +1411,11 @@ namespace ps2x::iop::detail
+                m_impl->memory.zeroRam(address, size);
+     }
+ 
++    bool IopEmulator::readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination)
++    {
++        return m_impl->cdvd.readDiscSectors(lsn, sectors, destination);
++    }
++
+     bool IopEmulator::isMemoryRange(uint32_t address, size_t size) const
+     {
+         const bool physicalSegment = address < IopMemory::RamSize;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 83ee5ff..7a6263e 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -40,6 +40,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool writeMemory(uint32_t address, const void *source, size_t size);
+         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
+         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
++        [[nodiscard]] bool readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination);
+ 
+         [[nodiscard]] uint64_t cycles() const noexcept;
+         [[nodiscard]] uint64_t instructions() const noexcept;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 97907e4..235096f 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -259,6 +259,11 @@ namespace ps2x::iop
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
++    bool IopSubsystem::readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination)
++    {
++        return m_impl->emulator.readDiscSectors(lsn, sectors, destination);
++    }
++
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
+         DebugSnapshot snapshot;
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index d03c206..fdf4ccf 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -304,6 +304,9 @@ public:
+     bool writeIopMemory(uint32_t address, const void *source, size_t size);
+     bool zeroIopMemory(uint32_t address, size_t size);
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
++    // The disc's sectors (sectors * 2048 bytes into a host buffer), the same LSNs the IOP's CD
++    // reads see: for a game whose disc server runs on the host.
++    bool readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination);
+     bool deliverIopSifCommand(uint32_t commandId, const void *packet, size_t size);
+ 
+     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fe3e26d..7a4c309 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -819,6 +819,11 @@ bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
+     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
+ }
+ 
++bool PS2Runtime::readDiscSectors(uint32_t lsn, uint32_t sectors, void *destination)
++{
++    return m_iopSubsystem && m_iopSubsystem->readDiscSectors(lsn, sectors, destination);
++}
++
+ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+ {
+     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);

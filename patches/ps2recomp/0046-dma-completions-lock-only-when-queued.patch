@@ -1,0 +1,63 @@
+Subject: [PATCH] DMA completions: drained without the lock when none are queued
+
+Every guest Store32 drains the completed DMA causes (PS2Runtime::drainCompletedDmacHandlers ->
+PS2Memory::consumeCompletedDmacCauses), which took m_completedDmacMutex each time. A flag set
+under the lock when a cause is queued lets the drain return at once when there are none. A cause
+queued on the EE thread is seen at the next drain as before; one queued on another thread just
+after the test waits for the next drain, as one queued just after the swap always did.
+PS2X_EE_FASTPATHS bit 2 (0045) switches it off for an A/B.
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index db75761..4ddc07c 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -507,6 +507,9 @@ public:
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
++    // Set (under m_completedDmacMutex) while m_completedDmacCauses has causes: the EE's every
++    // Store32 drains them (PS2Runtime::drainCompletedDmacHandlers), and takes the lock only then.
++    std::atomic<bool> m_completedDmacPending{false};
+ 
+     struct CodeRegion
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index a46fa04..a890988 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -410,6 +410,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     {
+         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+         m_completedDmacCauses.clear();
++        m_completedDmacPending.store(false, std::memory_order_release);
+     }
+     m_codeRegions.clear();
+     m_path3Masked = false;
+@@ -2140,17 +2141,27 @@ void PS2Memory::processPendingTransfers()
+     }
+ }
+ 
++bool ps2EeFastPaths(unsigned bit) noexcept; // (EeScheduler.cpp: PS2X_EE_FASTPATHS, bit 2)
++
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     m_completedDmacCauses.push_back(cause);
++    m_completedDmacPending.store(true, std::memory_order_release);
+ }
+ 
+ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+ {
++    // (called after every Store32: nothing completed is by far the common case, and needs no lock;
++    // a cause queued on another thread just after this test waits for the next drain, as one
++    // queued just after the swap below always did)
++    static const bool fast = ps2EeFastPaths(2u);
++    if (fast && !m_completedDmacPending.load(std::memory_order_acquire))
++        return {};
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     std::vector<uint32_t> causes;
+     causes.swap(m_completedDmacCauses);
++    m_completedDmacPending.store(false, std::memory_order_release);
+     return causes;
+ }
+ 

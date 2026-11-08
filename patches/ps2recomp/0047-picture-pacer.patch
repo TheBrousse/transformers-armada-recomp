@@ -1,0 +1,104 @@
+Subject: [PATCH] Picture pacer: a provider that hands its pictures over on a schedule of its own
+
+Transformers' native renderer (TODO N9, docs/TODO.md 95) hands each picture over at its frame's moment
+plus a steady delay, so that the pictures reach the screen evenly. The window used to show a provided
+picture only at a VBlank, whichever was newest then: its place among the VBlanks moved with the render
+thread's and the GPU's times (a picture up one VBlank, two or three). With a pacer set
+(ps2_host_display::setPicturePacer) the window waits on the pacer instead of the VBlanks and draws the
+moment one is handed over; -1 from the pacer (no provided picture now: a movie, a screen it does not
+draw) falls back to the VBlanks. The FPS counter then counts the pictures the window shows.
+---
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -109,6 +109,19 @@
+     using PictureProvider = bool (*)(unsigned int &texture, int &width, int &height);
+     void setPictureProvider(PictureProvider provider);
+     PictureProvider pictureProvider();
++    // When the provider's pictures are shown (a game whose renderer paces its own pictures - each
++    // handed over at the moment it is to be on the screen, so that they reach it evenly): `wait`
++    // replaces the window's wait for a VBlank - it returns 1 when a new picture is to be shown now,
++    // 0 when none came by `until`, -1 when the provider has none now (the VBlanks' pictures then, as
++    // without a pacer: a movie, a screen it does not draw). `presented`, if any, is told when the
++    // window has presented the picture. Null (the default): the window shows a picture each VBlank.
++    struct PicturePacer
++    {
++        int (*wait)(std::chrono::steady_clock::time_point until) = nullptr;
++        void (*presented)() = nullptr;
++    };
++    void setPicturePacer(PicturePacer pacer);
++    PicturePacer picturePacer();
+ 
+     // The emulated drawing switched off (a native renderer drawing the frame itself): the GS draws
+     // no primitive, while everything the EE can observe goes on - DMA, VIF1 and VU1 (its programs
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -684,6 +684,26 @@
+ 
+     namespace
+     {
++        std::atomic<int (*)(Clock::time_point)> g_pacerWait{nullptr};
++        std::atomic<void (*)()> g_pacerPresented{nullptr};
++    }
++
++    void setPicturePacer(PicturePacer pacer)
++    {
++        g_pacerPresented.store(pacer.presented, std::memory_order_release);
++        g_pacerWait.store(pacer.wait, std::memory_order_release);
++    }
++
++    PicturePacer picturePacer()
++    {
++        PicturePacer pacer;
++        pacer.wait = g_pacerWait.load(std::memory_order_acquire);
++        pacer.presented = g_pacerPresented.load(std::memory_order_acquire);
++        return pacer;
++    }
++
++    namespace
++    {
+         std::atomic<bool> g_emulatedDrawing{true};
+     }
+ 
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2952,14 +2952,20 @@
+         uint32_t momentFirst = 0u, momentLast = 0u;
+         std::chrono::steady_clock::time_point refreshVBlank{}, shows{};
+         std::chrono::steady_clock::duration refreshPeriod{};
+-        const bool byRefresh = ps2_gpu::viewActive() && ps2_host_display::momentFields(momentFirst, momentLast) &&
++        // A picture provider that paces its own pictures (ps2_host_display::setPicturePacer): shown when it hands
++        // one over, not at the VBlanks.
++        const ps2_host_display::PicturePacer pacer = ps2_host_display::picturePacer();
++        const int paced = pacer.wait ? pacer.wait(std::chrono::steady_clock::now() + kInputPoll) : -1;
++        const bool byRefresh = paced < 0 && ps2_gpu::viewActive() && ps2_host_display::momentFields(momentFirst, momentLast) &&
+                                ps2_host_display::screenTiming(refreshVBlank, refreshPeriod);
+-        ps2_host_display::setPicturesCountedByWindow(byRefresh);
+-        const bool vblankDue = byRefresh ? ps2_host_display::waitForRefresh(std::chrono::steady_clock::now() + kInputPoll, shows)
+-                                         : ps2_host_display::waitForVBlank(std::chrono::steady_clock::now() + kInputPoll, pictureTick);
++        ps2_host_display::setPicturesCountedByWindow(byRefresh || paced >= 0);
++        const bool vblankDue = paced >= 0 ? paced == 1
++                               : byRefresh ? ps2_host_display::waitForRefresh(std::chrono::steady_clock::now() + kInputPoll, shows)
++                                           : ps2_host_display::waitForVBlank(std::chrono::steady_clock::now() + kInputPoll, pictureTick);
+         const auto now = std::chrono::steady_clock::now();
+         // (drawing alone, the GPU publishes no software picture: its own is shown at each VBlank)
+-        const bool newPicture = vblankDue && (byRefresh || UploadFrame(frameTex, presentWidth, presentHeight, pictureTick) || ps2_gpu::viewActive());
++        const bool newPicture = vblankDue && (paced == 1 || byRefresh || UploadFrame(frameTex, presentWidth, presentHeight, pictureTick) ||
++                                              ps2_gpu::viewActive());
+         if (fpsCounter.shown)
+             fpsCounter.update(now);
+         if (newPicture || now - lastDraw >= (ps2_settings::panelOpen() ? kPanelRedraw : kIdleRedraw))
+@@ -3018,7 +3024,13 @@
+                 m_debugUiDrawCallback(*this, m_debugUiUserData);
+             }
+             ps2_host_present::end(); // (raylib's EndDrawing, or the swap chain's present) also reads the input
+-            if (newPicture && byRefresh)
++            if (newPicture && paced == 1)
++            {
++                ps2_host_display::noteShownPicture();
++                if (pacer.presented)
++                    pacer.presented();
++            }
++            else if (newPicture && byRefresh)
+             {
+                 const bool fresh = gpuPicture.showsNs != lastShownNs;
+                 ps2_host_display::noteMomentShown(showsNs, gpuPicture.showsNs, fresh,

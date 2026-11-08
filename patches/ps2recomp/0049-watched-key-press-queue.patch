@@ -1,0 +1,39 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -507,6 +507,19 @@
+         constexpr int kMaxWatchedKeys = 8;
+         std::atomic<int> g_watchedKeys[kMaxWatchedKeys]; // (0: free)
+         std::atomic<int> g_keyPresses[kMaxWatchedKeys];
++
++        // IsKeyPressed only compares final held states, so a press and release
++        // received in the same PollInputEvents are otherwise lost. Raylib queues
++        // each genuine key-down separately (not repeats). ImGui reads held states
++        // and its separate character queue, not this key-code queue.
++        void collectWatchedKeyPresses()
++        {
++            if (!IsWindowReady()) return;
++            for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
++                for (int i = 0; i < kMaxWatchedKeys; ++i)
++                    if (g_watchedKeys[i].load(std::memory_order_relaxed) == key)
++                        g_keyPresses[i].fetch_add(1, std::memory_order_relaxed);
++        }
+     }
+ 
+     void watchKey(int key)
+@@ -529,14 +542,7 @@
+ 
+     void updateFromWindow()
+     {
+-        // The keys a game watches (watchKey).
+-        if (IsWindowReady())
+-            for (int i = 0; i < kMaxWatchedKeys; ++i)
+-            {
+-                const int key = g_watchedKeys[i].load(std::memory_order_relaxed);
+-                if (key != 0 && IsKeyPressed(key))
+-                    g_keyPresses[i].fetch_add(1, std::memory_order_relaxed);
+-            }
++        collectWatchedKeyPresses();
+         const MouseConfig &config = mouseConfig();
+         const bool mappedByGame = g_mouseMappedByGame.load(std::memory_order_relaxed);
+         if (config.test)

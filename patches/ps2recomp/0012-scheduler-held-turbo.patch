@@ -1,0 +1,93 @@
+Subject: [PATCH] fast loads: a held turbo mode and a mute from game code
+
+EeScheduler::setTurboHeld(bool): the turbo mode of PS2X_TURBO_VSYNCS (no waiting for the host
+clock; the pacing clock moves on instead) held on until released, for game code that knows when
+it may run unthrottled: a loading screen, whose timing nothing depends on.
+ps2_audio_stream::setMuted(bool): silence while it does, without touching the player's sound
+setting (PS2X_AUDIO); the dump goes on.
+
+---
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index e2ead23..6f6dd12 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -411,7 +411,12 @@ public:
+     // Clock that host deadlines are paced against: wall time plus the time skipped
+     // while turbo mode runs unthrottled (PS2X_TURBO_VSYNCS=<n>: until VBlank tick n).
+     [[nodiscard]] std::chrono::steady_clock::time_point hostNow() const noexcept;
+-    [[nodiscard]] bool turboActive() const noexcept { return m_vsyncTick < m_turboUntilVSync; }
++    [[nodiscard]] bool turboActive() const noexcept
++    {
++        return m_turboHeld.load(std::memory_order_relaxed) || m_vsyncTick < m_turboUntilVSync;
++    }
++    // Turbo mode held on from game code (any thread) until released: e.g. while the game loads.
++    void setTurboHeld(bool held) noexcept { m_turboHeld.store(held, std::memory_order_relaxed); }
+     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+ 
+     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+@@ -592,6 +597,7 @@ private:
+     std::atomic<int64_t> m_hostClockOffsetNs{0};
+     std::atomic<int64_t> m_idleHostNs{0}; // idleHostTime
+     uint64_t m_turboUntilVSync = 0;
++    std::atomic<bool> m_turboHeld{false};
+ 
+     // The schedule emulated time is held to: the EE cycle and the host time of the latest
+     // VBlank. Everything that waits for the host's clock takes its deadline from here, so
+diff --git a/ps2xRuntime/include/runtime/ps2_audio_stream.h b/ps2xRuntime/include/runtime/ps2_audio_stream.h
+index 952fc12..f319085 100644
+--- a/ps2xRuntime/include/runtime/ps2_audio_stream.h
++++ b/ps2xRuntime/include/runtime/ps2_audio_stream.h
+@@ -25,6 +25,8 @@ namespace ps2_audio_stream
+     // window thread): at once.
+     void setEnabled(bool on);
+     void setVolume(float volume);
++    // Silence from game code while it runs ahead of real time (a fast load); the dump goes on.
++    void setMuted(bool muted);
+ 
+     // Finishes the dump file and stops the device stream.
+     void shutdown();
+diff --git a/ps2xRuntime/src/lib/ps2_audio_stream.cpp b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+index 08bdec0..06c8841 100644
+--- a/ps2xRuntime/src/lib/ps2_audio_stream.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+@@ -35,6 +35,7 @@ namespace
+ 
+         bool configured = false;
+         bool enabled = true;
++        bool muted = false;       // setMuted: the game's own silence (a fast load), whatever enabled says
+         float volume = 1.0f;
+         bool deviceStarted = false;
+ #if !defined(PLATFORM_VITA)
+@@ -214,7 +215,7 @@ namespace ps2_audio_stream
+                     s.dumpHeaderFrames = s.dumpFrames;
+                 }
+             }
+-            if (!s.enabled)
++            if (!s.enabled || s.muted)
+                 return;
+             for (size_t i = 0; i < frames; ++i)
+             {
+@@ -276,6 +277,23 @@ namespace ps2_audio_stream
+ #endif
+     }
+ 
++    void setMuted(bool muted)
++    {
++        Stream &s = stream();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!s.configured)
++            configure(s);
++        if (s.muted == muted)
++            return;
++        s.muted = muted;
++        if (muted)
++        {
++            s.count = 0u; // (the device fades out what it played last, then waits for a new fill)
++            s.playing = false;
++            s.averageFill = static_cast<double>(kTargetFill);
++        }
++    }
++
+     void setVolume(float volume)
+     {
+         Stream &s = stream();

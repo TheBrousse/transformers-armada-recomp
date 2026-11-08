@@ -1,0 +1,108 @@
+Subject: [PATCH] added guest code: functions the game never had
+
+PS2Runtime::kAddedCodeBegin/End (0x01F40000-0x01F48000, RAM above the heap that no game uses): a
+function table of its own beside the generated one. registerFunction there puts a C++ function at a
+guest address the game can call like its own code (through a vtable or a pointer), for a game's C++
+mods: new classes, new abilities. One lookup (functionEntry) serves replaceFunction, hasFunction,
+lookupFunction and the dispatcher.
+
+---
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index e3e9c13..c761e87 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -335,6 +335,11 @@ public:
+     };
+ 
+     bool replaceFunction(uint32_t address, RecompiledFunction func);
++    // Guest code the game never had: [kAddedCodeBegin, kAddedCodeEnd) of RAM is code of the port's own
++    // (a game's C++ mods), reached like the game's: registerFunction there, then call it from a guest
++    // vtable or pointer as any function. Nothing is executed or stored at those addresses.
++    static constexpr uint32_t kAddedCodeBegin = 0x01F40000u;
++    static constexpr uint32_t kAddedCodeEnd = 0x01F48000u;
+     // TODO remove this later need to update all tests
+     bool registerFunction(uint32_t address, RecompiledFunction func);
+     RecompiledFunction lookupFunction(uint32_t address);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index faa73fd..23be41c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1413,12 +1413,27 @@ namespace
+         slot = offset >> 2;
+         return slot < g_ps2RecompiledFunctionTableSlotCount;
+     }
++
++    // The added code's functions (PS2Runtime::kAddedCodeBegin): a table of their own beside the
++    // generated one.
++    PS2Runtime::RecompiledFunction g_addedFunctions[(PS2Runtime::kAddedCodeEnd - PS2Runtime::kAddedCodeBegin) / 4u] = {};
++
++    // The table entry of a guest address (generated code or added code), or nullptr.
++    PS2Runtime::RecompiledFunction *functionEntry(uint32_t address)
++    {
++        uint32_t slot = 0u;
++        if (generatedFunctionTableSlot(address, slot))
++            return &g_ps2RecompiledFunctionTable[slot];
++        if ((address & 3u) == 0u && address >= PS2Runtime::kAddedCodeBegin && address < PS2Runtime::kAddedCodeEnd)
++            return &g_addedFunctions[(address - PS2Runtime::kAddedCodeBegin) / 4u];
++        return nullptr;
++    }
+ }
+ 
+ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+ {
+-    uint32_t slot = 0u;
+-    if (!generatedFunctionTableSlot(address, slot))
++    RecompiledFunction *entry = functionEntry(address);
++    if (!entry)
+     {
+         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
+                   << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
+@@ -1427,7 +1442,7 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+         return false;
+     }
+ 
+-    g_ps2RecompiledFunctionTable[slot] = func;
++    *entry = func;
+     return true;
+ }
+ 
+@@ -1438,8 +1453,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+ 
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+-    uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    const RecompiledFunction *entry = functionEntry(address);
++    return entry && *entry != nullptr;
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1465,14 +1480,9 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+ 
+-    uint32_t slot = 0u;
+-    if (generatedFunctionTableSlot(address, slot))
++    if (RecompiledFunction *entry = functionEntry(address); entry && *entry != nullptr)
+     {
+-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+-        if (fn != nullptr)
+-        {
+-            return fn;
+-        }
++        return *entry;
+     }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+@@ -1699,9 +1709,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    uint32_t slot = 0u;
+-    const RecompiledFunction targetFn =
+-        generatedFunctionTableSlot(targetPc, slot) ? g_ps2RecompiledFunctionTable[slot] : nullptr;
++    const RecompiledFunction *targetEntry = functionEntry(targetPc);
++    const RecompiledFunction targetFn = targetEntry ? *targetEntry : nullptr;
+     if (!targetFn)
+     {
+         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);

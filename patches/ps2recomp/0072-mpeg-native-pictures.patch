@@ -1,0 +1,240 @@
+Subject: [PATCH] MPEG: decoded pictures handed to the host, accurate colour, host costs
+
+sceMpegGetPicture hands each picture it serves (RGBA, its index, PTS, VBlank tick, the game's buffer)
+to a sink the game port may set (runtime/ps2_mpeg_native.h); when the sink draws it itself the
+PS2-layout copy into the game's buffer is left out. sceMpegDelete tells the sink. An accurate
+YUV -> RGB conversion (the chroma interpolated to every pixel across) can be chosen; the host
+time of decoding, conversion and copies is counted. Nothing changes with no sink set.
+(Transformers roadmap N6: native movies.)
+diff --git a/ps2xRuntime/include/runtime/ps2_mpeg_native.h b/ps2xRuntime/include/runtime/ps2_mpeg_native.h
+new file mode 100644
+index 0000000..dbc7c4b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_mpeg_native.h
+@@ -0,0 +1,41 @@
++#pragma once
++// Movie pictures handed to the host (Kernel/Stubs/MPEG.cpp): the libmpeg HLE decodes each picture with FFmpeg; a game
++// port with a renderer of its own can take the picture as it is served to the game (sceMpegGetPicture) and draw it
++// itself, instead of reading the PS2-layout copy the HLE writes into the game's buffer.
++
++#include <cstdint>
++
++namespace ps2_stubs
++{
++    struct MpegNativePicture
++    {
++        uint32_t mpegAddr = 0;       // the sceMpeg object
++        uint32_t imageAddr = 0;      // the game's buffer the picture was asked into (sceMpegGetPicture's a1)
++        uint32_t width = 0;          // the picture's size
++        uint32_t height = 0;
++        uint32_t index = 0;          // its number in the stream since the decoder was made (0, 1, 2 ...)
++        int64_t pts90k = -1;         // its presentation time (90 kHz), -1 when the stream gives none
++        uint64_t vsyncTick = 0;      // the VBlank tick it was served at
++        const uint8_t *rgba = nullptr; // width x height RGBA, R first, alpha 255; nullptr: the decoder was deleted
++    };
++
++    // Called on the EE thread for every picture served (and with rgba nullptr when a decoder is deleted). Returns
++    // true when the host draws the picture itself and the game's buffer need not get the PS2-layout copy (the
++    // copy is written when it returns false, or when no sink is set - as before).
++    using MpegNativePictureSink = bool (*)(const MpegNativePicture &picture);
++    void setMpegNativePictureSink(MpegNativePictureSink sink);
++
++    // The YUV -> RGB conversion of the decoded pictures: false (default) = as before (swscale's fast path: one chroma
++    // value for each pair of pixels across), true = accurate (the chroma interpolated to every pixel across).
++    void setMpegAccurateColour(bool accurate);
++
++    // The host time spent on movie pictures since the last call (for the port's logs): decoding (FFmpeg's parser
++    // and decoder, the YUV -> RGB conversion included), the conversion alone, and the PS2-layout copies into the
++    // game's buffers; and the pictures served and copied.
++    struct MpegHostCosts
++    {
++        double decodeMs = 0.0, convertMs = 0.0, guestCopyMs = 0.0;
++        uint32_t picturesServed = 0, guestCopies = 0;
++    };
++    MpegHostCosts takeMpegHostCosts();
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index cb96b09..8a1af3a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_mpeg_native.h"
+ #include "SaveState.h"
+ 
+ #if !defined(PS2X_HAS_FFMPEG)
+@@ -18,6 +19,7 @@ extern "C"
+ #endif
+ 
+ #include <atomic>
++#include <chrono>
+ #include <deque>
+ #include <memory>
+ 
+@@ -51,6 +53,16 @@ namespace ps2_stubs
+ {
+     namespace
+     {
++        // (ps2_mpeg_native.h) The accurate YUV -> RGB conversion, and the host time spent on pictures (ns).
++        std::atomic<bool> g_mpegAccurateColour{false};
++        std::atomic<uint64_t> g_mpegDecodeNs{0}, g_mpegConvertNs{0}, g_mpegGuestCopyNs{0};
++        std::atomic<uint32_t> g_mpegPicturesServed{0}, g_mpegGuestCopies{0};
++
++        uint64_t mpegNsSince(std::chrono::steady_clock::time_point start)
++        {
++            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++        }
++
+         struct MpegDecodedFrame
+         {
+             int width = 0;
+@@ -103,6 +115,11 @@ namespace ps2_stubs
+                 {
+                     return true;
+                 }
++                struct FeedTimer // (the decoding's host time, ps2_mpeg_native.h)
++                {
++                    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++                    ~FeedTimer() { g_mpegDecodeNs.fetch_add(mpegNsSince(start), std::memory_order_relaxed); }
++                } feedTimer;
+ 
+                 if (!ensureInitialized())
+                 {
+@@ -398,10 +415,17 @@ namespace ps2_stubs
+                     return false;
+                 }
+ 
++                // (ps2_mpeg_native.h: the accurate conversion - the chroma interpolated to every pixel across, not
++                // one value for each pair; ~0.05 ms a 640 x 384 picture more. Bicubic and SWS_ACCURATE_RND were
++                // measured too: 1-3 ms a picture more, for a rounding step - not used.)
++                const int swsFlags = g_mpegAccurateColour.load(std::memory_order_relaxed)
++                                         ? (SWS_BILINEAR | SWS_FULL_CHR_H_INT)
++                                         : SWS_BILINEAR;
+                 if (!m_swsCtx ||
+                     m_swsWidth != width ||
+                     m_swsHeight != height ||
+-                    m_swsFormat != srcFormat)
++                    m_swsFormat != srcFormat ||
++                    m_swsFlags != swsFlags)
+                 {
+                     if (m_swsCtx)
+                     {
+@@ -415,7 +439,7 @@ namespace ps2_stubs
+                         width,
+                         height,
+                         AV_PIX_FMT_RGBA,
+-                        SWS_BILINEAR,
++                        swsFlags,
+                         nullptr,
+                         nullptr,
+                         nullptr);
+@@ -427,6 +451,7 @@ namespace ps2_stubs
+                     m_swsWidth = width;
+                     m_swsHeight = height;
+                     m_swsFormat = srcFormat;
++                    m_swsFlags = swsFlags;
+                 }
+ 
+                 MpegDecodedFrame decoded;
+@@ -440,6 +465,7 @@ namespace ps2_stubs
+ 
+                 uint8_t *dstData[4] = {decoded.rgba.data(), nullptr, nullptr, nullptr};
+                 int dstLinesize[4] = {width * 4, 0, 0, 0};
++                const auto convertStart = std::chrono::steady_clock::now();
+                 const int scaledRows = sws_scale(
+                     m_swsCtx,
+                     m_frame->data,
+@@ -448,6 +474,7 @@ namespace ps2_stubs
+                     height,
+                     dstData,
+                     dstLinesize);
++                g_mpegConvertNs.fetch_add(mpegNsSince(convertStart), std::memory_order_relaxed);
+                 if (scaledRows <= 0)
+                 {
+                     std::cerr << "[MPEG] FFmpeg scaler produced no rows." << std::endl;
+@@ -466,6 +493,7 @@ namespace ps2_stubs
+             int m_swsWidth = 0;
+             int m_swsHeight = 0;
+             AVPixelFormat m_swsFormat = AV_PIX_FMT_NONE;
++            int m_swsFlags = 0;
+             bool m_initialized = false;
+             bool m_drained = false;
+         };
+@@ -2214,6 +2242,28 @@ namespace ps2_stubs
+     namespace
+     {
+         std::atomic<bool> g_mpegPictureNeverBlocks{false};
++        std::atomic<MpegNativePictureSink> g_mpegNativeSink{nullptr}; // (ps2_mpeg_native.h)
++    }
++
++    void setMpegNativePictureSink(MpegNativePictureSink sink)
++    {
++        g_mpegNativeSink.store(sink, std::memory_order_relaxed);
++    }
++
++    void setMpegAccurateColour(bool accurate)
++    {
++        g_mpegAccurateColour.store(accurate, std::memory_order_relaxed);
++    }
++
++    MpegHostCosts takeMpegHostCosts()
++    {
++        MpegHostCosts c;
++        c.decodeMs = static_cast<double>(g_mpegDecodeNs.exchange(0u, std::memory_order_relaxed)) / 1e6;
++        c.convertMs = static_cast<double>(g_mpegConvertNs.exchange(0u, std::memory_order_relaxed)) / 1e6;
++        c.guestCopyMs = static_cast<double>(g_mpegGuestCopyNs.exchange(0u, std::memory_order_relaxed)) / 1e6;
++        c.picturesServed = g_mpegPicturesServed.exchange(0u, std::memory_order_relaxed);
++        c.guestCopies = g_mpegGuestCopies.exchange(0u, std::memory_order_relaxed);
++        return c;
+     }
+ 
+     void setMpegPictureNeverBlocks(bool enabled)
+@@ -2530,6 +2580,12 @@ namespace ps2_stubs
+             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
+             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+         }
++        if (const MpegNativePictureSink sink = g_mpegNativeSink.load(std::memory_order_relaxed))
++        {
++            MpegNativePicture gone; // (rgba nullptr: the decoder is deleted - its pictures are no longer drawn)
++            gone.mpegAddr = mpegAddr;
++            (void)sink(gone);
++        }
+         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
+         setReturnU32(ctx, 0u);
+     }
+@@ -2921,7 +2977,32 @@ namespace ps2_stubs
+ 
+         if (haveFrame)
+         {
+-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
++            // (ps2_mpeg_native.h) The picture to the host's renderer as it is served; the PS2-layout copy into the
++            // game's buffer only when the host still needs it (its renderer does not draw this one, or the emulated
++            // GS draws).
++            bool guestCopy = true;
++            if (const MpegNativePictureSink sink = g_mpegNativeSink.load(std::memory_order_relaxed))
++            {
++                MpegNativePicture picture;
++                picture.mpegAddr = mpegAddr;
++                picture.imageAddr = imageAddr;
++                picture.width = width;
++                picture.height = height;
++                picture.index = frameCount;
++                picture.pts90k = frame.pts90k;
++                picture.vsyncTick = runtime ? runtime->eeScheduler().currentVSyncTick() : 0u;
++                picture.rgba = frame.rgba.size() >= static_cast<size_t>(width) * height * 4u ? frame.rgba.data() : nullptr;
++                if (picture.rgba)
++                    guestCopy = !sink(picture);
++            }
++            g_mpegPicturesServed.fetch_add(1u, std::memory_order_relaxed);
++            if (guestCopy)
++            {
++                const auto copyStart = std::chrono::steady_clock::now();
++                writeDecodedFrameToGuest(rdram, imageAddr, frame);
++                g_mpegGuestCopyNs.fetch_add(mpegNsSince(copyStart), std::memory_order_relaxed);
++                g_mpegGuestCopies.fetch_add(1u, std::memory_order_relaxed);
++            }
+             if (g_mpegGuestBuffersStream.load(std::memory_order_relaxed) && runtime)
+             {
+                 // Decoding a picture takes the console a good part of a frame; here it

@@ -1,0 +1,32 @@
+Subject: [PATCH] Runtime: a stub's guest write in one copy when the range is one piece of host memory
+
+writeGuestBytes (the stubs' helper) looked every byte up on its own: sceVu0UnitMatrix's 64 bytes, called from the
+game's matrix set-up many times a frame, cost ~0.8% of Deep Amazon's game thread. When the first and the last byte
+are one piece of host memory (main RAM, the scratchpad) the range is copied at once; the same bytes are written.
+
+ps2xRuntime:
+- Stubs/Helpers/Support.h: writeGuestBytes, the contiguous case first.
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -676,6 +676,19 @@
+             return true;
+         }
+ 
++        // The whole range at once when its first and last bytes are one piece of host memory (main RAM, the
++        // scratchpad): the byte-by-byte lookups below cost sceVu0UnitMatrix's 64 bytes ~0.8% of a busy game thread.
++        if (len - 1u <= 0xFFFFFFFFull - addr)
++        {
++            uint8_t *first = getMemPtr(rdram, addr);
++            uint8_t *last = getMemPtr(rdram, static_cast<uint32_t>(addr + (len - 1u)));
++            if (first && last && last - first == static_cast<std::ptrdiff_t>(len - 1u))
++            {
++                std::memcpy(first, src, len);
++                return true;
++            }
++        }
++
+         bool allViaPtrs = true;
+         for (size_t i = 0; i < len; ++i)
+         {

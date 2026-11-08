@@ -1,0 +1,47 @@
+Subject: [PATCH] VIF1: V4-5 unpacks widened to 8 bits per channel
+
+The 5:5:5:1 fields are shifted up as the hardware does (5-bit fields << 3, the alpha bit << 7),
+not left as raw 5- and 1-bit values. Transformers' forest billboards (sprites with V4-5 colours
+and an alpha test GEQUAL 0x40) reached the GS with alpha 1 and were never drawn.
+---
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 910fe66..44060d7 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -477,12 +477,13 @@ namespace
+             unpackVectors(dest, destStep, src, 4u, count, lanes, mode, row, [&](const uint8_t *s, __m128i)
+                           { return extend8(_mm_cvtsi32_si128(static_cast<int>(loadBytes(s, 4u)))); });
+             return true;
+-        case 15: // V4-5: 5:5:5:1 in a word; ROW is not added to it
++        case 15: // V4-5: 5:5:5:1 in a word, each widened to 8 bits as the hardware does (the 5-bit
++                 // fields shifted up 3, the 1-bit one up 7); ROW is not added to it
+             unpackVectors(dest, destStep, src, 2u, count, lanes, 0u, row, [](const uint8_t *s, __m128i)
+                           {
+                               const uint32_t packed = loadBytes(s, 2u);
+-                              return _mm_setr_epi32(static_cast<int>(packed & 0x1Fu), static_cast<int>((packed >> 5) & 0x1Fu),
+-                                                    static_cast<int>((packed >> 10) & 0x1Fu), static_cast<int>((packed >> 15) & 0x01u)); });
++                              return _mm_setr_epi32(static_cast<int>((packed & 0x1Fu) << 3), static_cast<int>(((packed >> 5) & 0x1Fu) << 3),
++                                                    static_cast<int>(((packed >> 10) & 0x1Fu) << 3), static_cast<int>(((packed >> 15) & 0x01u) << 7)); });
+             return true;
+         default:
+             return false;
+@@ -967,13 +968,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5: packed 5:5:5:1 colour in a single 16-bit value, each field widened to
++                        // 8 bits as the hardware does (5-bit fields << 3, the 1-bit one << 7).
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        decompressed[0] = (packed & 0x1Fu) << 3;
++                        decompressed[1] = ((packed >> 5) & 0x1Fu) << 3;
++                        decompressed[2] = ((packed >> 10) & 0x1Fu) << 3;
++                        decompressed[3] = ((packed >> 15) & 0x01u) << 7;
+                     }
+                     else
+                     {

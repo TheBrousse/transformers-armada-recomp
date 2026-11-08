@@ -1,0 +1,483 @@
+Subject: [PATCH] GPU renderer: keyboard prompts, frame-mode pictures in
+ full, points as dots
+
+A texture pack's keyboard/ folder replaces textures while the keyboard
+is the device in use (ps2_host_input::keyboardPromptsShown), switching
+from one picture to the next.
+
+An interlaced frame-mode display (224-row buffers for 448 lines) keeps
+the buffers it shows at twice the scale down and shows each row as the
+two lines it becomes, so the picture has every line of its own instead
+of half as many (PS2X_GPU_FRAME_LINES=0: as before); textures drawn into
+those buffers are smoothed.
+
+Points added to the frame (Cs x C + Cd) are drawn as soft dots at their
+exact place, their weights summing to one pixel's light, instead of a
+block of the scale's size (PS2X_GPU_ROUND_POINTS=0: blocks).
+---
+ ps2xRuntime/src/lib/gs/gs_gpu.cpp          | 118 ++++++++++++++++++---
+ ps2xRuntime/src/lib/gs/gs_gpu_shaders.h    |  38 +++++--
+ ps2xRuntime/src/lib/gs/gs_texture_pack.cpp |  34 ++++--
+ ps2xRuntime/src/lib/gs/gs_texture_pack.h   |  11 +-
+ 4 files changed, 169 insertions(+), 32 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index faa0f9c..87f41b4 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_gpu.h"
+ 
+ #include "runtime/ps2_host_display.h"
++#include "runtime/ps2_host_input.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/gs_native_mesh.h"
+@@ -673,10 +674,23 @@ struct GSGpuRenderer::Impl
+     // GL rows as the picture it becomes: the field copies read it at its own scale, and each
+     // picture is drawn at the screen's full resolution instead of every second line made up.
+     bool fullFields = false;
++    // PS2X_GPU_FRAME_LINES (on by default): the buffers an interlaced frame-mode display shows (the
++    // SDK's double buffers of 224 rows for 448 lines - in Transformers the warp gate's loading
++    // screen alone) kept at twice the scale down too, so that their 224 rows give every line of the
++    // picture its own (the user, 2026-10-23: "way too pixelated, the PS2's resolution"). Set from
++    // the pictures shown (presentPicture), cleared at the first picture of another mode.
++    bool frameLinesFull = true;
++    bool roundPoints = true;      // PS2X_GPU_ROUND_POINTS (prepareDraw)
++    bool roundPointsDraw = false; // (the draw's points as dots: appendPrimitives)
++    std::array<uint32_t, 4> frameLinesBlocks{~0u, ~0u, ~0u, ~0u}; // (the screen shows three: two circuits, double buffers)
++    bool frameLinesBuffer(uint32_t bp) const { return std::find(frameLinesBlocks.begin(), frameLinesBlocks.end(), bp) != frameLinesBlocks.end(); }
+     int frameScaleY(uint32_t bp, uint32_t bw, Kind kind) const
+     {
+         uint32_t block = 0u;
+-        if (fullFields && bw >= 8u && (kind == kC32 || kind == kC16 || kind == kC16S) && ps2_host_display::fieldsBuffer(block) && bp == block)
++        const bool colour = kind == kC32 || kind == kC16 || kind == kC16S;
++        if (fullFields && bw >= 8u && colour && ps2_host_display::fieldsBuffer(block) && bp == block)
++            return 2 * scaleY;
++        if (frameLinesFull && bw >= 8u && colour && frameLinesBuffer(bp))
+             return 2 * scaleY;
+         return scaleY;
+     }
+@@ -985,9 +999,11 @@ struct GSGpuRenderer::Impl
+     {
+         bool valid = false;
+         uint64_t writeClock = 0u, clutVersion = 0u, flushSerial = 0u;
+-        uint32_t key[12] = {};
++        uint32_t key[13] = {};
+         uint32_t slot = 0u;
+     } replacementMemo;
++    // The texture pack's keyboard/ replacements in use (ps2_host_input::keyboardPromptsShown).
++    bool packKeyboard() const { return packOpen && pack.keyboardSize() != 0u && ps2_host_input::keyboardPromptsShown(); }
+     uint32_t replacementSlotUncached(const GSTex0Reg &tex0, const GSTexaReg &texa, uint8_t wrapU, uint8_t wrapV, bool linear, bool decode);
+     std::array<GLuint, 8> packSamplers{};       // by wrap U, wrap V (repeat / clamp) and filtering
+     std::array<GLuint, 8> decodedSamplers{};    // ... the cache's: one sample, as the GS takes (no anisotropy)
+@@ -1424,6 +1440,8 @@ bool GSGpuRenderer::Impl::init()
+     // (on by default since 2026-10-08, the user's OK after playing with it; =0: each field at half the
+     // scale down, as the emulated path's exact pictures - check_frames.ps1 - are made)
+     fullFields = envFlag("PS2X_GPU_FULL_FIELDS", true);
++    frameLinesFull = envFlag("PS2X_GPU_FRAME_LINES", true);
++    roundPoints = envFlag("PS2X_GPU_ROUND_POINTS", true);
+     if (fullFields)
+         std::fprintf(stderr, "[gpu] full fields on (PS2X_GPU_FULL_FIELDS): the buffer of both fields kept at twice the scale down\n");
+ 
+@@ -1737,7 +1755,7 @@ bool GSGpuRenderer::Impl::init()
+         textureCache = nativeEnabled && envFlag("PS2X_GPU_TEXTURE_CACHE", true); // (on by default since 2026-10-08)
+         replacements = packOpen || textureCache || !textureDump.empty(); // (the dump looks at every texture too)
+         if (packOpen)
+-            std::fprintf(stderr, "[gpu] texture pack: %zu replacement textures\n", pack.size());
++            std::fprintf(stderr, "[gpu] texture pack: %zu replacement textures (%zu for the keyboard)\n", pack.size(), pack.keyboardSize());
+         if (textureCache)
+             std::fprintf(stderr, "[gpu] texture cache on (PS2X_GPU_TEXTURE_CACHE): textures from local memory decoded once, for the native path\n");
+         if (replacements)
+@@ -2959,9 +2977,10 @@ void GSGpuRenderer::Impl::paletteColours(const GSTex0Reg &tex0, const GSTexaReg
+ uint32_t GSGpuRenderer::Impl::replacementSlot(const GSTex0Reg &tex0, const GSTexaReg &texa, uint8_t wrapU, uint8_t wrapV, bool linear,
+                                               bool decode)
+ {
+-    const uint32_t key[12] = {tex0.tbp0, tex0.tbw, tex0.psm, tex0.tw, tex0.th, tex0.cpsm | (static_cast<uint32_t>(tex0.csm) << 8u), tex0.csa,
++    const uint32_t key[13] = {tex0.tbp0, tex0.tbw, tex0.psm, tex0.tw, tex0.th, tex0.cpsm | (static_cast<uint32_t>(tex0.csm) << 8u), tex0.csa,
+                               texa.ta0, texa.ta1, texa.aem ? 1u : 0u, static_cast<uint32_t>(wrapU) | (static_cast<uint32_t>(wrapV) << 8u),
+-                              (linear ? 1u : 0u) | (decode ? 2u : 0u)};
++                              (linear ? 1u : 0u) | (decode ? 2u : 0u),
++                              packKeyboard() ? 1u : 0u}; // (the device switched: the prompts' other replacement)
+     ReplacementMemo &memo = replacementMemo;
+     if (replacementMemoMode == 0)
+         return replacementSlotUncached(tex0, texa, wrapU, wrapV, linear, decode);
+@@ -3045,7 +3064,7 @@ uint32_t GSGpuRenderer::Impl::replacementSlotUncached(const GSTex0Reg &tex0, con
+         clutHash = c.hash;
+     }
+ 
+-    gs_texture_pack::Texture *texture = packOpen ? pack.find({cached.hash, clutHash, bits}) : nullptr;
++    gs_texture_pack::Texture *texture = packOpen ? pack.find({cached.hash, clutHash, bits}, packKeyboard()) : nullptr;
+     if (packLog)
+     {
+         const uint64_t logKey = cached.hash ^ (clutHash * 0x9E3779B97F4A7C15ull) ^ bits;
+@@ -3488,6 +3507,7 @@ void GSGpuRenderer::Impl::prepareDraw()
+     {
+         const GSTex0Reg &tex0 = ctx.tex0;
+         const Kind texKind = kindOf(tex0.psm);
++        bool memorySmooth = false; // (a texture of local memory smoothed though the GS would not)
+         const int texW = state.textureWidth;
+         const int texH = state.textureHeight;
+         const uint64_t clamp = ctx.clamp;
+@@ -3641,8 +3661,12 @@ void GSGpuRenderer::Impl::prepareDraw()
+             // without one does the GPU read the texture from its own copy, which is brought up
+             // to date first (ending the batch when the game wrote those pages since).
+             const bool decode = textureCache && drawnNatively;
++            // (the warp gate's loading screen - drawn into the frame-mode buffers - magnifies its
++            // star textures with the nearest texel: at the PC's scales each texel a block. Smoothed
++            // there; PS2X_GPU_FRAME_LINES=0 as the console)
++            memorySmooth = frameLinesFull && frame && frameLinesBuffer(frame->bp);
+             if ((packOpen || decode) && wrapU <= 1u && wrapV <= 1u)
+-                slot = replacementSlot(tex0, state.texa, wrapU, wrapV, state.linearFilter, decode);
++                slot = replacementSlot(tex0, state.texa, wrapU, wrapV, state.linearFilter || memorySmooth, decode);
+             if (slot == 0u)
+                 memoryTexture(tex0.tbp0, tbw, texKind, std::min(decodeExtent(texW, wrapU, minU, maxU), kMaxCoord),
+                               std::min(decodeExtent(texH, wrapV, minV, maxV), kMaxCoord));
+@@ -3669,7 +3693,7 @@ void GSGpuRenderer::Impl::prepareDraw()
+         d.tex0[0] = static_cast<uint32_t>(texMode);
+         d.tex0[1] = slot;
+         d.tex0[2] = tex0.psm;
+-        d.tex0[3] = state.linearFilter ? 1u : 0u;
++        d.tex0[3] = state.linearFilter || memorySmooth ? 1u : 0u;
+         d.tex1[0] = tex0.tbp0;
+         d.tex1[1] = tbw;
+         d.tex1[2] = static_cast<uint32_t>(texW);
+@@ -3733,6 +3757,15 @@ void GSGpuRenderer::Impl::prepareDraw()
+     d.scissor[3] = sy1;
+     d.misc[0] = (primKind == kTriangles && state.prim.iip) ? 1u : 0u;
+     d.misc[1] = primKind == kTriangles ? 0u : 1u;
++    // Points drawn adding to the frame (Cs x C + Cd: the warp gate's loading screen's 100,000 stars
++    // a frame) as round dots: at the PC's scales a GS pixel is a block of them, so a star was a
++    // square (the user, 2026-10-23: "way too pixelated"). Each fragment's colour weighted by a
++    // disc over the pixel whose mean is 1 - the same light, a dot instead of a square (2: the
++    // shaders' flag). PS2X_GPU_ROUND_POINTS=0: squares, as the console's one pixel scaled.
++    roundPointsDraw = primKind == kPoints && roundPoints && (scaleX > 1 || scaleY > 1) && !state.prim.tme && d.blend[0] != 0u &&
++                      (d.blend[1] & 3u) == 0u && ((d.blend[1] >> 2) & 3u) == 2u && ((d.blend[1] >> 6) & 3u) == 1u;
++    if (roundPointsDraw)
++        d.misc[1] = 2u;
+ 
+     ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+     ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+@@ -4043,6 +4076,32 @@ void GSGpuRenderer::Impl::appendPrimitives(const GSVertex *in, uint32_t count, u
+         for (uint32_t p = 0; p < count; ++p)
+         {
+             const GSVertex &v = in[static_cast<size_t>(p) * each];
++            if (roundPointsDraw)
++            {
++                // (a soft dot at its exact place: the pixel int(x) holds it, the pixel p's centre at p - so
++                // x - 0.5 - over the 3 x 3 pixels around; the centre to the shaders in S, T)
++                const float cx = static_cast<float>(v.x) - static_cast<float>(ofxPixels) - 0.5f;
++                const float cy = static_cast<float>(v.y) - static_cast<float>(ofyPixels) - 0.5f;
++                GpuVertex q{};
++                q.z = rawZ(v.z);
++                q.r = v.r;
++                q.g = v.g;
++                q.b = v.b;
++                q.a = v.a;
++                q.s = cx;
++                q.t = cy;
++                q.q = 1.0f;
++                q.packed = drawIndex | (static_cast<uint32_t>(v.fog) << 24u);
++                const float x0 = cx - 1.5f, y0 = cy - 1.5f, x1 = cx + 1.5f, y1 = cy + 1.5f;
++                const float corners[6][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
++                for (const auto &corner : corners)
++                {
++                    q.x = corner[0];
++                    q.y = corner[1];
++                    vertices.push_back(q);
++                }
++                continue;
++            }
+             pushQuad(static_cast<int>(v.x) - ofxPixels, static_cast<int>(v.y) - ofyPixels, rawZ(v.z), v.r, v.g, v.b, v.a, v.fog);
+         }
+         break;
+@@ -4857,7 +4916,7 @@ bool GSGpuRenderer::Impl::carryFrom(const MomentSegment &a, const MomentSegment
+     mix(d.tex0[0] | (d.tex0[2] << 4u) | (static_cast<uint64_t>(d.tex1[2]) << 16u) | (static_cast<uint64_t>(d.tex1[3]) << 40u));
+     mix(d.blend[0] | (d.blend[1] << 1u) | (static_cast<uint64_t>(d.blend[2]) << 9u) | (static_cast<uint64_t>(d.test[0]) << 17u) |
+         (static_cast<uint64_t>(d.test[1]) << 18u) | (static_cast<uint64_t>(d.test[2] & 0xFFu) << 21u) | (static_cast<uint64_t>(d.depth[0]) << 29u) |
+-        (static_cast<uint64_t>(d.depth[1]) << 31u) | (static_cast<uint64_t>(d.misc[1]) << 32u) | (static_cast<uint64_t>(d.fog[0]) << 33u));
++        (static_cast<uint64_t>(d.depth[1]) << 31u) | (static_cast<uint64_t>(std::min(d.misc[1], 1u)) << 32u) | (static_cast<uint64_t>(d.fog[0]) << 33u));
+     mix(d.frame[1] | (static_cast<uint64_t>(a.count) << 32u));
+     key |= key == 0u ? 1u : 0u;
+     const bool kept = carryKind(key, false);
+@@ -5562,6 +5621,7 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+         bool valid = false;
+         uint32_t fbp = 0, fbw = 0, x = 0, y = 0, width = 0, height = 0, dy = 0;
+         uint8_t psm = 0;
++        bool halfRows = false; // (frame mode, its buffer at twice the scale down: a row makes two lines)
+     };
+     const auto decode = [&](uint64_t dispfb, uint64_t display, bool enabled)
+     {
+@@ -5584,8 +5644,19 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+         c.dy = bits(display, 12, 0x7FF);
+         if (frameLines)
+         {
+-            c.height = (c.height + 1u) / 2u;
+-            c.dy /= 2u;
++            // (its buffer kept at twice the scale down - frameScaleY - shows its rows as the lines
++            // they become: the picture its full height, each line its own GL rows)
++            const Kind k = kindOf(c.psm);
++            const Target *ft = frameLinesFull && (k == kC32 || k == kC16 || k == kC16S)
++                                   ? findTarget(GSInternal::framePageBaseToBlock(c.fbp), std::max<uint32_t>(c.fbw, 1u), k)
++                                   : nullptr;
++            if (ft && ft->sy == 2 * scaleY)
++                c.halfRows = true;
++            else
++            {
++                c.height = (c.height + 1u) / 2u;
++                c.dy /= 2u;
++            }
+         }
+         c.valid = enabled && (c.fbw != 0u || dw != 0u || dh != 0u || magh != 0u);
+         return c;
+@@ -5594,6 +5665,26 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+     const Circuit c2 = decode(request.dispfb2, request.display2, en2);
+     if (!c1.valid && !c2.valid)
+         return;
++    // (the frame-mode buffers - the last two shown, the double buffers - for frameScaleY)
++    if (frameLinesFull)
++    {
++        if (frameLines)
++        {
++            for (const Circuit *c : {&c1, &c2})
++            {
++                if (!c->valid)
++                    continue;
++                const uint32_t block = GSInternal::framePageBaseToBlock(c->fbp);
++                if (!frameLinesBuffer(block))
++                {
++                    std::copy_backward(frameLinesBlocks.begin(), frameLinesBlocks.end() - 1, frameLinesBlocks.end());
++                    frameLinesBlocks[0] = block;
++                }
++            }
++        }
++        else
++            frameLinesBlocks.fill(~0u);
++    }
+ 
+     const bool both = c1.valid && c2.valid;
+     const bool show1 = c1.valid && !(both && mmod && alp == 0u);
+@@ -5680,7 +5771,7 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+         Target *t = (kind == kC32 || kind == kC16 || kind == kC16S) ? findTarget(bp, bw, kind) : nullptr;
+         if (t)
+         {
+-            t = target(bp, bw, kind, static_cast<int>(c.y + c.height));
++            t = target(bp, bw, kind, static_cast<int>(c.y + (c.halfRows ? (c.height + 1u) / 2u : c.height)));
+             ensureLoaded(*t);
+             msaaResolve(*t, 6);
+             s.texture = t->tex;
+@@ -5763,7 +5854,8 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+              static_cast<int>((request.bgcolor >> 16u) & 0xFFu), 0);
+         set4("uSource1", s1.params[0], s1.params[1], s1.params[2], s1.params[3]);
+         set4("uSource2", s2.params[0], s2.params[1], s2.params[2], s2.params[3]);
+-        set4("uScales", s1.scale ? s1.scale : packedScale(), s2.scale ? s2.scale : packedScale(), 0, 0);
++        set4("uScales", s1.scale ? s1.scale : packedScale(), s2.scale ? s2.scale : packedScale(), c1.halfRows && s1.scale ? 1 : 0,
++             c2.halfRows && s2.scale ? 1 : 0);
+         timeBegin(4);
+         glDrawArrays(GL_TRIANGLES, 0, 3);
+         GLuint made = composed; // (what the smoothing reads)
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+index b8b7ba9..be2940b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+@@ -640,6 +640,15 @@ void main()
+     }
+ #endif
+     ivec4 c = d.misc.x != 0u ? ivec4(clamp(vColor, 0.0, 255.0)) : ivec4(vFlat);
++    if (d.misc.y == 2u)
++    {
++        // (a point added to the frame: a soft dot at its exact place, its weights' sum one pixel's - prepareDraw)
++        // (round on the screen: a buffer at twice the scale down has its pixels twice as tall)
++        float k = uTarget.w / uTarget.z;
++        vec2 r = (gl_FragCoord.xy / uTarget.zw - 0.5 - vTex.xy) * vec2(1.0, k);
++        float w = exp(-2.0 * dot(r, r)) * 0.63662 * k;
++        c.rgb = ivec3(min(vec3(c.rgb) * w, vec3(255.0)));
++    }
+ 
+     if (d.tex0.x != 0u)
+     {
+@@ -945,6 +954,7 @@ flat out vec4 vBlend;
+ // A frame byte masked (the destination's kept: r, g, b), and the alpha kept (a 24-bit frame, or
+ // its byte masked).
+ flat out vec4 vKeep;
++flat out vec2 vPoint; // (a point drawn as a dot: its centre, GS pixels)
+ // A replacement's coordinates (0 to 1) over the divisor: S, T over Q, or U, V (1/256 texels) over
+ // 256 times the texture's size, over 1.
+ noperspective out vec3 vPack;
+@@ -979,7 +989,8 @@ void main()
+     uint where = csel == 0u ? 0u : (csel == 2u || bits24 ? 1u : 2u);
+     uint constant = csel == 2u ? (d.blend.z & 0xFFu) : ((flags & kAlpha80) != 0u ? 128u : 0u);
+     vState.y = (d.test.z & 0xFFu) | (constant << 8) | (where << 16) | (min(d.texa.w, 255u) << 24);
+-    vState.z = 0u;
++    vState.z = d.misc.y == 2u ? 1u : 0u; // (1: a point drawn as a round dot)
++    vPoint = aTex.xy;
+     vState.w = (d.fog.y & 0xFFu) | ((d.fog.z & 0xFFu) << 8) | ((d.fog.w & 0xFFu) << 16);
+     vec4 scissor = vec4(clamp(d.scissor, ivec4(-1), ivec4(1 << 20)));
+     vScissor = vec4(scissor.xy, scissor.zw + 1.0) * uTarget.zwzw;
+@@ -1023,6 +1034,7 @@ flat in vec4 vScissor;
+ flat in vec4 vBlend;
+ flat in vec4 vKeep;
+ noperspective in vec3 vPack;
++flat in vec2 vPoint; // (a point drawn as a dot: its centre, GS pixels)
+ 
+ bool alphaPassesF(uint atst, float a, float aref)
+ {
+@@ -1053,6 +1065,12 @@ void main()
+     uint slot = state & 31u, mode = (state >> 5) & 3u;
+     bool flatPrimitive = (state & (1u << 11)) != 0u;
+     vec4 c = (state & (1u << 10)) != 0u ? floor(clamp(vColor, 0.0, 255.0)) : vec4(vFlat);
++    if ((vState.z & 1u) != 0u)
++    {
++        float k = uTarget.w / uTarget.z;
++        vec2 r = (gl_FragCoord.xy / uTarget.zw - 0.5 - vPoint) * vec2(1.0, k);
++        c.rgb = min(floor(c.rgb * (exp(-2.0 * dot(r, r)) * 0.63662 * k)), vec3(255.0));
++    }
+     if (mode != 0u)
+     {
+         vec4 t;
+@@ -1300,7 +1318,8 @@ uniform ivec4 uMode;     // mmod, alp, -, output scale (x | y << 8)
+ uniform ivec4 uBg;       // r, g, b, -
+ uniform ivec4 uSource1;  // 0 a frame buffer of the GPU's / 1 local memory, psm, bp, bw
+ uniform ivec4 uSource2;
+-uniform ivec4 uScales;   // scale of circuit 1's buffer, of circuit 2's (x | y << 8)
++uniform ivec4 uScales;   // scale of circuit 1's buffer, of circuit 2's (x | y << 8); 1: circuit 1's / 2's
++                         // rows each make two lines of the picture (frame mode, its buffer at twice the scale down)
+ out vec4 oColor;
+ 
+ ivec2 unpackScale(int packed) { return max(ivec2(packed & 255, packed >> 8), ivec2(1)); }
+@@ -1309,14 +1328,21 @@ ivec2 unpackScale(int packed) { return max(ivec2(packed & 255, packed >> 8), ive
+ // multiplies. (a + 0.5) / b is at least 1/32 from a whole number, more than the rounding.
+ ivec2 divScale(ivec2 a, ivec2 b) { return ivec2((vec2(a) + 0.5) / vec2(b)); }
+ 
+-ivec4 fetch(int circuit, ivec2 gsPixel, ivec2 sub)
++ivec4 fetch(int circuit, ivec2 gsPixel, ivec2 sub, int line)
+ {
+     ivec4 source = circuit == 1 ? uSource1 : uSource2;
+     uint raw;
+     if (source.x == 0)
+     {
+         ivec2 scale = unpackScale(circuit == 1 ? uScales.x : uScales.y);
+-        ivec2 p = gsPixel * scale + min(divScale(sub * scale, unpackScale(uMode.w)), scale - 1);
++        ivec2 out_ = unpackScale(uMode.w);
++        ivec2 p = gsPixel * scale + min(divScale(sub * scale, out_), scale - 1);
++        if ((circuit == 1 ? uScales.z : uScales.w) != 0)
++        {
++            // (a buffer row is two picture lines: line from the circuit's first, gsPixel.y its row)
++            int half_ = scale.y / 2;
++            p.y = gsPixel.y * scale.y + (line & 1) * half_ + min(divScale(ivec2(0, sub.y * half_), out_).y, half_ - 1);
++        }
+         if (circuit == 1)
+             raw = texelFetch(uCrt1, clamp(p, ivec2(0), textureSize(uCrt1, 0) - 1), 0).r;
+         else
+@@ -1356,14 +1382,14 @@ void main()
+     {
+         int y = gs.y - uOrigin2.z;
+         if (y >= 0 && y < uOrigin2.w && gs.x < uSize.y)
+-            dst = fetch(2, ivec2(gs.x + uOrigin2.x, y + uOrigin2.y), sub);
++            dst = fetch(2, ivec2(gs.x + uOrigin2.x, (uScales.w != 0 ? y / 2 : y) + uOrigin2.y), sub, y);
+     }
+     if (uShow.x != 0)
+     {
+         int y = gs.y - uOrigin1.z;
+         if (y >= 0 && y < uOrigin1.w && gs.x < uSize.x)
+         {
+-            ivec4 src = fetch(1, ivec2(gs.x + uOrigin1.x, y + uOrigin1.y), sub);
++            ivec4 src = fetch(1, ivec2(gs.x + uOrigin1.x, (uScales.z != 0 ? y / 2 : y) + uOrigin1.y), sub, y);
+             if (uShow.z != 0)
+                 dst = src;
+             else
+diff --git a/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp b/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
+index 780d663..bd999ae 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
+@@ -108,11 +108,11 @@ namespace gs_texture_pack
+             m_reader.join();
+     }
+ 
+-    bool Pack::open(const std::string &folder)
++    void Pack::index(const std::string &folder, std::unordered_map<Key, Texture *, KeyHasher> &into)
+     {
+         std::error_code error;
+-        if (folder.empty() || !fs::is_directory(folder, error))
+-            return false;
++        if (!fs::is_directory(folder, error))
++            return;
+         for (const auto &entry : fs::directory_iterator(folder, error))
+         {
+             if (!entry.is_regular_file())
+@@ -125,9 +125,18 @@ namespace gs_texture_pack
+                 continue;
+             auto texture = std::make_unique<Texture>();
+             texture->path = path.string();
+-            m_byKey.emplace(key, texture.get());
++            into.emplace(key, texture.get());
+             m_textures.push_back(std::move(texture));
+         }
++    }
++
++    bool Pack::open(const std::string &folder)
++    {
++        std::error_code error;
++        if (folder.empty() || !fs::is_directory(folder, error))
++            return false;
++        index(folder, m_byKey);
++        index((fs::path(folder) / "keyboard").string(), m_byKeyKeyboard);
+         if (m_textures.empty())
+             return false;
+         // The files are read in the background, so that a texture the game shows for the first
+@@ -155,12 +164,19 @@ namespace gs_texture_pack
+             t.state.store(read(t) ? 1 : -1, std::memory_order_release);
+     }
+ 
+-    Texture *Pack::find(const Key &key)
++    Texture *Pack::find(const Key &key, bool keyboard)
+     {
+-        const auto it = m_byKey.find(key);
+-        if (it == m_byKey.end())
+-            return nullptr;
+-        Texture *texture = it->second;
++        Texture *texture = nullptr;
++        if (keyboard)
++            if (const auto k = m_byKeyKeyboard.find(key); k != m_byKeyKeyboard.end())
++                texture = k->second;
++        if (!texture)
++        {
++            const auto it = m_byKey.find(key);
++            if (it == m_byKey.end())
++                return nullptr;
++            texture = it->second;
++        }
+         take(*texture);
+         while (texture->state.load(std::memory_order_acquire) == 2)
+             std::this_thread::yield(); // (the reader is at this one: no longer than one file)
+diff --git a/ps2xRuntime/src/lib/gs/gs_texture_pack.h b/ps2xRuntime/src/lib/gs/gs_texture_pack.h
+index 2aee1d6..d7ccdcb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texture_pack.h
++++ b/ps2xRuntime/src/lib/gs/gs_texture_pack.h
+@@ -60,19 +60,22 @@ namespace gs_texture_pack
+         ~Pack();
+ 
+         // Indexes the folder's .dds files and starts reading them in the background. False when
+-        // there is none.
++        // there is none. Its keyboard/ folder's replace them while the keyboard is the device the
++        // player uses (the button prompts as keys: find's `keyboard`).
+         bool open(const std::string &folder);
+         bool empty() const { return m_textures.empty(); }
+         size_t size() const { return m_textures.size(); }
++        size_t keyboardSize() const { return m_byKeyKeyboard.size(); }
+ 
+         // The replacement for a texture, read (waiting for it if the background reader has not
+-        // got to it yet), or null.
+-        Texture *find(const Key &key);
++        // got to it yet), or null. `keyboard`: the keyboard/ folder's first.
++        Texture *find(const Key &key, bool keyboard = false);
+ 
+     private:
+         static bool read(Texture &t);
+         std::vector<std::unique_ptr<Texture>> m_textures;
+-        std::unordered_map<Key, Texture *, KeyHasher> m_byKey;
++        std::unordered_map<Key, Texture *, KeyHasher> m_byKey, m_byKeyKeyboard;
++        void index(const std::string &folder, std::unordered_map<Key, Texture *, KeyHasher> &into);
+         std::thread m_reader;
+         std::atomic<bool> m_stop{false};
+         void take(Texture &t); // reads it, unless someone else has (the reader thread or find())

@@ -1,0 +1,101 @@
+Subject: [PATCH] Memory: a game's heap up to just under its stack, the
+ kernel's pools in kernel RAM
+
+The heap a game got ended at 0x1F00000, with the kernel's RPC/TLS/boot-mode pools
+above it: 896 KB less than on hardware, where a heap asked for as the rest of RAM
+runs up to the main thread's stack (0x1FE0000). Transformers measures its memory
+at boot and ran out in the HQ after a level, a warp back and a new level picked.
+The pools move to kernel RAM (0x80000-0xB1000), the heap runs to 0x1FA8000 (the
+224 KB under the stack left for a port's added data). Save-state format 3: a
+state of format 2 has the other layout of memory and is refused.
+---
+ ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h | 10 ++++++----
+ ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp      |  4 ++--
+ ps2xRuntime/src/lib/ps2_runtime.cpp                 |  5 ++++-
+ ps2xRuntime/src/lib/ps2_savestate.cpp               |  4 +++-
+ 4 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index d6b7549..0a7e69c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -243,20 +243,22 @@ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
+ static constexpr uint32_t kRpcPacketSize = 64;
+-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
++// The kernel's own pools live in kernel RAM (0x80000-0xFFFFF, which a game never uses), as on
++// hardware: at 0x1F00000 they took the top of the heap a game is given (up to its stack) away.
++static constexpr uint32_t kRpcPacketPoolBase = 0x00080000;
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
+-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
++static constexpr uint32_t kRpcServerPoolBase = 0x00090000;
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
+-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
++static constexpr uint32_t kTlsPoolBase = 0x000A0000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
+ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
+ 
+-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
++static constexpr uint32_t kBootModePoolBase = 0x000B0000;
+ static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+ 
+ static constexpr uint32_t kSifRpcModeNowait = 0x01;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..6f4e3e6 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -543,7 +543,7 @@ namespace ps2_syscalls
+         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA8000u; // (kGuestHeapHardLimit: ps2_runtime.cpp)
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
+ 
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+@@ -583,7 +583,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+ 
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA8000u; // (kGuestHeapHardLimit: ps2_runtime.cpp)
+ 
+         const uint32_t ret = runtime
+                                  ? runtime->guestHeapLimit()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7a4c309..211bc9a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -151,7 +151,10 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    // A game's heap runs up to 0x1FA8000: on hardware it reaches its stack (the SDK puts the main
++    // thread's 128 KB stack at the top of RAM, 0x1FE0000); the 224 KB in between is for a port's
++    // added data (Transformers' mods). The kernel's pools are in kernel RAM (State.h).
++    constexpr uint32_t kGuestHeapHardLimit = 0x01FA8000u;
+     // Stacks for asynchronous guest callbacks (SIF command handlers, interrupt
+     // handlers). On hardware these run on the kernel's stack, in kernel RAM
+     // below 0x80000 that games never use. Carving them from the top of RAM put
+diff --git a/ps2xRuntime/src/lib/ps2_savestate.cpp b/ps2xRuntime/src/lib/ps2_savestate.cpp
+index d04816e..932a05d 100644
+--- a/ps2xRuntime/src/lib/ps2_savestate.cpp
++++ b/ps2xRuntime/src/lib/ps2_savestate.cpp
+@@ -33,7 +33,9 @@ namespace
+     // Bump when a section's layout changes: older files are then refused instead of
+     // being read as garbage.
+     // 2: the IOP section holds the sound processor (SPU2) and the RPC queue threads.
+-    constexpr uint32_t kVersion = 2u;
++    // 3 (2026-10-23): the kernel's pools moved to kernel RAM and a game's heap up to its stack; a
++    // state of format 2 has another layout of memory (and a game's added data elsewhere).
++    constexpr uint32_t kVersion = 3u;
+ 
+     constexpr uint32_t tag(char a, char b, char c, char d)
+     {

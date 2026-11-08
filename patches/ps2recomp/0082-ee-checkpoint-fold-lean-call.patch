@@ -1,0 +1,421 @@
+Subject: [PATCH] Runtime: the checkpoint's flags folded into its one compare; the plain call and the loop checkpoint in small frames
+
+(N11f, TODO 94: the dispatcher's own cost.) Sampled in Deep Amazon (test PC, turbo, logic 240) the dispatcher was 16.8%
+of the EE thread - dispatchGuestCall 9.0, dispatchGuestBranch 3.6, eeCheckpointDue 3.5 - most of it instructions every
+call pays: the plain call ~80 of them, a quarter only saving and restoring the nine registers the whole dispatcher's
+frame needed, the checkpoint ~25 with two flag loads and tests of their own.
+
+- The flags folded into m_stopAtCycle (now atomic): raising the checkpoint-pending flag (or the stop) sets it to 0
+  (EeScheduler::raiseCheckpoint, the flag then the 0, seq_cst - every place that set the flag, from any thread), so
+  the lean checkpoint's one compare also catches them; checkpointLeanSlow tests them as before, in the same order, and
+  puts the stop back once they are down (rearmStopAt). updateStopAt stores the stop, a full fence, then reads the flags
+  and keeps it at 0 if one is up: a flag raised after that read writes its 0 after the store, so none is lost to a
+  stop worked out again. The same answers at the same checkpoints.
+- PS2X_LEAN_CHECKPOINT=0's checkpoint out of line (checkpointDueOld), so the inline one is only the lean way.
+- PS2X_RAISE_LOG=1 (a measuring aid): a request made from another host thread (requestStop, requestSaveState /
+  LoadState, postEvent) noted with the EE clock and the host time; the dispatcher loop logs when it is back in the loop
+  after it (`[ee raise] ... after <n> EE cycles, <t> us`). Off: a constant flag tested once a dispatch.
+- dispatchGuestCall = the plain call alone (round 6's plain way); everything else in dispatchGuestCallFull (out of
+  line): a small frame. eeCheckpointDue (the loops' checkpoint) a leaf without a frame; PS2X_HOT_STATS's count in
+  eeCheckpointDueCounted.
+
+ps2xRuntime:
+- runtime/ee_scheduler.h: checkpointDue's lean way one compare; checkpointDueOld; m_stopAtCycle atomic; updateStopAt's
+  fence and flags; rearmStopAt; raiseCheckpoint; requestCheckpoint through it.
+- Kernel/EeScheduler.cpp: every flag raise through raiseCheckpoint; requestStop; checkpointLeanSlow / processPendingEvents
+  / reset put the stop back; PS2X_RAISE_LOG.
+- ps2_runtime.h/.cpp: dispatchGuestCall / dispatchGuestCallFull; eeCheckpointDue / eeCheckpointDueCounted.
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 20b6d25..75def33 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -383,6 +383,14 @@ public:
+                            uint32_t sourcePc,
+                            uint32_t fallthroughPc,
+                            RecompiledFunction targetFn);
++    // (0082) dispatchGuestCall's other ways (no entry, PS2X_DIRECT_CALLS=0, the lean switches off) out of line, so
++    // the plain call keeps a small frame.
++    bool dispatchGuestCallFull(uint8_t *rdram,
++                               R5900Context *ctx,
++                               uint32_t targetPc,
++                               uint32_t sourcePc,
++                               uint32_t fallthroughPc,
++                               RecompiledFunction targetFn);
+     // (FPS round 3) dispatchGuestCall in three parts for Ps2CallKnown, which makes the call itself
+     // in the generated code: callBegin = the checkpoint (0: due, the caller returns) and the
+     // call's level; callEnd = everything after the target returned (the level given back).
+@@ -478,6 +486,7 @@ public:
+     const EeScheduler &eeScheduler() const;
+     void postEeEvent(EeEvent event);
+     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
++    bool eeCheckpointDueCounted(uint32_t cycles) noexcept; // (0082: PS2X_HOT_STATS's, out of line)
+     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
+ 
+     struct EeExitHandlerRegistration
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 17bbe7c..217210a 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -375,15 +375,18 @@ public:
+                 if (m_countContext)
+                     m_countContext->cop0_count = static_cast<uint32_t>(m_eeCycle);
+             }
+-            if (m_eeCycle >= m_stopAtCycle) [[unlikely]]
++            // (0082) The flags folded into m_stopAtCycle: raising one sets it to 0 (raiseCheckpoint), so the one compare
++            // also catches them; checkpointLeanSlow tests them as before and puts the stop back (rearmStopAt).
++            if (m_eeCycle >= m_stopAtCycle.load(std::memory_order_relaxed)) [[unlikely]]
+                 return checkpointLeanSlow(cycles != 0u);
+-            if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
+-            {
+-                m_unwindingForCheckpoint = true;
+-                return true;
+-            }
+             return false;
+         }
++        return checkpointDueOld(cycles);
++    }
++    // (0082) PS2X_LEAN_CHECKPOINT=0's checkpoint (before round 6), out of line: the inline one is only the lean way,
++    // so the dispatcher's and the loops' checkpoints keep few registers.
++    [[nodiscard]] PS2_NOINLINE bool checkpointDueOld(uint32_t cycles) noexcept
++    {
+         const uint32_t override = m_cycleScaleOverride.load(std::memory_order_relaxed);
+         const uint32_t scale = override ? override : m_defaultScale256;
+         if (scale < 256u)
+@@ -457,7 +460,7 @@ public:
+     // ready, or RotateThreadReadyQueue - and a game may rely on that (global state set for a span
+     // of code, a heap without a lock). Off: the console's rule.
+     void setTimeSliceEnabled(bool enabled) noexcept { m_timeSliceEnabled = enabled; }
+-    void requestCheckpoint() noexcept { m_checkpointPending.store(true, std::memory_order_release); }
++    void requestCheckpoint() noexcept { raiseCheckpoint(); }
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+     // Kernel object API. All calls except postEvent/requestStop execute on the
+@@ -621,11 +624,31 @@ private:
+     // handed on when they are due (and were just added to), then the flags, then the fast end - as checkpointDue.
+     [[nodiscard]] PS2_NOINLINE bool checkpointLeanSlow(bool accounted) noexcept;
+     // (Round 6) m_heldStopCycle and m_stopAtCycle again, after the held cycles' base or limit or the fast end moved.
++    // (0082) Then, with the flags folded into it: kept at 0 while a flag is up. The store, a full fence, then the flags -
++    // a flag raised after they were read writes its 0 after this store (raiseCheckpoint: the flag, then the 0, both
++    // seq_cst), so a stop or a checkpoint is never lost to a stop worked out again here.
+     void updateStopAt() noexcept
+     {
+         const uint64_t stop = m_heldBase + m_heldLimit;
+         m_heldStopCycle = stop < m_heldBase ? ~0ull : stop; // (a limit near the top: never)
+-        m_stopAtCycle = m_heldStopCycle < m_fastEndCycle ? m_heldStopCycle : m_fastEndCycle;
++        m_stopAtCycle.store(m_heldStopCycle < m_fastEndCycle ? m_heldStopCycle : m_fastEndCycle, std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        if (m_checkpointPending.load(std::memory_order_relaxed) || m_stopRequested.load(std::memory_order_relaxed))
++            m_stopAtCycle.store(0u, std::memory_order_relaxed);
++    }
++    // (0082) m_stopAtCycle back from a raise's 0 once the flags are down (it stays 0 while one is up).
++    void rearmStopAt() noexcept
++    {
++        const uint64_t real = m_heldStopCycle < m_fastEndCycle ? m_heldStopCycle : m_fastEndCycle;
++        if (m_stopAtCycle.load(std::memory_order_relaxed) != real)
++            updateStopAt();
++    }
++    // (0082) A checkpoint asked for, from any thread: the flag, then the folded stop at 0 (the next checkpoint's one
++    // compare goes out of line and finds the flag).
++    void raiseCheckpoint() noexcept
++    {
++        m_checkpointPending.store(true, std::memory_order_seq_cst);
++        m_stopAtCycle.store(0u, std::memory_order_seq_cst);
+     }
+     // m_fastEndCycle again: the earlier of the next deadline and the time slice's end.
+     void refreshFastEnd() noexcept
+@@ -644,7 +667,7 @@ private:
+     // this), when they are due again (base + limit), and the earlier of that and the fast end.
+     uint64_t m_heldBase = 0u;
+     uint64_t m_heldStopCycle = 0u;
+-    uint64_t m_stopAtCycle = 0u;
++    std::atomic<uint64_t> m_stopAtCycle{0u}; // (0082: atomic - other threads set it to 0 with a flag, raiseCheckpoint)
+     std::atomic<uint32_t> m_scaleNow{256u}; // the scale checkpoints charge now: the override, else the default
+     uint32_t m_cycleRemainder = 0u;   // (the cycle scale's fraction carried)
+     uint32_t m_defaultScale256 = 256u; // PS2X_EE_CYCLE_SCALE
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 19b1bd6..3dfd767 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -249,6 +249,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     updateStopAt();
+     m_stopRequested.store(false, std::memory_order_release);
+     m_checkpointPending.store(false, std::memory_order_release);
++    updateStopAt(); // (0082: the folded stop without the flags just cleared)
+     m_debugPublishCountdown = 0u;
+     {
+         std::lock_guard lock(m_eventMutex);
+@@ -291,6 +292,43 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     publishSnapshot();
+ }
+ 
++// (0082) PS2X_RAISE_LOG=1, a measuring aid - how promptly the EE takes a request from another host thread: the request
++// noted with the EE clock (read without sync) and the host time; the dispatcher loop logs when it is back in the loop.
++namespace
++{
++    const bool g_raiseLogOn = []()
++    {
++        const char *env = std::getenv("PS2X_RAISE_LOG");
++        return env && *env == '1';
++    }();
++    std::atomic<const char *> g_raiseWhat{nullptr};
++    std::atomic<uint64_t> g_raiseCycle{0u};
++    std::atomic<int64_t> g_raiseNs{0};
++    int64_t raiseNowNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++    void noteRaise(const char *what, bool executor, const volatile uint64_t &eeCycle)
++    {
++        if (!g_raiseLogOn || executor)
++            return;
++        g_raiseCycle.store(eeCycle, std::memory_order_relaxed);
++        g_raiseNs.store(raiseNowNs(), std::memory_order_relaxed);
++        g_raiseWhat.store(what, std::memory_order_seq_cst);
++    }
++    void noteRaiseSeen(const char *where, uint64_t eeCycle)
++    {
++        if (!g_raiseLogOn)
++            return;
++        const char *what = g_raiseWhat.exchange(nullptr, std::memory_order_seq_cst);
++        if (!what)
++            return;
++        const uint64_t at = g_raiseCycle.load(std::memory_order_relaxed);
++        std::fprintf(stderr, "[ee raise] %s from another thread: back in the dispatcher (%s) after %lld EE cycles, %.1f us\n", what,
++                     where, static_cast<long long>(eeCycle - at), (raiseNowNs() - g_raiseNs.load(std::memory_order_relaxed)) / 1000.0);
++    }
++}
++
+ void EeScheduler::run()
+ {
+     assertExecutor();
+@@ -298,6 +336,7 @@ void EeScheduler::run()
+ 
+     while (!m_stopRequested.load(std::memory_order_acquire))
+     {
++        noteRaiseSeen("loop", m_eeCycle); // (PS2X_RAISE_LOG)
+         processPendingEvents();
+         if (m_stopRequested.load(std::memory_order_acquire))
+         {
+@@ -481,6 +520,7 @@ void EeScheduler::run()
+         }
+     }
+ 
++    noteRaiseSeen("stopped", m_eeCycle); // (PS2X_RAISE_LOG)
+     m_guestExecuting.store(false, std::memory_order_release);
+     m_running.store(false, std::memory_order_release);
+     copyMainContextToRuntime();
+@@ -489,8 +529,9 @@ void EeScheduler::run()
+ 
+ void EeScheduler::requestStop()
+ {
+-    m_stopRequested.store(true, std::memory_order_release);
+-    m_checkpointPending.store(true, std::memory_order_release);
++    noteRaise("stop", onExecutorThread(), m_eeCycle); // (PS2X_RAISE_LOG)
++    m_stopRequested.store(true, std::memory_order_seq_cst);
++    raiseCheckpoint();
+     m_eventCv.notify_all();
+ }
+ 
+@@ -514,13 +555,14 @@ void EeScheduler::postEvent(EeEvent event)
+         requestStop();
+         return;
+     }
++    noteRaise("event", onExecutorThread(), m_eeCycle); // (PS2X_RAISE_LOG)
+ 
+     {
+         std::lock_guard lock(m_eventMutex);
+         ++g_eeDispatchStats.events[static_cast<size_t>(event.type) & 7u];
+         m_events.push_back(event);
+         m_eventsPosted.store(true, std::memory_order_seq_cst);
+-        m_checkpointPending.store(true, std::memory_order_seq_cst);
++        raiseCheckpoint();
+     }
+     m_eventCv.notify_one();
+ }
+@@ -577,7 +619,7 @@ void EeScheduler::flushHeldCycles() noexcept
+         if (m_pendingEeTimerInterrupts != 0u)
+         {
+             ++g_eeDispatchStats.timerIrqs;
+-            m_checkpointPending.store(true, std::memory_order_release);
++            raiseCheckpoint();
+         }
+     }
+     // The timers add cycles up without acting while they stay below their next interrupt and
+@@ -602,6 +644,7 @@ bool EeScheduler::checkpointLeanSlow(bool accounted) noexcept
+         m_unwindingForCheckpoint = true;
+         return true;
+     }
++    rearmStopAt(); // (0082: here by a raise whose flag is down again - the stop back)
+     if (m_eeCycle < m_fastEndCycle)
+         return false;
+     return checkpointDeadlineOrSlice();
+@@ -613,7 +656,7 @@ bool EeScheduler::checkpointDeadlineOrSlice() noexcept
+     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+     {
+         ++g_eeDispatchStats.deadlines;
+-        m_checkpointPending.store(true, std::memory_order_release);
++        raiseCheckpoint();
+         m_unwindingForCheckpoint = true;
+         return true;
+     }
+@@ -1396,7 +1439,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     invocation.sequence = ++m_invocationSequence;
+     ++g_eeDispatchStats.invocations;
+     m_pendingInvocations.push_back(std::move(invocation));
+-    m_checkpointPending.store(true, std::memory_order_release);
++    raiseCheckpoint();
+ }
+ 
+ [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
+@@ -2009,7 +2052,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+     m_rescheduleRequested = true;
+     if (interruptSafe || m_insideInterrupt)
+     {
+-        m_checkpointPending.store(true, std::memory_order_release);
++        raiseCheckpoint();
+     }
+ }
+ 
+@@ -2071,7 +2114,10 @@ void EeScheduler::processPendingEvents()
+         const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+         const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
+         const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
+-        m_checkpointPending.store(pendingWork, std::memory_order_release);
++        if (pendingWork)
++            raiseCheckpoint();
++        else
++            m_checkpointPending.store(false, std::memory_order_release);
+     }
+     else
+     {
+@@ -2079,13 +2125,17 @@ void EeScheduler::processPendingEvents()
+         const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
+         const bool pendingWork = m_eventsPosted.load(std::memory_order_seq_cst) || cycleEventDue ||
+                                  m_stopRequested.load(std::memory_order_acquire);
+-        m_checkpointPending.store(pendingWork, std::memory_order_seq_cst);
++        if (pendingWork)
++            raiseCheckpoint();
++        else
++            m_checkpointPending.store(false, std::memory_order_seq_cst);
+         // Without the lock a post can come between the test and the store, which would clear the
+         // checkpoint it asked for: a post sets m_eventsPosted before m_checkpointPending, so one
+         // whose request the store overwrote is seen here and asked for again.
+         if (!pendingWork && m_eventsPosted.load(std::memory_order_seq_cst))
+-            m_checkpointPending.store(true, std::memory_order_seq_cst);
++            raiseCheckpoint();
+     }
++    rearmStopAt(); // (0082: the folded stop back when no flag is up)
+     applyPendingPreemption();
+ }
+ 
+@@ -2443,7 +2493,7 @@ void EeScheduler::waitForEvent()
+             accountCycles(step);
+             remaining -= step;
+         }
+-        m_checkpointPending.store(true, std::memory_order_release);
++        raiseCheckpoint();
+     }
+ }
+ 
+@@ -2590,23 +2640,25 @@ namespace
+ 
+ void EeScheduler::requestSaveState(std::filesystem::path path)
+ {
++    noteRaise("save state", onExecutorThread(), m_eeCycle); // (PS2X_RAISE_LOG)
+     {
+         std::lock_guard lock(m_stateRequestMutex);
+         m_saveStateRequest = std::move(path);
+     }
+     m_stateRequestPending.store(true, std::memory_order_release);
+-    m_checkpointPending.store(true, std::memory_order_release);
++    raiseCheckpoint();
+     m_eventCv.notify_all();
+ }
+ 
+ void EeScheduler::requestLoadState(std::filesystem::path path)
+ {
++    noteRaise("load state", onExecutorThread(), m_eeCycle); // (PS2X_RAISE_LOG)
+     {
+         std::lock_guard lock(m_stateRequestMutex);
+         m_loadStateRequest = std::move(path);
+     }
+     m_stateRequestPending.store(true, std::memory_order_release);
+-    m_checkpointPending.store(true, std::memory_order_release);
++    raiseCheckpoint();
+     m_eventCv.notify_all();
+ }
+ 
+@@ -3073,7 +3125,7 @@ void EeScheduler::loadState(ps2x::StateReader &in)
+     in.podMap(m_invocationStackTops);
+ 
+     m_debugPublishCountdown = 0u;
+-    m_checkpointPending.store(true, std::memory_order_release);
++    raiseCheckpoint();
+     if (in.ok())
+     {
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f743ea0..89262ae 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2063,12 +2063,43 @@ namespace
+     }();
+ }
+ 
++// (0082) The plain call on its own: what the round-6 plain way below does, in a function with nothing else, so its
++// frame saves a few registers instead of the nine the whole dispatcher needed. The rest: dispatchGuestCallFull.
+ bool PS2Runtime::dispatchGuestCall(uint8_t *rdram,
+                                    R5900Context *ctx,
+                                    uint32_t targetPc,
+                                    uint32_t sourcePc,
+                                    uint32_t fallthroughPc,
+                                    RecompiledFunction targetFn)
++{
++    if (!g_plainCalls || !targetFn) [[unlikely]]
++        return dispatchGuestCallFull(rdram, ctx, targetPc, sourcePc, fallthroughPc, targetFn);
++    ctx->pc = targetPc;
++    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++        return false;
++    Ps2DispatchLevels &levels = g_ps2DispatchLevels;
++    const uint32_t level = levels.level + 1u;
++    levels.level = level;
++    if (level < kDispatchLevels) [[likely]]
++        levels.resumedByDispatcher[level] = false;
++    targetFn(rdram, ctx, this);
++    if (ctx->pc == fallthroughPc && !isStopRequested() && !(level < kDispatchLevels && levels.resumedByDispatcher[level]))
++        [[likely]]
++    {
++        if (m_eeScheduler)
++            m_eeScheduler->clearCheckpointUnwind();
++        --levels.level;
++        return true;
++    }
++    return callEnd(rdram, ctx, targetPc, fallthroughPc, level);
++}
++
++PS2_NOINLINE bool PS2Runtime::dispatchGuestCallFull(uint8_t *rdram,
++                                                    R5900Context *ctx,
++                                                    uint32_t targetPc,
++                                                    uint32_t sourcePc,
++                                                    uint32_t fallthroughPc,
++                                                    RecompiledFunction targetFn)
+ {
+     if (g_plainCalls && targetFn) [[likely]]
+     {
+@@ -3219,7 +3250,14 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    if (g_ps2HotStats) ++g_hotLoops;
++    if (g_ps2HotStats) [[unlikely]]
++        return eeCheckpointDueCounted(cycles); // (0082: the count out of line - the loops' checkpoint a small frame)
++    return m_eeScheduler->checkpointDue(cycles);
++}
++
++PS2_NOINLINE bool PS2Runtime::eeCheckpointDueCounted(uint32_t cycles) noexcept
++{
++    ++g_hotLoops;
+     return m_eeScheduler->checkpointDue(cycles);
+ }
+ 

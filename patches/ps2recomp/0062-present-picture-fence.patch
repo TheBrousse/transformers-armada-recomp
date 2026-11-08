@@ -1,0 +1,366 @@
+Subject: [PATCH] DXGI present: the presenting device waits for each picture's unlock (TODO 98)
+
+The window's pictures go through two Direct3D 11 devices: GL draws each into a texture of the
+interop's device (WGL_NV_DX_interop2: lock, blit, unlock) and a second device copies it into the
+swap chain's back buffer and presents. Nothing ordered the second device's copy after the interop
+device's work at the unlock, and on AMD's driver (RX 7900 XTX, RX 5700 XT) the copy now and then
+read the texture before GL's new picture had reached it: the screen showed the picture that
+texture held three presents before - a picture ahead and then the ones before it again, the
+user's flicker with the pictures between frames on (measured with a number stamped into each
+picture, read back from the back buffer: about 1 present in 7 on the RX 5700 XT, 1 in 20 on the
+RX 7900 XTX went back to an older picture; none with the fence).
+
+Now a fence shared by the two devices (ID3D11Fence, Direct3D 11.4): the interop's device signals
+it after each unlock and the presenting device's GPU waits for it before the copy - no CPU wait.
+PS2X_PRESENT_FENCE=0: as before. Also, before GL draws into one of the three textures again, the
+presenting device's last copy out of it must be done (an event query, asked without waiting;
+PS2X_PRESENT_READGUARD=0: not waited for). And a checking aid: PS2X_PRESENT_STAMPS=1 reads the
+picture-number stamps (the game's TF_NATIVE_STAMP) of every present from what went to the back
+buffer; PS2X_PRESENT_CAPTURE=<first>,<count>,<dir> also saves those presents at a quarter size.
+---
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -40,6 +40,7 @@
+ #endif
+ #include <windows.h>
+ #include <d3d11_1.h>
++#include <d3d11_4.h>
+ #include <dxgi1_5.h>
+ 
+ // raylib's GL loader (its function pointers, loaded on the window's context)
+@@ -54,7 +55,9 @@
+ #include <cstdlib>
+ #include <deque>
+ #include <mutex>
++#include <string>
+ #include <thread>
++#include <vector>
+ 
+ namespace ps2_host_present::dxgi
+ {
+@@ -77,6 +80,14 @@ namespace ps2_host_present::dxgi
+             ID3D11Texture2D *shown = nullptr;   // the same, the presenting device's
+             GLuint renderbuffer = 0u, framebuffer = 0u; // (the present thread's context)
+             HANDLE object = nullptr;
++            // (TODO 98) The presenting device's copy out of `shown` (into the back buffer) marked done: GL blits the
++            // next picture into this texture only once it is - the interop's lock waits for the interop device's work
++            // alone, not the presenting device's, whose copy waits behind its queued presents. Without it a picture
++            // was copied into the back buffer after GL had already drawn a later one into the texture (or while it
++            // did): the screen showed a picture a few ahead and then the ones before it again (about 1 present in
++            // 15 at 3440x1440 with the pictures between frames on), now and then two of them in one.
++            ID3D11Query *read = nullptr;
++            bool reading = false;
+         };
+ 
+         struct Job
+@@ -96,6 +107,11 @@ namespace ps2_host_present::dxgi
+             ID3D11DeviceContext *context = nullptr;  // (the present thread's alone)
+             ID3D11Device *shareDevice = nullptr;     // the interop's: the textures GL draws into
+             ID3D11DeviceContext *shareContext = nullptr;
++            // (TODO 98) A fence between the two devices: signalled by the interop's device once GL's picture is unlocked,
++            // waited for on the GPU by the presenting device before it copies the picture (setupFence).
++            ID3D11Fence *shareFence = nullptr, *presentFence = nullptr;
++            ID3D11DeviceContext4 *shareContext4 = nullptr, *context4 = nullptr;
++            UINT64 shareValue = 0u;
+             IDXGISwapChain1 *swapChain = nullptr;
+             UINT swapChainFlags = 0u;
+             bool tearing = false;
+@@ -133,6 +149,14 @@ namespace ps2_host_present::dxgi
+             bool statsKnown = false;
+         } g;
+ 
++        // (TODO 98) PS2X_PRESENT_READGUARD=0: a picture texture drawn into again without waiting for the presenting
++        // device's copy out of it (as before; an A/B).
++        bool readGuard()
++        {
++            static const bool on = !std::getenv("PS2X_PRESENT_READGUARD") || *std::getenv("PS2X_PRESENT_READGUARD") != '0';
++            return on;
++        }
++
+         int syncInterval()
+         {
+             static const int forced = []()
+@@ -179,6 +203,7 @@ namespace ps2_host_present::dxgi
+                     glDeleteRenderbuffers(1, &picture.renderbuffer);
+                 release(picture.texture);
+                 release(picture.shown);
++                release(picture.read);
+                 picture = Picture{};
+             }
+             g.fitted = false;
+@@ -349,6 +374,152 @@ namespace ps2_host_present::dxgi
+             return flight;
+         }
+ 
++        // PS2X_PRESENT_CAPTURE=<first>,<count>,<dir> (a checking aid): the presents numbered from 1; from <first> on,
++        // <count> of them saved as they went to the back buffer - <dir>\present_<n>.bmp at a quarter of the size, and a
++        // line each in the log with the picture's stamps (TF_NATIVE_STAMP: 16 squares in the top-left and bottom-left
++        // corners, each the picture's number's bit, read at full size here). A ring of four read-back textures, each
++        // read three presents after its copy (the copy is done by then: the wait does not hold the presents up).
++        namespace capture
++        {
++            struct Slot
++            {
++                ID3D11Texture2D *texture = nullptr;
++                uint64_t number = 0u;
++                int64_t ns = 0;
++            };
++            std::array<Slot, 4> g_ring{};
++            size_t g_next = 0u;
++            uint64_t g_first = 0u, g_count = 0u, g_presents = 0u;
++            std::string g_dir;
++            bool g_on = false, g_read = false, g_all = false; // (g_all: PS2X_PRESENT_STAMPS=1 - every present's stamps read)
++
++            void setup()
++            {
++                if (g_read)
++                    return;
++                g_read = true;
++                g_all = std::getenv("PS2X_PRESENT_STAMPS") && *std::getenv("PS2X_PRESENT_STAMPS") == '1';
++                g_on = g_all;
++                const char *v = std::getenv("PS2X_PRESENT_CAPTURE");
++                if (!v)
++                    return;
++                unsigned long long first = 0, count = 0;
++                char dir[512] = {};
++                if (std::sscanf(v, "%llu,%llu,%511[^\n]", &first, &count, dir) == 3)
++                {
++                    g_first = first;
++                    g_count = count;
++                    g_dir = dir;
++                    g_on = g_on || count > 0u;
++                    std::fprintf(stderr, "[present] capture: presents %llu..%llu to %s\n", first, first + count - 1u, dir);
++                }
++            }
++
++            // The stamp's number at (x0, y): 16 squares of `side` pixels, a red one first and last as markers.
++            int stampAt(const uint8_t *data, UINT pitch, int width, int height, int x0, int y, int side)
++            {
++                if (y < 0 || y >= height || x0 + 18 * side > width)
++                    return -2;
++                auto px = [&](int x) { return data + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * 4u; };
++                const uint8_t *m = px(x0 + side / 2);
++                if (!(m[0] > 160 && m[1] < 90 && m[2] < 90))
++                    return -1; // (no marker: no stamp)
++                int value = 0;
++                for (int b = 0; b < 16; ++b)
++                {
++                    const uint8_t *p = px(x0 + (b + 1) * side + side / 2);
++                    value |= (p[1] > 128 ? 1 : 0) << b;
++                }
++                return value;
++            }
++
++            void save(Slot &slot, ID3D11DeviceContext *context, int width, int height)
++            {
++                D3D11_MAPPED_SUBRESOURCE mapped{};
++                if (FAILED(context->Map(slot.texture, 0, D3D11_MAP_READ, 0, &mapped)))
++                    return;
++                const uint8_t *data = static_cast<const uint8_t *>(mapped.pData);
++                const int side = 16;
++                const int top = stampAt(data, mapped.RowPitch, width, height, side, side + side / 2, side);
++                const int bottom = stampAt(data, mapped.RowPitch, width, height, side, height - side - side / 2, side);
++                std::fprintf(stderr, "[present] capture %llu at %.3f ms: stamp top %d bottom %d%s\n", static_cast<unsigned long long>(slot.number),
++                             static_cast<double>(slot.ns) / 1.0e6, top, bottom, top != bottom ? "  MIXED" : "");
++                if (slot.number < g_first || slot.number >= g_first + g_count)
++                {
++                    context->Unmap(slot.texture, 0);
++                    return; // (its stamps only)
++                }
++                // a quarter of the size, 24-bit BMP (bottom-up rows)
++                const int w = width / 4, h = height / 4, rowBytes = (w * 3 + 3) & ~3;
++                std::vector<uint8_t> out(static_cast<size_t>(rowBytes) * h);
++                for (int y = 0; y < h; ++y)
++                    for (int x = 0; x < w; ++x)
++                    {
++                        const uint8_t *p = data + static_cast<size_t>(y * 4) * mapped.RowPitch + static_cast<size_t>(x * 4) * 4u;
++                        uint8_t *q = out.data() + static_cast<size_t>(h - 1 - y) * rowBytes + static_cast<size_t>(x) * 3u;
++                        q[0] = p[2];
++                        q[1] = p[1];
++                        q[2] = p[0];
++                    }
++                context->Unmap(slot.texture, 0);
++                char name[600];
++                std::snprintf(name, sizeof(name), "%s\\present_%06llu.bmp", g_dir.c_str(), static_cast<unsigned long long>(slot.number));
++                if (FILE *f = std::fopen(name, "wb"))
++                {
++                    const uint32_t size = 54u + static_cast<uint32_t>(out.size());
++                    uint8_t hdr[54] = {'B', 'M'};
++                    auto put32 = [&](int at, uint32_t v) { std::memcpy(hdr + at, &v, 4); };
++                    put32(2, size);
++                    put32(10, 54u);
++                    put32(14, 40u);
++                    put32(18, static_cast<uint32_t>(w));
++                    put32(22, static_cast<uint32_t>(h));
++                    hdr[26] = 1;
++                    hdr[28] = 24;
++                    put32(34, static_cast<uint32_t>(out.size()));
++                    std::fwrite(hdr, 1, 54, f);
++                    std::fwrite(out.data(), 1, out.size(), f);
++                    std::fclose(f);
++                }
++            }
++
++            // A present's picture (in `shown`, just copied into the back buffer): copied for reading if it is wanted.
++            void take(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *shown, int width, int height)
++            {
++                setup();
++                if (!g_on)
++                    return;
++                const uint64_t n = ++g_presents;
++                // (the oldest in the ring read now: three presents since its copy)
++                Slot &slot = g_ring[g_next];
++                if (slot.texture && slot.number)
++                {
++                    save(slot, context, width, height);
++                    slot.number = 0u;
++                }
++                if (!g_all && (n < g_first || n >= g_first + g_count))
++                {
++                    g_next = (g_next + 1u) % g_ring.size();
++                    return;
++                }
++                if (!slot.texture)
++                {
++                    D3D11_TEXTURE2D_DESC desc{};
++                    shown->GetDesc(&desc);
++                    desc.Usage = D3D11_USAGE_STAGING;
++                    desc.BindFlags = 0u;
++                    desc.MiscFlags = 0u;
++                    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++                    if (FAILED(device->CreateTexture2D(&desc, nullptr, &slot.texture)))
++                        return;
++                }
++                context->CopyResource(slot.texture, shown);
++                slot.number = n;
++                slot.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
++                g_next = (g_next + 1u) % g_ring.size();
++            }
++        }
++
+         // Its copy done on the GPU: unlocked (the unlock has nothing left to wait for), copied into
+         // the back buffer and presented.
+         void finishCopy(Flight &flight)
+@@ -364,6 +535,17 @@ namespace ps2_host_present::dxgi
+                 return;
+             }
+             g.unlockObjects(g.interopDevice, 1, &flight.picture->object);
++            // (TODO 98) The presenting device's GPU waits until the interop's device has done its part of the unlock. The
++            // presenting device copied the texture out before that had happened, now and then: the picture the texture held
++            // three presents before (measured with picture stamps: about 1 present in 15 showed an older picture than the
++            // one before it, at 3440x1440 with the pictures between frames on, on an RX 7900 XTX; a copy made while the
++            // texture is being written can mix two pictures).
++            if (g.presentFence)
++            {
++                g.shareContext4->Signal(g.shareFence, ++g.shareValue);
++                g.shareContext->Flush();
++                g.context4->Wait(g.presentFence, g.shareValue);
++            }
+             g.copied.store(flight.job.number, std::memory_order_release);
+             g.done.notify_all();
+             const Clock::time_point t1 = Clock::now();
+@@ -373,6 +555,19 @@ namespace ps2_host_present::dxgi
+             {
+                 g.context->CopyResource(back, flight.picture->shown);
+                 back->Release();
++                capture::take(g.device, g.context, flight.picture->shown, g.width, g.height); // (PS2X_PRESENT_CAPTURE)
++                // (the copies out of `shown` marked: the texture is not drawn into again before they are done - TODO 98)
++                if (!flight.picture->read && readGuard())
++                {
++                    D3D11_QUERY_DESC qd{};
++                    qd.Query = D3D11_QUERY_EVENT;
++                    g.device->CreateQuery(&qd, &flight.picture->read);
++                }
++                if (flight.picture->read)
++                {
++                    g.context->End(flight.picture->read);
++                    flight.picture->reading = true;
++                }
+                 const int interval = syncInterval();
+                 hr = g.swapChain->Present(static_cast<UINT>(interval), interval == 0 && g.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+             }
+@@ -394,6 +589,19 @@ namespace ps2_host_present::dxgi
+             }
+         }
+ 
++        // The next picture texture's last copy into the back buffer done (TODO 98): never waited for - asked, as the GL
++        // fences are (the thread never waits inside a driver's call).
++        bool nextPictureFree()
++        {
++            Picture &picture = g.pictures[g.next];
++            if (!picture.reading)
++                return true;
++            if (g.context->GetData(picture.read, nullptr, 0u, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
++                return false;
++            picture.reading = false;
++            return true;
++        }
++
+         // Two pictures' copies at most on their way, retired in turn as the GPU finishes them. The
+         // thread never waits inside GL: it asks the fences (a timeout of 0) and sleeps between the
+         // asks - a wait in AMD's GL driver (glClientWaitSync with a timeout, the interop's unlock with
+@@ -426,7 +634,7 @@ namespace ps2_host_present::dxgi
+                 }
+                 // (none started while the window's size changes: the textures are made again)
+                 const bool sameSize = !g.jobs.empty() && g.fitted && g.jobs.front().width == g.width && g.jobs.front().height == g.height;
+-                if (!g.jobs.empty() && flying.size() < kInFlight && (flying.empty() || sameSize))
++                if (!g.jobs.empty() && flying.size() < kInFlight && (flying.empty() || sameSize) && (!g.fitted || nextPictureFree()))
+                 {
+                     const Job job = g.jobs.front();
+                     g.jobs.pop_front();
+@@ -488,6 +696,35 @@ namespace ps2_host_present::dxgi
+         }
+     }
+ 
++    // (TODO 98) The fence shared by the two devices (State::shareFence). PS2X_PRESENT_FENCE=0: none, as before (an A/B).
++    static void setupFence()
++    {
++        if (std::getenv("PS2X_PRESENT_FENCE") && *std::getenv("PS2X_PRESENT_FENCE") == '0')
++            return;
++        ID3D11Device5 *share5 = nullptr, *device5 = nullptr;
++        HANDLE handle = nullptr;
++        bool ok = SUCCEEDED(g.shareDevice->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&share5))) &&
++                  SUCCEEDED(g.device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5))) &&
++                  SUCCEEDED(share5->CreateFence(0u, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g.shareFence))) &&
++                  SUCCEEDED(g.shareFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle)) &&
++                  SUCCEEDED(device5->OpenSharedFence(handle, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g.presentFence))) &&
++                  SUCCEEDED(g.shareContext->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.shareContext4))) &&
++                  SUCCEEDED(g.context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.context4)));
++        if (handle)
++            CloseHandle(handle);
++        release(share5);
++        release(device5);
++        if (!ok)
++        {
++            release(g.shareFence);
++            release(g.presentFence);
++            release(g.shareContext4);
++            release(g.context4);
++        }
++        std::fprintf(stderr, ok ? "[present] the presenting device waits on a fence for each picture's unlock\n"
++                                : "[present] no fence between the two devices (Direct3D 11.4 missing): the copies unsynchronised\n");
++    }
++
+     bool open(void *nativeWindow)
+     {
+         g.window = static_cast<HWND>(nativeWindow);
+@@ -549,6 +786,8 @@ namespace ps2_host_present::dxgi
+         if (SUCCEEDED(hr))
+             hr = createDevice(g.shareDevice, g.shareContext);
+         release(chosen);
++        if (SUCCEEDED(hr))
++            setupFence();
+         if (FAILED(hr))
+         {
+             std::fprintf(stderr, "[present] no Direct3D 11 device (%08lx)\n", static_cast<unsigned long>(hr));
+@@ -674,6 +913,10 @@ namespace ps2_host_present::dxgi
+         g.partWindow = nullptr;
+         g.partDc = nullptr;
+         release(g.swapChain);
++        release(g.shareFence);
++        release(g.presentFence);
++        release(g.shareContext4);
++        release(g.context4);
+         release(g.context);
+         release(g.device);
+         release(g.shareContext);

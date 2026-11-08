@@ -1,0 +1,196 @@
+Subject: [PATCH] VU memories: native code's pointers go to them
+
+The libc stubs and other native code resolved 0x11000000-0x1100FFFF (VU0/VU1 micro and data
+memory, as the EE sees them) by masking the address into main RAM. A game's memset of VU1 data
+memory (Transformers' warp effect, VU1Module::Start: memset(0x1100C000, 0, n)) cleared RAM at
+0x0100C000 instead, every warp loading screen, corrupting what lived there. getMemPtr /
+getConstMemPtr now resolve the VU windows (VU0's 4 KB repeating in their 16 KB) to the VU
+memories, waiting for the VIF1 thread and marking micro memory written as the memory's own
+stores do; guestContiguousBytes knows where a VU memory ends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_memory.h  | 69 +++++++++++++++++++++++
+ ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp |  6 ++
+ ps2xRuntime/src/lib/ps2_memory.cpp        | 26 +++++++++
+ 3 files changed, 101 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index c0315f9..db75761 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -86,6 +86,59 @@ inline uint8_t *ps2GetScratchpadHostPtr()
+     return ps2ScratchpadHostPtrStorage().load(std::memory_order_relaxed);
+ }
+ 
++// The VU memories as the EE sees them (0x11000000-0x1100FFFF: VU0 micro, VU0 data, VU1 micro, VU1
++// data, 16 KB windows; VU0's 4 KB repeat in theirs), for the host pointers of native code (libc
++// stubs and the like). Without them an address there was masked into main RAM: the game's memset
++// of VU1 data (0x1100C000, the warp's water effect) cleared RAM at 0x0100C000 instead.
++inline std::atomic<uint8_t *> *ps2VuHostPtrStorage()
++{
++    static std::atomic<uint8_t *> ptrs[4] = {};
++    return ptrs;
++}
++
++// Called before a host pointer into a VU memory is handed out (region 0-3 as above; write: the
++// caller may write): PS2Memory's, which waits for the VIF1 thread on VU1 memory and marks a micro
++// memory written (its programs are recompiled), as its own stores do.
++using Ps2VuAccessHook = void (*)(uint32_t region, bool write);
++inline std::atomic<Ps2VuAccessHook> &ps2VuAccessHookStorage()
++{
++    static std::atomic<Ps2VuAccessHook> hook{nullptr};
++    return hook;
++}
++
++inline void ps2SetVuHostPtrs(uint8_t *vu0Code, uint8_t *vu0Data, uint8_t *vu1Code, uint8_t *vu1Data)
++{
++    std::atomic<uint8_t *> *ptrs = ps2VuHostPtrStorage();
++    ptrs[0].store(vu0Code, std::memory_order_relaxed);
++    ptrs[1].store(vu0Data, std::memory_order_relaxed);
++    ptrs[2].store(vu1Code, std::memory_order_relaxed);
++    ptrs[3].store(vu1Data, std::memory_order_relaxed);
++}
++
++// True when addr is in the VU memories: their host byte and the bytes left in that memory.
++inline bool ps2ResolveVuPointer(uint32_t addr, uint8_t *&host, uint32_t &remaining, int access = -1)
++{
++    uint32_t phys = 0xFFFFFFFFu;
++    if (addr < 0x20000000u)
++        phys = addr;
++    else if ((addr >= 0x20000000u && addr < 0x40000000u) || (addr >= 0x80000000u && addr < 0xC0000000u))
++        phys = addr & 0x1FFFFFFFu;
++    if (phys < PS2_VU0_CODE_BASE || phys >= PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
++        return false;
++    const uint32_t region = (phys - PS2_VU0_CODE_BASE) >> 14;
++    const uint32_t size = region < 2u ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
++    uint8_t *base = ps2VuHostPtrStorage()[region].load(std::memory_order_relaxed);
++    if (!base)
++        return false;
++    if (access >= 0)
++        if (Ps2VuAccessHook hook = ps2VuAccessHookStorage().load(std::memory_order_relaxed))
++            hook(region, access != 0);
++    const uint32_t offset = phys & (size - 1u);
++    host = base + offset;
++    remaining = size - offset;
++    return true;
++}
++
+ inline bool ps2IsScratchpadAddress(uint32_t addr)
+ {
+     if (addr >= PS2_SCRATCHPAD_BASE && addr < (PS2_SCRATCHPAD_BASE + PS2_SCRATCHPAD_SIZE))
+@@ -149,6 +202,13 @@ inline uint8_t *getMemPtr(uint8_t *rdram, uint32_t addr)
+     {
+         return nullptr;
+     }
++    if (addr >= PS2_VU0_CODE_BASE)
++    {
++        uint8_t *vu = nullptr;
++        uint32_t remaining = 0u;
++        if (ps2ResolveVuPointer(addr, vu, remaining, 1))
++            return vu;
++    }
+ 
+     uint32_t offset = 0;
+     bool scratch = false;
+@@ -171,6 +231,13 @@ inline const uint8_t *getConstMemPtr(const uint8_t *rdram, uint32_t addr)
+     {
+         return nullptr;
+     }
++    if (addr >= PS2_VU0_CODE_BASE)
++    {
++        uint8_t *vu = nullptr;
++        uint32_t remaining = 0u;
++        if (ps2ResolveVuPointer(addr, vu, remaining, 0))
++            return vu;
++    }
+ 
+     uint32_t offset = 0;
+     bool scratch = false;
+@@ -337,6 +404,8 @@ public:
+     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
+     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
+ 
++    // A micro memory written through a host pointer (ps2VuAccessHook): its programs are stale.
++    void noteVuCodeWritten(bool vu1) { vu1 ? markVU1CodeModified() : markVU0CodeModified(); }
+     uint8_t *getVU1Code() { return m_vu1Code; }
+     const uint8_t *getVU1Code() const { return m_vu1Code; }
+     uint8_t *getVU1Data() { return m_vu1Data; }
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index a0751f4..503f4ea 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -32,6 +32,12 @@ namespace ps2_stubs
+ 
+         uint32_t guestContiguousBytes(uint32_t guestAddr)
+         {
++            uint8_t *vu = nullptr;
++            uint32_t vuRemaining = 0u;
++            if (ps2ResolveVuPointer(guestAddr, vu, vuRemaining))
++            {
++                return vuRemaining;
++            }
+             uint32_t offset = 0u;
+             bool scratch = false;
+             if (!ps2ResolveGuestPointer(guestAddr, offset, scratch))
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index fae079e..f35ed91 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -299,6 +299,24 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
+     return basePage * 2048 + y * strideBytes + x * 4;
+ }
+ 
++namespace
++{
++    PS2Memory *g_vuHookMemory = nullptr;
++
++    void vuAccessHook(uint32_t region, bool write)
++    {
++        if (region >= 2u)
++            ps2vif1::sync(region == 2u ? "VU1 code memory (host pointer)" : "VU1 data memory (host pointer)");
++        if (write && g_vuHookMemory)
++        {
++            if (region == 0u)
++                g_vuHookMemory->noteVuCodeWritten(false);
++            else if (region == 2u)
++                g_vuHookMemory->noteVuCodeWritten(true);
++        }
++    }
++}
++
+ PS2Memory::PS2Memory()
+     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
+ {
+@@ -326,6 +344,10 @@ PS2Memory::~PS2Memory()
+         m_gsVRAM = nullptr;
+     }
+ 
++    ps2VuAccessHookStorage().store(nullptr, std::memory_order_relaxed);
++    if (g_vuHookMemory == this)
++        g_vuHookMemory = nullptr;
++    ps2SetVuHostPtrs(nullptr, nullptr, nullptr, nullptr);
+     if (m_vu1Code)
+     {
+         delete[] m_vu1Code;
+@@ -369,6 +391,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_rdram = nullptr;
+         m_scratchpad = nullptr;
+         ps2SetScratchpadHostPtr(nullptr);
++        ps2SetVuHostPtrs(nullptr, nullptr, nullptr, nullptr);
+         iop_ram = nullptr;
+         m_gsVRAM = nullptr;
+         m_vu0Code = nullptr;
+@@ -443,6 +466,9 @@ bool PS2Memory::initialize(size_t ramSize)
+         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
+         markVU0CodeModified();
+         markVU1CodeModified();
++        ps2SetVuHostPtrs(m_vu0Code, m_vu0Data, m_vu1Code, m_vu1Data);
++        g_vuHookMemory = this;
++        ps2VuAccessHookStorage().store(vuAccessHook, std::memory_order_relaxed);
+ 
+         // Initialize VIF registers
+         memset(&vif0_regs, 0, sizeof(vif0_regs));
+-- 
+2.54.0.windows.1
+

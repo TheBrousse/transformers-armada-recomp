@@ -1,0 +1,73 @@
+Subject: [PATCH] Debugging aids: the time slice can be turned off; the
+ recent dispatches
+
+EeScheduler::setTimeSliceEnabled(false) drops the time slice (same-priority threads in turn): the
+console's kernel switches threads only on waits, a higher priority made ready and
+RotateThreadReadyQueue, and a game may rely on that. ps2xRecentDispatches() gives a game's
+debugging hooks the calling thread's last guest dispatches (the trace= of a missing target).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h | 6 ++++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 2 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp        | 7 +++++++
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 6f6dd12..4610938 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -353,6 +353,11 @@ public:
+     // instead of executing the loop until then.
+     void skipIdleCycles() noexcept;
+     // Makes the running guest code return to the dispatcher at its next checkpoint.
++    // The time slice: same-priority threads in turn, every kDefaultTimeSliceCycles (on by default).
++    // The console's kernel has none - a thread runs until it waits, a higher priority one is made
++    // ready, or RotateThreadReadyQueue - and a game may rely on that (global state set for a span
++    // of code, a heap without a lock). Off: the console's rule.
++    void setTimeSliceEnabled(bool enabled) noexcept { m_timeSliceEnabled = enabled; }
+     void requestCheckpoint() noexcept { m_checkpointPending.store(true, std::memory_order_release); }
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+@@ -565,6 +570,7 @@ private:
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
++    bool m_timeSliceEnabled = true;
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 714c775..d6f2bd9 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -500,7 +500,7 @@ void EeScheduler::setVBlankPeriod(std::chrono::nanoseconds period) noexcept
+ bool EeScheduler::timeSliceExpired() noexcept
+ {
+     const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++    if (running != nullptr && m_timeSliceEnabled && hasReadyAtOrAbovePriority(running->currentPriority))
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 211bc9a..5d24a5c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -443,6 +443,13 @@ namespace
+     }
+ }
+ 
++// The calling thread's last guest dispatches (the trace= of a missing target), for a game's own
++// debugging hooks: who got here.
++std::string ps2xRecentDispatches()
++{
++    return formatDispatchHistory();
++}
++
+ // PS2X_SHOT_VSYNCS=2400,2600: at each of these VBlank ticks, save the displayed frame to
+ // runs/shot_<tick>.png. The EE scheduler calls this when it latches the VBlank's picture, so a
+ // capture shows the game state at exactly that tick, however fast the presenter runs.
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,331 @@
+Subject: [PATCH] EE thread (FPS round 6): a leaner checkpoint charge, the plain call in one test, jalr calls
+ with the lean begin and end
+
+The runtime's own cost per call and loop checkpoint was 13-19% of the saturated game thread at 240 (the three
+dispatch functions, all three machines, Amazon and Deep Amazon at draw distance 4). Every change gives the same
+cycles at the same checkpoints and runs the same guest code in the same order. Each has a switch to the round-5
+way (an A/B):
+
+ps2xRuntime (runtime/ee_scheduler.h, Kernel/EeScheduler.cpp) - PS2X_LEAN_CHECKPOINT=0: as before:
+- EeScheduler::checkpointDue reads the cycle scale once (m_scaleNow: the override, else the default, kept by
+  setCycleScale) and makes one compare of the clock against m_stopAtCycle - the earlier of the held cycles'
+  hand-over and the fast end - before the two flags, instead of the held cycles' sum and compare and the fast
+  end's compare. The held cycles are the clock less m_heldBase (the clock at the last hand-over), so nothing is
+  added up beside the clock; accountCyclesInline hands them on when the clock reaches m_heldStopCycle. Reaching
+  m_stopAtCycle goes to checkpointLeanSlow, which asks what checkpointDue asked, in its order (the hand-over
+  when cycles were just added, the flags, the fast end and the deadline / time slice). m_stopAtCycle is worked
+  out again wherever its parts change (flushHeldCycles, invalidateHeldCycles, refreshFastEnd, reset, loadState).
+
+ps2xRuntime (ps2_runtime.cpp):
+- dispatchGuestCall: the plain call first - the switches it looked at one by one (hot stats, PS2X_DIRECT_CALLS,
+  PS2X_DISPATCH_LEAN, PS2X_DISPATCH_HISTORY) folded into one test made once (g_plainCalls). PS2X_LEAN_CALL=0:
+  as before.
+- dispatchGuestBranch: a call (jalr, and the decompiled functions' calls) takes the same lean begin and end as
+  dispatchGuestCall - the target looked up as before (callTarget), its level kept, the common end in place,
+  callEnd for the rest (the target as the call's entry, as enterCall's) - instead of enterCall. Only the dispatch
+  history ring (read by the missing-function report) is left out, as the lean direct call does unless
+  PS2X_DISPATCH_HISTORY=1. PS2X_LEAN_BRANCH=0: as before.
+---
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 9466ad0..bbb38b0 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -18,6 +18,10 @@
+ #include <variant>
+ #include <vector>
+ 
++// (FPS round 6) PS2X_LEAN_CHECKPOINT=0: EeScheduler::checkpointDue and the held cycles as before round 6 (an A/B;
++// the same cycles and the same checkpoints either way).
++extern const bool g_ps2LeanCheckpoint;
++
+ // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
+ // not an error and must only be caught at EeScheduler::run().
+ struct EeDispatcherTransfer final
+@@ -349,8 +353,37 @@ public:
+     // EE timers and the IOP are owed are handed on in one go when one of them could act on them
+     // (flushHeldCycles), and the deadline / time slice checks go out of line when the EE clock
+     // reaches the earlier of the two (m_fastEndCycle) - the same answers at the same checkpoints.
++    // (FPS round 6, PS2X_LEAN_CHECKPOINT, on by default) The same answers at the same checkpoints with fewer steps:
++    // the scale read once (m_scaleNow: the override, else the default), the held cycles worked out from the clock
++    // (the clock less m_heldBase) instead of added up beside it, and one compare against m_stopAtCycle - the earlier
++    // of the held cycles' hand-over and the fast end - before the flags. Reaching it goes out of line
++    // (checkpointLeanSlow), which hands the held cycles on, then asks what the checkpoint always asked, in its order.
+     [[nodiscard]] PS2_FORCEINLINE bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+     {
++        if (g_ps2LeanCheckpoint) [[likely]]
++        {
++            const uint32_t scale = m_scaleNow.load(std::memory_order_relaxed);
++            if (scale < 256u)
++            {
++                const uint32_t scaled = cycles * scale + m_cycleRemainder;
++                m_cycleRemainder = scaled & 255u;
++                cycles = scaled >> 8;
++            }
++            if (cycles != 0u)
++            {
++                m_eeCycle += cycles;
++                if (m_countContext)
++                    m_countContext->cop0_count = static_cast<uint32_t>(m_eeCycle);
++            }
++            if (m_eeCycle >= m_stopAtCycle) [[unlikely]]
++                return checkpointLeanSlow(cycles != 0u);
++            if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
++            {
++                m_unwindingForCheckpoint = true;
++                return true;
++            }
++            return false;
++        }
+         const uint32_t override = m_cycleScaleOverride.load(std::memory_order_relaxed);
+         const uint32_t scale = override ? override : m_defaultScale256;
+         if (scale < 256u)
+@@ -381,7 +414,11 @@ public:
+     // and the point of the next hand-over worked out again.
+     void flushHeldCycles() noexcept;
+     // The next hand-over at the next checkpoint (an EE timer or the IOP may act sooner now).
+-    void invalidateHeldCycles() noexcept { m_heldLimit = 0u; }
++    void invalidateHeldCycles() noexcept
++    {
++        m_heldLimit = 0u;
++        updateStopAt();
++    }
+     [[nodiscard]] bool onExecutorThread() const noexcept { return std::this_thread::get_id() == m_executorThread; }
+     // A factor for the cycles executed guest code is charged (0: PS2X_EE_CYCLE_SCALE, 1 by
+     // default). Below 1 the EE runs faster than the console's: more code fits in a VBlank.
+@@ -556,17 +593,35 @@ private:
+         // between (a timer register, a call into the IOP, a save state) hands them on first
+         // (ps2EeFlushHeldCycles), and whatever moves their next point forward asks for the
+         // limit to be worked out again (ps2EeInvalidateHeldCycles).
++        // (Round 6, the lean checkpoint: the held cycles are the clock less m_heldBase, due at m_heldStopCycle.)
++        if (g_ps2LeanCheckpoint) [[likely]]
++        {
++            if (m_eeCycle >= m_heldStopCycle)
++                flushHeldCycles();
++            return;
++        }
+         m_heldCycles += elapsed;
+         if (m_heldCycles >= m_heldLimit)
+             flushHeldCycles();
+     }
+     // The checkpoint's out-of-line part: a deadline due by the EE clock, or the time slice over.
+     [[nodiscard]] bool checkpointDeadlineOrSlice() noexcept;
++    // (Round 6) The lean checkpoint's out-of-line part, once the clock reaches m_stopAtCycle: the held cycles
++    // handed on when they are due (and were just added to), then the flags, then the fast end - as checkpointDue.
++    [[nodiscard]] PS2_NOINLINE bool checkpointLeanSlow(bool accounted) noexcept;
++    // (Round 6) m_heldStopCycle and m_stopAtCycle again, after the held cycles' base or limit or the fast end moved.
++    void updateStopAt() noexcept
++    {
++        const uint64_t stop = m_heldBase + m_heldLimit;
++        m_heldStopCycle = stop < m_heldBase ? ~0ull : stop; // (a limit near the top: never)
++        m_stopAtCycle = m_heldStopCycle < m_fastEndCycle ? m_heldStopCycle : m_fastEndCycle;
++    }
+     // m_fastEndCycle again: the earlier of the next deadline and the time slice's end.
+     void refreshFastEnd() noexcept
+     {
+         const uint64_t next = m_nextDeadlineCycle.load(std::memory_order_relaxed);
+         m_fastEndCycle = (next != 0u && next < m_sliceEndCycle) ? next : m_sliceEndCycle;
++        updateStopAt();
+     }
+     // The running thread's time slice is over: another of its priority or above takes over,
+     // or the slice starts again.
+@@ -574,6 +629,12 @@ private:
+     uint64_t m_heldCycles = 0u;       // accounted, not yet handed to the EE timers / IOP
+     uint64_t m_heldLimit = 0u;        // ... handed on once they reach this (0: at the next checkpoint)
+     uint64_t m_fastEndCycle = 0u;     // min(next deadline, time slice end): below it nothing is due by the clock
++    // (Round 6, the lean checkpoint) The clock when the held cycles were last handed on (they are the clock less
++    // this), when they are due again (base + limit), and the earlier of that and the fast end.
++    uint64_t m_heldBase = 0u;
++    uint64_t m_heldStopCycle = 0u;
++    uint64_t m_stopAtCycle = 0u;
++    std::atomic<uint32_t> m_scaleNow{256u}; // the scale checkpoints charge now: the override, else the default
+     uint32_t m_cycleRemainder = 0u;   // (the cycle scale's fraction carried)
+     uint32_t m_defaultScale256 = 256u; // PS2X_EE_CYCLE_SCALE
+     bool m_unwindingForCheckpoint = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 4e664fe..6bd40e5 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -108,11 +108,19 @@ namespace
+     EeScheduler *g_heldCyclesScheduler = nullptr;
+ }
+ 
++// (FPS round 6) PS2X_LEAN_CHECKPOINT=0: the checkpoint and the held cycles as before round 6 (A/B).
++extern const bool g_ps2LeanCheckpoint = []()
++{
++    const char *env = std::getenv("PS2X_LEAN_CHECKPOINT");
++    return !env || *env != '0';
++}();
++
+ EeScheduler::EeScheduler(PS2Runtime &runtime)
+     : m_runtime(runtime)
+ {
+     g_heldCyclesScheduler = this;
+     m_defaultScale256 = cycleScale256();
++    m_scaleNow.store(m_defaultScale256, std::memory_order_relaxed);
+     if (const char *turbo = std::getenv("PS2X_TURBO_VSYNCS"))
+         m_turboUntilVSync = std::strtoull(turbo, nullptr, 10);
+     if (const char *load = std::getenv("PS2X_LOAD_STATE"); load && *load)
+@@ -236,7 +244,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_eeCycle = 0u;
+     m_heldCycles = 0u;
+     m_heldLimit = 0u;
++    m_heldBase = 0u;
+     m_sliceEndCycle = kDefaultTimeSliceCycles;
++    updateStopAt();
+     m_stopRequested.store(false, std::memory_order_release);
+     m_checkpointPending.store(false, std::memory_order_release);
+     m_debugPublishCountdown = 0u;
+@@ -518,8 +528,9 @@ void EeScheduler::postEvent(EeEvent event)
+ 
+ void EeScheduler::setCycleScale(double factor) noexcept
+ {
+-    m_cycleScaleOverride.store(factor > 0.0 ? static_cast<uint32_t>(std::clamp(factor, 0.05, 1.0) * 256.0 + 0.5) : 0u,
+-                               std::memory_order_relaxed);
++    const uint32_t override = factor > 0.0 ? static_cast<uint32_t>(std::clamp(factor, 0.05, 1.0) * 256.0 + 0.5) : 0u;
++    m_cycleScaleOverride.store(override, std::memory_order_relaxed);
++    m_scaleNow.store(override ? override : m_defaultScale256, std::memory_order_relaxed); // (round 6: the one read)
+ }
+ 
+ void EeScheduler::setVBlankPeriod(std::chrono::nanoseconds period) noexcept
+@@ -553,8 +564,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ 
+ void EeScheduler::flushHeldCycles() noexcept
+ {
+-    const uint64_t held = m_heldCycles;
++    // (Round 6, the lean checkpoint: the clock less the base at the last hand-over; the same count as the sum)
++    const uint64_t held = g_ps2LeanCheckpoint ? m_eeCycle - m_heldBase : m_heldCycles;
+     m_heldCycles = 0u;
++    m_heldBase = m_eeCycle;
+     PS2Memory &memory = m_runtime.memory();
+     if (held != 0u)
+     {
+@@ -574,6 +587,24 @@ void EeScheduler::flushHeldCycles() noexcept
+                                 ? memory.m_eeTimerDue - memory.m_eeTimerCycles
+                                 : 0u;
+     m_heldLimit = std::min(timers, ps2IopHeldHeadroom());
++    updateStopAt();
++}
++
++// (Round 6) The lean checkpoint once the clock has reached m_stopAtCycle: what checkpointDue asked, in its order -
++// the held cycles handed on if they are due (accountCyclesInline's test, only when cycles were just added), then
++// the flags, then the fast end and the deadline / time slice.
++bool EeScheduler::checkpointLeanSlow(bool accounted) noexcept
++{
++    if (accounted && m_eeCycle >= m_heldStopCycle)
++        flushHeldCycles();
++    if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
++    {
++        m_unwindingForCheckpoint = true;
++        return true;
++    }
++    if (m_eeCycle < m_fastEndCycle)
++        return false;
++    return checkpointDeadlineOrSlice();
+ }
+ 
+ bool EeScheduler::checkpointDeadlineOrSlice() noexcept
+@@ -2950,6 +2981,8 @@ void EeScheduler::loadState(ps2x::StateReader &in)
+     // (cycles held from the timeline before the load are not the loaded one's)
+     m_heldCycles = 0u;
+     m_heldLimit = 0u;
++    m_heldBase = m_eeCycle;
++    updateStopAt();
+     m_insideInterrupt = false;
+     m_unwindingForCheckpoint = false;
+     m_countContext = nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 3b86733..c2d54c5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1898,6 +1898,30 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++// (FPS round 6) The plain call: the switches a call looks at folded into one test made once - no hot-stats count,
++// the jal's table entry (PS2X_DIRECT_CALLS 1 or 2), the lean end (PS2X_DISPATCH_LEAN), no dispatch history
++// (PS2X_DISPATCH_HISTORY). PS2X_LEAN_CALL=0: dispatchGuestCall as in round 5 (A/B). PS2X_LEAN_BRANCH=0: a call by
++// dispatchGuestBranch (jalr, the decompiled functions' calls) through enterCall as before; with it on such a call
++// takes the lean begin and end too (what dispatchGuestCall does with its table entry: the target looked up as
++// before, its level kept, the common end in place, callEnd for the rest - the target as the call's entry, as
++// enterCall's entryPc is).
++namespace
++{
++    bool envOff(const char *name)
++    {
++        const char *env = std::getenv(name);
++        return env && *env == '0';
++    }
++    bool envOn(const char *name)
++    {
++        const char *env = std::getenv(name);
++        return env && *env == '1';
++    }
++    const bool g_plainSwitches = !g_ps2HotStats && !envOff("PS2X_DISPATCH_LEAN") && !envOn("PS2X_DISPATCH_HISTORY");
++    const bool g_plainCalls = g_plainSwitches && !envOff("PS2X_LEAN_CALL") && !envOff("PS2X_DIRECT_CALLS");
++    const bool g_plainBranchCalls = g_plainSwitches && !envOff("PS2X_LEAN_BRANCH");
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1906,6 +1930,31 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      GuestBranchKind kind,
+                                      const char *debugName)
+ {
++    if (g_plainBranchCalls && (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall)) [[likely]]
++    {
++        // (round 6) the call's checkpoint as below, then the lean begin and end
++        ctx->pc = targetPc;
++        if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++            return false;
++        const RecompiledFunction fn = callTarget(g_dispatchThread, targetPc);
++        if (!fn) [[unlikely]]
++            return enterCall(rdram, ctx, fn, targetPc, sourcePc, fallthroughPc, kind, debugName); // (the report)
++        Ps2DispatchLevels &levels = g_ps2DispatchLevels;
++        const uint32_t level = levels.level + 1u;
++        levels.level = level;
++        if (level < kDispatchLevels) [[likely]]
++            levels.resumedByDispatcher[level] = false;
++        fn(rdram, ctx, this);
++        if (ctx->pc == fallthroughPc && !isStopRequested() && !(level < kDispatchLevels && levels.resumedByDispatcher[level]))
++            [[likely]]
++        {
++            if (m_eeScheduler)
++                m_eeScheduler->clearCheckpointUnwind();
++            --levels.level;
++            return true;
++        }
++        return callEnd(rdram, ctx, targetPc, fallthroughPc, level);
++    }
+     if (g_ps2HotStats) hotNoteCall(targetPc, true);
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+@@ -2019,6 +2068,28 @@ bool PS2Runtime::dispatchGuestCall(uint8_t *rdram,
+                                    uint32_t fallthroughPc,
+                                    RecompiledFunction targetFn)
+ {
++    if (g_plainCalls && targetFn) [[likely]]
++    {
++        // (FPS round 6) the plain call: one test of the switches (above), then what the lean way below does
++        ctx->pc = targetPc;
++        if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++            return false;
++        Ps2DispatchLevels &levels = g_ps2DispatchLevels;
++        const uint32_t level = levels.level + 1u;
++        levels.level = level;
++        if (level < kDispatchLevels) [[likely]]
++            levels.resumedByDispatcher[level] = false;
++        targetFn(rdram, ctx, this);
++        if (ctx->pc == fallthroughPc && !isStopRequested() && !(level < kDispatchLevels && levels.resumedByDispatcher[level]))
++            [[likely]]
++        {
++            if (m_eeScheduler)
++                m_eeScheduler->clearCheckpointUnwind();
++            --levels.level;
++            return true;
++        }
++        return callEnd(rdram, ctx, targetPc, fallthroughPc, level);
++    }
+     if (g_ps2HotStats) hotNoteCall(targetPc, false);
+     if (g_ps2DirectCalls == 0 || !targetFn) [[unlikely]]
+         return dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, GuestBranchKind::DirectCall, "JAL");

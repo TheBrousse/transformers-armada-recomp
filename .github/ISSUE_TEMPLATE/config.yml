@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Player guide and troubleshooting
+    url: https://github.com/kayliox/transformers-armada-recomp/blob/main/docs/TROUBLESHOOTING.md
+    about: Common problems and their fixes.

@@ -1,0 +1,303 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_host_display.h b/ps2xRuntime/include/runtime/ps2_host_display.h
+index d78b10b..a41f5fb 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -130,6 +130,23 @@ namespace ps2_host_display
+     // itself wrote). On (true) by default.
+     void setEmulatedDrawing(bool on);
+     bool emulatedDrawing();
++    // (Roadmap N4) The emulated drawing off and the GS left with local memory alone: no draw state, CLUT load,
++    // primitive or picture reaches its renderers (the GS front end sends none, the GS thread takes uploads, local
++    // writes, transfers and read-backs only). PS2X_GS_NATIVE_IDLE=0: the renderers fed as before.
++    bool gsNativeAlone();
++    // (Roadmap N3b) The GS packets that reach the GS while the native renderer draws alone, handed to an observer of
++    // its own (on the thread feeding the GS) - what a game draws outside the frames the native renderer captures (a
++    // load screen of its own). Native meshes are not handed over.
++    using GifObserver = void (*)(const uint8_t *data, uint32_t bytes);
++    void setGifObserver(GifObserver observer);
++    GifObserver gifObserver();
++    // (A checking aid: the packets handed over with the emulated drawing on too - the same screen drawn both ways.)
++    void setGifObserverAlways(bool always);
++    bool gifObserverAlways();
++    // (Native meshes - VU1's own output in the runtime's packed form - handed over too, as the packet of their first
++    // field, while the observer asks for them: the screen it draws needs them, and making the packet costs.)
++    void setGifObserverMeshes(bool meshes);
++    bool gifObserverMeshes();
+ 
+     // Interlaced field mode: which field each VBlank shows. -1 (the default): the VBlank's, as
+     // the console scans out. 0 or 1: always the field of the even or of the odd buffer rows,
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5c75138..8b2451b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1288,6 +1288,31 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
++    // (N3b: what reaches the GS while a native renderer draws alone, to its observer)
++    if (const ps2_host_display::GifObserver observe = ps2_host_display::gifObserver())
++        if (ps2_host_display::gsNativeAlone() || ps2_host_display::gifObserverAlways())
++        {
++            if (!gsmesh::isMesh(data, sizeBytes))
++                observe(data, sizeBytes);
++            else if (ps2_host_display::gifObserverMeshes())
++            {
++                gsmesh::Header header{};
++                if (gsmesh::readHeader(data, sizeBytes, header) && header.fields > 0u)
++                {
++                    thread_local std::vector<uint8_t> observed;
++                    meshFieldPacket(data, header, 0u, observed);
++                    static int told = std::getenv("TF_NATIVE_LOOSELOG_AT") ? 3 : 0; // (debug: the first few seen)
++                    if (told > 0)
++                    {
++                        --told;
++                        std::fprintf(stderr, "[gs] a native mesh handed to the observer: %u fields, %u vertices, %zu bytes\n", header.fields,
++                                     header.count, observed.size());
++                    }
++                    if (observed.size() >= 16u)
++                        observe(observed.data(), static_cast<uint32_t>(observed.size()));
++                }
++            }
++        }
+ 
+     // A native mesh (runtime/gs/gs_native_mesh.h): per field its tags and register writes go
+     // through as the packet's do (PRIM from the vertex tag), the draw state as a kick that
+@@ -1316,7 +1341,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+                                           gsmesh::loadLE64(tags + 16u * (k + 1u)));
+                 m_curQ = 1.0f;
+                 writeRegisterUnlocked(GS_REG_PRIM, (gsmesh::loadLE64(gsmesh::vertexTag(data, f)) >> 47) & 0x7FFu);
+-                if (m_drawStateDirty || m_drawStateShownField != ps2_host_display::shownField())
++                if (!ps2_host_display::gsNativeAlone() && (m_drawStateDirty || m_drawStateShownField != ps2_host_display::shownField()))
+                     refreshDrawState();
+                 if (m_drawsLeftOut || !ps2_host_display::emulatedDrawing())
+                     ++t_meshStats.leftOut;
+@@ -2032,7 +2057,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        if (!ps2_host_display::gsNativeAlone()) // (N4: no CLUT loads while the native renderer draws alone)
++            m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_CLAMP_1:
+@@ -2064,7 +2090,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        if (!ps2_host_display::gsNativeAlone()) // (N4: no CLUT loads while the native renderer draws alone)
++            m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_XYOFFSET_1:
+@@ -2353,7 +2380,7 @@ void GS::vertexKick(bool drawing)
+     if (m_vtxCount < needed)
+         return;
+ 
+-    if (drawing && m_backend)
++    if (drawing && m_backend && !ps2_host_display::gsNativeAlone()) // (N4: no draw state sent while the native renderer draws alone)
+     {
+         if (m_drawStateDirty || m_drawStateShownField != ps2_host_display::shownField())
+             refreshDrawState();
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index e0b6e3f..f9be701 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -21,6 +21,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <type_traits>
+ 
+ namespace
+@@ -777,6 +778,11 @@ void GSThreadedBackend::run()
+     };
+     static const char *const kOpNames[] = {"wrap", "submit", "clut", "transfer", "upload", "texture flush", "local write",
+                                            "present", "capture", "state", "primitives", "download", "mesh"};
++    // (Roadmap N4: ps2_host_display::gsNativeAlone - the native renderer draws alone, the GS keeps local memory. PS2X_GS_NATIVE_LOG=1: every 10 s, the records taken while alone, by kind.)
++    bool aloneBefore = false;
++    static const bool aloneLog = std::getenv("PS2X_GS_NATIVE_LOG") && *std::getenv("PS2X_GS_NATIVE_LOG") != '0';
++    uint64_t aloneCounts[16] = {};
++    auto aloneSince = std::chrono::steady_clock::now();
+     for (;;)
+     {
+         uint64_t published = m_published.load();
+@@ -796,7 +802,7 @@ void GSThreadedBackend::run()
+         }
+         if (published == readPos)
+         {
+-            if (m_gpu)
++            if (m_gpu && !ps2_host_display::gsNativeAlone())
+             {
+                 const auto since = stallMs > 0.0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                 m_gpu->idle(); // (the producer paused: what is drawn goes to the GPU now)
+@@ -819,6 +825,101 @@ void GSThreadedBackend::run()
+             const void *payload = record + 1;
+             // The GPU draws alone once it is up; until then (no window yet) the software renderer
+             // does, and the GPU starts from its local memory.
++            const bool alone = ps2_host_display::gsNativeAlone();
++            if (alone != aloneBefore)
++            {
++                aloneBefore = alone;
++                // (back from drawing alone: the GPU renderer's copies of local memory are stale - it reloads them)
++                if (!alone && m_gpu)
++                    m_gpu->invalidate();
++                std::fprintf(stderr, "[gs] %s\n", alone ? "the native renderer draws alone: the GS keeps local memory only (N4)"
++                                                        : "the emulated drawing is back: the GS draws again");
++            }
++            if (alone)
++            {
++                if (aloneLog)
++                {
++                    ++aloneCounts[static_cast<uint32_t>(record->op) & 15u];
++                    const auto now = std::chrono::steady_clock::now();
++                    if (now - aloneSince >= std::chrono::seconds(10))
++                    {
++                        std::string line;
++                        for (uint32_t k = 0; k < 16u && k < std::size(kOpNames); ++k)
++                            if (aloneCounts[k])
++                                line += std::string(" ") + kOpNames[k] + " " + std::to_string(aloneCounts[k]);
++                        std::fprintf(stderr, "[gs] alone, 10 s:%s\n", line.c_str());
++                        std::fill(std::begin(aloneCounts), std::end(aloneCounts), 0u);
++                        aloneSince = now;
++                    }
++                }
++                switch (record->op)
++                {
++                case Op::BeginTransfer:
++                {
++                    const auto &c = *static_cast<const GSTransferCommand *>(payload);
++                    // (PS2X_GS_NATIVE_LOG=2: the large transfers too - a movie's pictures, a target's copy)
++                    static const bool big = std::getenv("PS2X_GS_NATIVE_LOG") && *std::getenv("PS2X_GS_NATIVE_LOG") == '2';
++                    static uint32_t told = 0u;
++                    if (big && c.trxreg.rrw >= 256u && told < 400u)
++                    {
++                        ++told;
++                        std::fprintf(stderr, "[gs] transfer dir %u: %ux%u src bp %x bw %u psm %x at %u,%u -> dst bp %x bw %u psm %x at %u,%u\n",
++                                     c.direction, c.trxreg.rrw, c.trxreg.rrh, c.bitbltbuf.sbp, c.bitbltbuf.sbw, c.bitbltbuf.spsm, c.trxpos.ssax,
++                                     c.trxpos.ssay, c.bitbltbuf.dbp, c.bitbltbuf.dbw, c.bitbltbuf.dpsm, c.trxpos.dsax, c.trxpos.dsay);
++                    }
++                    m_inner->BeginTransfer(c);
++                    break;
++                }
++                case Op::UploadImage:
++                {
++                    const auto *upload = static_cast<const UploadPayload *>(payload);
++                    m_inner->UploadImage(reinterpret_cast<const uint8_t *>(upload + 1), upload->bytes);
++                    break;
++                }
++                case Op::TextureFlush:
++                    m_inner->TextureFlush();
++                    break;
++                case Op::WriteVram:
++                {
++                    const auto *write = static_cast<const WriteVramPayload *>(payload);
++                    m_inner->WriteVram(write->psm, write->base, write->bw, write->x, write->y, write->value);
++                    break;
++                }
++                case Op::Present:
++                {
++                    // (no picture: the window shows the native renderer's; the host display learns this VBlank's is there)
++                    static const std::vector<uint8_t> none;
++                    ps2_host_display::publish(static_cast<const GSPresentationRequest *>(payload)->vsyncTick, none, 0u, 0u, 0u, false, 0u);
++                    break;
++                }
++                case Op::Capture:
++                {
++                    const auto *capture = static_cast<const CapturePayload *>(payload);
++                    const uint64_t number = capture->number;
++                    if (m_cpu)
++                    {
++                        m_cpu->CaptureQueued(capture->command, [this, number](std::vector<uint8_t> &&bytes)
++                                             {
++                                                 std::lock_guard<std::mutex> lock(m_captureMutex);
++                                                 m_capturedBytes = static_cast<uint32_t>(std::min<size_t>(bytes.size(), kCaptureBytes));
++                                                 m_captured.assign(bytes.begin(), bytes.begin() + m_capturedBytes);
++                                                 captureTaken(number); });
++                        break;
++                    }
++                    m_inner->BeginTransfer(capture->command);
++                    std::lock_guard<std::mutex> lock(m_captureMutex);
++                    m_captured.resize(kCaptureBytes);
++                    m_capturedBytes = m_inner->ConsumeLocalToHostBytes(m_captured.data(), kCaptureBytes);
++                    captureTaken(number);
++                    break;
++                }
++                default: // (submit, state, primitives, CLUT loads, meshes, GPU downloads: drawing work - none)
++                    break;
++                }
++                readPos += record->bytes;
++                m_consumed.store(readPos, std::memory_order_release);
++                continue;
++            }
+             const bool gpuOnly = m_gpuOnly && m_gpu->ready();
+             if (gpuOnly && !m_meshesReady.load(std::memory_order_relaxed))
+                 m_meshesReady.store(true, std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index b2772b2..a4b888a 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -717,6 +717,61 @@ namespace ps2_host_display
+         return g_emulatedDrawing.load(std::memory_order_acquire);
+     }
+ 
++    namespace
++    {
++        std::atomic<GifObserver> g_gifObserver{nullptr};
++    }
++
++    void setGifObserver(GifObserver observer)
++    {
++        g_gifObserver.store(observer, std::memory_order_release);
++    }
++
++    GifObserver gifObserver()
++    {
++        return g_gifObserver.load(std::memory_order_acquire);
++    }
++
++    namespace
++    {
++        std::atomic<bool> g_gifObserverAlways{false};
++    }
++
++    void setGifObserverAlways(bool always)
++    {
++        g_gifObserverAlways.store(always, std::memory_order_release);
++    }
++
++    bool gifObserverAlways()
++    {
++        return g_gifObserverAlways.load(std::memory_order_acquire);
++    }
++
++    namespace
++    {
++        std::atomic<bool> g_gifObserverMeshes{false};
++    }
++
++    void setGifObserverMeshes(bool meshes)
++    {
++        g_gifObserverMeshes.store(meshes, std::memory_order_release);
++    }
++
++    bool gifObserverMeshes()
++    {
++        return g_gifObserverMeshes.load(std::memory_order_acquire);
++    }
++
++    bool gsNativeAlone()
++    {
++        static const bool allowed = []()
++        {
++            const char *e = std::getenv("PS2X_GS_NATIVE_IDLE");
++            return !(e && *e == '0');
++        }();
++        return allowed && !g_emulatedDrawing.load(std::memory_order_acquire);
++    }
++
+     namespace
+     {
+         uint64_t g_pictureCount = 0u; // (under g_mutex)

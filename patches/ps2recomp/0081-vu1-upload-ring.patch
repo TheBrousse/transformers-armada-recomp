@@ -1,0 +1,220 @@
+Subject: [PATCH] Runtime: VU1's last microcode uploads and program starts, dumped on a reserved instruction
+
+Always on, a few stores each: the last 256 MPG uploads that changed VU1's code (with an FNV hash of their bytes) or were
+dropped (their data past the transfer) - an unchanged upload counted on the newest entry for the same place - and the last
+256 program starts (MSCAL / MSCALF / MSCNT, a run of the same start counted on one entry), one sequence number ordering
+both. When VU1 meets a reserved instruction (the fast engine's report or the reference interpreter's), they are written
+to runs/vu1_uploads_<n>.txt (the first 4 times in a session) with the code around the pc, beside PS2X_VU1_HISTORY's
+vu1_history.txt (which records every instruction and so stays off).
+
+For Transformers (TODO 185 b): a player's game stopped after a warp tunnel in which VU1 kept starting at 0x270 / 0x1408
+on words 0xFFFFFFFB; not reproduced in eight tunnels on the test PC - the next one shows what wrote that code.
+
+ps2xRuntime:
+- ps2_vif1_interpreter.cpp: the two rings, filled at MPG / MSCAL / MSCALF / MSCNT; ps2Vu1RingDump.
+- vu/ps2_vu1_fast.cpp, vu/ps2_vu1_core.cpp: the reserved-instruction reports call it.
+
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 062348a3915204c9e5eda2fd1e6c8f23fc3775ce..c67ac44c5201d05b9e1a8154cd9fb24271ebe907 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_vif1_thread.h"
+ #include <cstring>
++#include <string>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -324,6 +325,112 @@ bool g_ps2VifTraceActive = false;
+ bool ps2Vu1WatchHit(uint32_t qword); // PS2X_VU1_WATCH (ps2_vu1_core.cpp)
+ void ps2Vu1HistoryUnpack(uint32_t qword, uint32_t count); // PS2X_VU1_HISTORY (ps2_vu1_core.cpp)
+ 
++// VU1's microcode uploads and program starts, the last 256 of each (always on, a few stores each): what wrote the code
++// a program then ran, when VU1 meets a reserved instruction - ps2Vu1RingDump writes them to runs/vu1_uploads_<n>.txt
++// (the first 4 times in a session), beside PS2X_VU1_HISTORY's vu1_history.txt. Uploads: every MPG that changed the
++// code (with an FNV hash of its bytes) or was dropped (its data past the transfer); an unchanged upload only counted on
++// the last entry for the same place. Program starts: MSCAL / MSCALF / MSCNT, a run of the same start counted on one
++// entry. One sequence number orders both.
++namespace
++{
++    struct Vu1RingEntry
++    {
++        uint64_t seq;
++        uint32_t kind; // uploads: 0 changed, 1 dropped; starts: 0 MSCAL, 1 MSCALF, 2 MSCNT
++        uint32_t addr; // the code address (uploads: where; starts: the pc, ~0 for MSCNT)
++        uint32_t bytes;
++        uint32_t first;
++        uint32_t hash;
++        uint32_t count; // the same again (uploads unchanged since, starts repeated)
++        uint64_t lastSeq;
++    };
++    constexpr uint32_t kVu1Ring = 256u;
++    Vu1RingEntry g_vu1Uploads[kVu1Ring] = {}, g_vu1Starts[kVu1Ring] = {};
++    uint32_t g_vu1UploadsAt = 0u, g_vu1StartsAt = 0u;
++    uint64_t g_vu1RingSeq = 0u;
++
++    void vu1RingUpload(uint32_t kind, uint32_t addr, const uint8_t *data, uint32_t bytes)
++    {
++        const uint64_t seq = ++g_vu1RingSeq;
++        uint32_t hash = 2166136261u;
++        for (uint32_t i = 0; i < bytes; ++i)
++            hash = (hash ^ data[i]) * 16777619u;
++        uint32_t first = 0u;
++        if (bytes >= 4u)
++            std::memcpy(&first, data, 4u);
++        g_vu1Uploads[g_vu1UploadsAt++ % kVu1Ring] = Vu1RingEntry{seq, kind, addr, bytes, first, hash, 1u, seq};
++    }
++    // (an upload that changed nothing: the newest entry for that place counts it; otherwise no entry)
++    void vu1RingSame(uint32_t addr)
++    {
++        const uint64_t seq = ++g_vu1RingSeq;
++        if (g_vu1UploadsAt == 0u)
++            return;
++        Vu1RingEntry &e = g_vu1Uploads[(g_vu1UploadsAt - 1u) % kVu1Ring];
++        if (e.addr == addr)
++            ++e.count, e.lastSeq = seq;
++    }
++    void vu1RingStart(uint32_t kind, uint32_t pc)
++    {
++        const uint64_t seq = ++g_vu1RingSeq;
++        if (g_vu1StartsAt != 0u)
++        {
++            Vu1RingEntry &e = g_vu1Starts[(g_vu1StartsAt - 1u) % kVu1Ring];
++            if (e.kind == kind && e.addr == pc)
++            {
++                ++e.count, e.lastSeq = seq;
++                return;
++            }
++        }
++        g_vu1Starts[g_vu1StartsAt++ % kVu1Ring] = Vu1RingEntry{seq, kind, pc, 0u, 0u, 0u, 1u, seq};
++    }
++}
++
++void ps2Vu1RingDump(const char *reason, uint32_t pc, const uint8_t *code)
++{
++    static int dumps = 0;
++    if (dumps >= 4)
++        return;
++    const std::string name = "runs/vu1_uploads_" + std::to_string(++dumps) + ".txt";
++    std::FILE *file = std::fopen(name.c_str(), "w");
++    if (!file)
++        return;
++    std::fprintf(file, "%s at pc %04x (sequence %llu)\n", reason, pc, static_cast<unsigned long long>(g_vu1RingSeq));
++    if (code)
++    {
++        std::fprintf(file, "code around it:");
++        for (uint32_t a = (pc & 0x3FF8u) >= 32u ? (pc & 0x3FF8u) - 32u : 0u; a < (pc & 0x3FF8u) + 40u && a < 0x4000u; a += 4u)
++        {
++            uint32_t w = 0u;
++            std::memcpy(&w, code + a, 4u);
++            std::fprintf(file, "%s%08x", (a & 7u) ? " " : (a % 32u == 0u ? "\n  " : "  "), w);
++        }
++        std::fprintf(file, "\n");
++    }
++    std::fprintf(file, "uploads (oldest first): seq kind dest bytes first hash [unchanged again, to seq]\n");
++    for (uint32_t i = g_vu1UploadsAt > kVu1Ring ? g_vu1UploadsAt - kVu1Ring : 0u; i < g_vu1UploadsAt; ++i)
++    {
++        const Vu1RingEntry &e = g_vu1Uploads[i % kVu1Ring];
++        std::fprintf(file, "  %llu %s %04x %u %08x %08x", static_cast<unsigned long long>(e.seq), e.kind ? "DROPPED" : "changed", e.addr, e.bytes,
++                     e.first, e.hash);
++        if (e.count > 1u)
++            std::fprintf(file, " [%u, to %llu]", e.count - 1u, static_cast<unsigned long long>(e.lastSeq));
++        std::fprintf(file, "\n");
++    }
++    std::fprintf(file, "program starts (oldest first): seq kind pc [times, to seq]\n");
++    for (uint32_t i = g_vu1StartsAt > kVu1Ring ? g_vu1StartsAt - kVu1Ring : 0u; i < g_vu1StartsAt; ++i)
++    {
++        const Vu1RingEntry &e = g_vu1Starts[i % kVu1Ring];
++        std::fprintf(file, "  %llu %s %04x", static_cast<unsigned long long>(e.seq), e.kind == 0u ? "MSCAL" : e.kind == 1u ? "MSCALF" : "MSCNT",
++                     e.addr);
++        if (e.count > 1u)
++            std::fprintf(file, " [%u, to %llu]", e.count, static_cast<unsigned long long>(e.lastSeq));
++        std::fprintf(file, "\n");
++    }
++    std::fclose(file);
++    std::fprintf(stderr, "[VU1] %s at pc %04x: its last microcode uploads and program starts in %s\n", reason, pc, name.c_str());
++}
++
+ namespace
+ {
+     // ----------------------------------------------------------------------------------
+@@ -673,6 +780,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
+         {
+             uint32_t startPC = (uint32_t)imm * 8u;
++            vu1RingStart(opcode == VIF_MSCAL ? 0u : 1u, startPC);
+ 
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
+@@ -692,6 +800,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (opcode == VIF_MSCNT)
+         {
++            vu1RingStart(2u, ~0u);
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
+             vif1_regs.top = runTop;
+@@ -753,12 +862,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                         markVU1CodeModified();
+                         ++g_ps2VifMpgChanged;
++                        vu1RingUpload(0u, destAddr, data + pos, copyBytes);
+                     }
++                    else
++                        vu1RingSame(destAddr);
+                     ++g_ps2VifMpgUploads;
+                 }
+                 else
+                 {
+                     ++g_ps2VifMpgDropped;
++                    vu1RingUpload(1u, destAddr, data + pos, static_cast<uint32_t>(std::min<uint64_t>(copyBytes, sizeBytes > pos ? sizeBytes - pos : 0u)));
+                 }
+             }
+             pos += mpgBytes;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a59f3f8afcf52ca4fcc45bd07b0cde0ad86f8903..f7dbfa30fb33f789f0d6c8d9c758e9f9ed97a784 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -16,6 +16,8 @@
+ #include <limits>
+ #include <ps2_log.h>
+ 
++void ps2Vu1RingDump(const char *reason, uint32_t pc, const uint8_t *code); // (ps2_vif1_interpreter.cpp: the last microcode uploads and program starts)
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -1901,7 +1903,10 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
+               << " instruction=0x" << instruction
+               << std::dec << '\n');
+     if (m_unit == Unit::VU1)
++    {
+         vu1HistoryDump(upper ? "reserved upper" : "reserved lower", m_state.pc);
++        ps2Vu1RingDump(upper ? "a reserved upper instruction" : "a reserved lower instruction", m_state.pc, nullptr);
++    }
+     m_stopRequested = true;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+index 8edbad86f36bae3d153f51094c7e3177b003aabf..60962343d358d574f3fff5c34cd2f267ac0ecf3d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+@@ -47,6 +47,8 @@
+ #include <xbyak/xbyak_util.h>
+ #endif
+ 
++void ps2Vu1RingDump(const char *reason, uint32_t pc, const uint8_t *code); // (ps2_vif1_interpreter.cpp: the last microcode uploads and program starts)
++
+ // XGKICK statistics shared with the reference interpreter (ps2_vu1_core.cpp).
+ extern uint64_t g_ps2Vu1XgkickPackets;
+ extern uint64_t g_ps2Vu1XgkickBytes;
+@@ -2311,6 +2313,8 @@ namespace
+             std::fprintf(stderr, "[VU1 fast reserved %s] pc=0x%x instruction=0x%x\n",
+                          upper ? "upper" : "lower", e.st->pc, instruction);
+             e.reservedReported = true;
++            ps2Vu1RingDump(upper ? "a reserved upper instruction (fast engine)" : "a reserved lower instruction (fast engine)", e.st->pc,
++                           e.decodedCode);
+ 
+             static const bool dump = std::getenv("PS2X_VU1_RESERVED_DUMP") != nullptr;
+             static std::vector<uint64_t> dumped;

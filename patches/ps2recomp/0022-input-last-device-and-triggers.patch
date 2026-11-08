@@ -1,0 +1,158 @@
+Subject: [PATCH] Input: the device used last, and the gamepad's triggers
+
+ps2_host_input::lastDevice() tells the gamepad from the keyboard and
+mouse by the last input each pad read saw (a gamepad's button or a stick
+past half way; a key or mouse button of the layout, or the mouse moving
+the view); before any input, the gamepad when one is connected.
+setKeyboardPrompts / keyboardPromptsShown switch the keyboard's button
+prompts (a texture pack's keyboard/ folder) on and off.
+gamepadTriggers() gives L2 and R2 from 0 to 1 (analog where the pad has
+them) for game code that drives with them.
+---
+ ps2xRuntime/include/runtime/ps2_host_input.h | 20 ++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp              | 69 ++++++++++++++++++++
+ 2 files changed, 89 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_input.h b/ps2xRuntime/include/runtime/ps2_host_input.h
+index a060da4..825c737 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_input.h
++++ b/ps2xRuntime/include/runtime/ps2_host_input.h
+@@ -65,6 +65,26 @@ namespace ps2_host_input
+     std::string keyName(int code);         // a raylib key code, or mouseButtonCode's
+     int keyCode(const std::string &name);  // -1: no such key
+     int mouseButtonCode(int button);       // a raylib mouse button as a code of the layout
++
++    // The device the player used last, as the pad is read: a gamepad (a button, a trigger, a
++    // stick past half way) or the keyboard and mouse (a key or button of the layout, the mouse
++    // moving the view). Before any input: the gamepad when one is connected, else the keyboard.
++    // For button prompts that follow the device (a texture pack's keyboard/ folder: below).
++    enum class Device
++    {
++        Keyboard,
++        Gamepad
++    };
++    Device lastDevice();
++    // The texture pack's replacements in its keyboard/ folder (the button prompts as keys) are
++    // used while this is on and the keyboard is the last device (on by default).
++    void setKeyboardPrompts(bool on);
++    bool keyboardPromptsShown();
++
++    // The gamepad's own L2 and R2 at the last pad read, 0..1 (analog where the pad's triggers are,
++    // else 0 or 1), for game code that drives with them (a vehicle's throttle and brake): false
++    // while no gamepad is connected or the game takes no input.
++    bool gamepadTriggers(float &l2, float &r2);
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 5ec5436..ef15993 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -129,6 +129,14 @@ namespace
+     std::atomic<float> g_mouseStickX{0.0f};      // -1..1, right and down positive
+     std::atomic<float> g_mouseStickY{0.0f};
+ 
++    // The device the player used last (ps2_host_input::lastDevice): -1 before any input, else a
++    // ps2_host_input::Device. Written by the pad backend, read by the texture pack.
++    std::atomic<int> g_lastDevice{-1};
++    std::atomic<bool> g_gamepadConnected{false};
++    std::atomic<bool> g_keyboardPrompts{true};
++    std::atomic<float> g_gamepadL2{0.0f}, g_gamepadR2{0.0f}; // (ps2_host_input::gamepadTriggers)
++    std::atomic<bool> g_gamepadLive{false};
++
+     // Travel not yet taken by game code that maps the mouse itself (takeMouseTravel).
+     std::atomic<bool> g_mouseMappedByGame{false};
+     std::mutex g_mouseTravelMutex;
+@@ -431,6 +439,28 @@ namespace ps2_host_input
+         g_gameInputBlocked.store(blocked, std::memory_order_relaxed);
+     }
+ 
++    Device lastDevice()
++    {
++        const int d = g_lastDevice.load(std::memory_order_relaxed);
++        if (d >= 0)
++            return static_cast<Device>(d);
++        return g_gamepadConnected.load(std::memory_order_relaxed) ? Device::Gamepad : Device::Keyboard;
++    }
++
++    void setKeyboardPrompts(bool on) { g_keyboardPrompts.store(on, std::memory_order_relaxed); }
++
++    bool gamepadTriggers(float &l2, float &r2)
++    {
++        l2 = g_gamepadL2.load(std::memory_order_relaxed);
++        r2 = g_gamepadR2.load(std::memory_order_relaxed);
++        return g_gamepadLive.load(std::memory_order_relaxed);
++    }
++
++    bool keyboardPromptsShown()
++    {
++        return g_keyboardPrompts.load(std::memory_order_relaxed) && lastDevice() == Device::Keyboard;
++    }
++
+     void setMouseSensitivity(float sensitivity)
+     {
+         g_mouseSensitivity.store(std::max(0.0f, sensitivity), std::memory_order_relaxed);
+@@ -678,6 +708,33 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+     }
+ 
++    // The triggers as the pad has them (gamepadTriggers).
++    {
++        float l2 = 0.0f, r2 = 0.0f;
++        const auto trigger = [](float axis) { return std::clamp((axis + 1.0f) * 0.5f, 0.0f, 1.0f); }; // (GLFW: -1 released .. 1)
++        if (sonyPad)
++        {
++            l2 = std::max(static_cast<float>(sony.l2) / 255.0f, ps2x::sonypad::gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2) ? 1.0f : 0.0f);
++            r2 = std::max(static_cast<float>(sony.r2) / 255.0f, ps2x::sonypad::gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2) ? 1.0f : 0.0f);
++        }
++        else if (gamepad >= 0)
++        {
++            l2 = std::max(trigger(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER)),
++                          IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2) ? 1.0f : 0.0f);
++            r2 = std::max(trigger(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER)),
++                          IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2) ? 1.0f : 0.0f);
++        }
++        g_gamepadL2.store(l2, std::memory_order_relaxed);
++        g_gamepadR2.store(r2, std::memory_order_relaxed);
++        g_gamepadLive.store(sonyPad || gamepad >= 0, std::memory_order_relaxed);
++    }
++
++    // What the gamepad does this read (the device the player uses: lastDevice).
++    const bool gamepadConnected = sonyPad || gamepad >= 0;
++    const bool gamepadUsed = btns != 0xFFFFu || std::fabs(lx) > 0.5f || std::fabs(ly) > 0.5f || std::fabs(rx) > 0.5f ||
++                             std::fabs(ry) > 0.5f;
++    bool keyboardUsed = false;
++
+     // Keyboard and mouse buttons, on top of the gamepad: the layout (kDefaultKeymap, PS2X_KEYMAP,
+     // ps2_host_input::setKeyBindings). Keys while the window takes input, mouse buttons once the
+     // mouse belongs to the game.
+@@ -703,7 +760,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             {
+                 const int code = codes[input][c];
+                 if (code >= kMouseCode ? (mouseButtons && IsMouseButtonDown(code - kMouseCode)) : (live && IsKeyDown(code)))
++                {
++                    keyboardUsed = true;
+                     return true;
++                }
+             }
+             return false;
+         };
+@@ -736,9 +796,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         {
+             rx = mouseX;
+             ry = mouseY;
++            keyboardUsed = true;
+         }
+     }
+ 
++    // The last device used: a key this read wins over a gamepad held from before only when the
++    // gamepad is idle (both at once: the gamepad, which the player is more likely holding).
++    g_gamepadConnected.store(gamepadConnected, std::memory_order_relaxed);
++    if (gamepadUsed)
++        g_lastDevice.store(static_cast<int>(ps2_host_input::Device::Gamepad), std::memory_order_relaxed);
++    else if (keyboardUsed)
++        g_lastDevice.store(static_cast<int>(ps2_host_input::Device::Keyboard), std::memory_order_relaxed);
++
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     data[4] = axisByte(rx);

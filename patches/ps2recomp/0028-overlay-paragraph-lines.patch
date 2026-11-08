@@ -1,0 +1,31 @@
+Subject: [PATCH] Widescreen overlays: a paragraph's lines kept together
+
+Text is drawn a letter at a time; a line's letters overlap and its lines do not, so a short last line in the 4:3 picture's outer quarter was a group of its own and went to the screen's edge. Letters of about one size one under the other less than 1.25 of their height apart now group.
+---
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 69289ca..88dd2a7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -203,9 +203,18 @@ namespace
+         return anchor == 1 ? "left" : (anchor == 2 ? "right" : "middle");
+     }
+ 
++    // Overlapping - or, for two letters of about one size (at most 40 rows, within 1.5x of each
++    // other), one under the other less than 1.25 of their height apart: a paragraph's lines are
++    // one group. Text is drawn a letter at a time, a line's letters overlapping each other and
++    // its lines not (the boot's legal and memory card screens: letters 13 rows, lines 26 apart),
++    // so a short last line in the 4:3 picture's outer quarter ("owners.", "slot 1.") went to the
++    // edge alone, away from its paragraph. (HUD pieces, bigger, only by overlapping.)
+     bool overlapping(const PlacedOverlay &a, const PlacedOverlay &b)
+     {
+-        return a.x0 <= b.x1 && a.x1 >= b.x0 && a.y0 <= b.y1 && a.y1 >= b.y0;
++        const float ha = a.y1 - a.y0, hb = b.y1 - b.y0;
++        const bool letters = ha > 0.0f && hb > 0.0f && std::max(ha, hb) <= 40.0f && std::max(ha, hb) <= 1.5f * std::min(ha, hb);
++        const float gap = letters ? 1.25f * std::min(ha, hb) : 0.0f;
++        return a.x0 <= b.x1 && a.x1 >= b.x0 && a.y0 <= b.y1 + gap && a.y1 + gap >= b.y0;
+     }
+ 
+     // The frame's elements in groups, each group's anchor by its place: t_previousOverlays.

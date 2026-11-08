@@ -1,0 +1,79 @@
+Subject: [PATCH] Display: a field offset for a frame let start on the other
+ field
+
+ps2_host_display::setFieldOffset(1) shows each VBlank's other field: for a game that lets a late
+frame start at the next VBlank instead of waiting a whole frame for the field it asked for
+(Transformers' TF_LATE_VBLANK). The presenter takes the offset at a flip, so a frame keeps its
+fields' order. 0 (the default): as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_host_display.h |  6 ++++++
+ ps2xRuntime/src/lib/gs/gs_gpu.cpp              | 10 +++++++++-
+ ps2xRuntime/src/lib/ps2_host_display.cpp       | 12 ++++++++++++
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_display.h b/ps2xRuntime/include/runtime/ps2_host_display.h
+index 043db6e..fbe1a92 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -111,6 +111,12 @@ namespace ps2_host_display
+     // even rows' field is the clean picture.
+     void setShownField(int field);
+     int shownField();
++    // The field a VBlank shows is its count's parity; with an offset of 1 the other (a game's
++    // frame that began on the other field than it asked for - a late frame let start at the
++    // next VBlank: Transformers' TF_LATE_VBLANK). Taken from the next flip on, so the frame
++    // shown keeps its fields' order.
++    void setFieldOffset(int offset);
++    int fieldOffset();
+ 
+     // Both fields shown, as two moments for a screen that shows whole pictures (each VBlank
+     // its own field's): with field pictures, the GPU keeps a buffer drawn by fields as its two
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 355adbc..8e417e8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -5783,7 +5783,15 @@ void GSGpuRenderer::Impl::presentPicture(const GSPresentationRequest &request)
+     // The picture's lines this VBlank shows (the others are filled in): with field pictures,
+     // the whole picture of the field whose buffer rows those are. With one field shown always
+     // (ps2_host_display::setShownField), the buffer holds that field as a whole picture.
+-    const uint32_t shownParity = static_cast<uint32_t>((request.vsyncTick ^ fieldPhase) & 1u);
++    // (ps2_host_display::fieldOffset - a late frame let start on the other field - taken at a
++    // flip: the frame shown keeps its fields' order, its earlier field first)
++    static uint32_t offsetFbp = ~0u, appliedOffset = 0u;
++    if (const uint32_t shownFbp = show1 ? c1.fbp : c2.fbp; shownFbp != offsetFbp)
++    {
++        offsetFbp = shownFbp;
++        appliedOffset = static_cast<uint32_t>(ps2_host_display::fieldOffset());
++    }
++    const uint32_t shownParity = static_cast<uint32_t>(((request.vsyncTick ^ fieldPhase) & 1u) ^ appliedOffset);
+     const bool wholePicture = ps2_host_display::shownField() >= 0;
+ 
+     // Each circuit from the buffer the GPU keeps for it, else from local memory (a movie, an
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index e650ab5..445146f 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -695,6 +695,18 @@ namespace ps2_host_display
+         return g_shownField.load(std::memory_order_relaxed);
+     }
+ 
++    std::atomic<int> g_fieldOffset{0};
++
++    void setFieldOffset(int offset)
++    {
++        g_fieldOffset.store(offset & 1, std::memory_order_relaxed);
++    }
++
++    int fieldOffset()
++    {
++        return g_fieldOffset.load(std::memory_order_relaxed);
++    }
++
+     void setFieldsAsMoments(bool on)
+     {
+         g_fieldsAsMoments.store(on, std::memory_order_relaxed);
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,48 @@
+Subject: [PATCH] EE timers: the advance inline when nothing is due
+
+PS2Memory::advanceEeTimers runs at every checkpoint of the generated code
+(2.6% of the EE thread in a busy Transformers level). Its common case - no
+GIF count to clear, no interrupt raised, the next one not reached - only adds
+the cycles: now inline in the header, the rest in advanceEeTimersSlow.
+---
+ ps2xRuntime/include/runtime/ps2_memory.h | 13 ++++++++++++-
+ ps2xRuntime/src/lib/ps2_memory.cpp       |  2 +-
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 47148e0..c0315f9 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -312,7 +312,18 @@ public:
+     // The cycles are handed on in steps, as far as the next interrupt can be
+     // raised; a timer register read or written first gets the rest
+     // (catchUpEeTimers, also before a save state takes the timers).
+-    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
++    // (inline: at every checkpoint of the generated code; the common case - nothing due, no GIF
++    // count to clear - only adds the cycles, the rest is advanceEeTimersSlow)
++    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept
++    {
++        if (!m_gifFqcSet && m_eeTimerInterrupts == 0u && m_eeTimerCycles + eeCycles < m_eeTimerDue)
++        {
++            m_eeTimerCycles += eeCycles;
++            return 0u;
++        }
++        return advanceEeTimersSlow(eeCycles);
++    }
++    uint32_t advanceEeTimersSlow(uint64_t eeCycles) noexcept;
+     void catchUpEeTimers() noexcept;
+     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+     void resetEeTimers() noexcept;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 915453b..fae079e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -470,7 +470,7 @@ void PS2Memory::resetEeTimers() noexcept
+     m_gifFqcSet = true;
+ }
+ 
+-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++uint32_t PS2Memory::advanceEeTimersSlow(uint64_t eeCycles) noexcept
+ {
+     if (eeCycles == 0u)
+     {

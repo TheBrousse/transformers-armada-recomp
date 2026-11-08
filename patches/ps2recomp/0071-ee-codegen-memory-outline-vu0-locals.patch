@@ -1,0 +1,1168 @@
+Subject: [PATCH] EE thread (FPS round 5): guest loads/stores with only main RAM inline, VU0 registers in SIMD
+ locals, constant blends and repeated clamps folded, fewer pc stores, unchecked call targets
+
+The game thread (EE) is the frame-rate limit in levels (TODO 94). Round 5 looked at the generated code itself.
+Every change runs the same guest code in the same order with the same EE clock and gives the same bits: the
+scripted cold boot into Amazon, the fight route (aim, walk, fire, melee, car) and Deep Amazon / Antarctica, all
+in turbo with VIF1 on the EE thread, give the same game state on every game tick as before on the test PC,
+the other PC and locally, and the native renderer's shots are pixel-identical.
+
+ps2xRuntime (ps2_runtime_macros.h):
+- Guest loads and stores (READn/WRITEn): only main RAM's usual case inline - an access wholly inside its 32 MB
+  (and its uncached mirror at 0x20000000, PS2X_MEMORY_MIRROR_INLINE, default 1: the address with bit 29
+  cleared) is read/written in place; everything else - the wrap-around at RAM's end, the other mirrors, the
+  scratchpad, I/O, VU memory, the BIOS - goes to one out-of-line function per size (Ps2ReadSlowN /
+  Ps2WriteSlowN) holding the former inline logic unchanged. The inline copies of those rare paths (two
+  unrolled wrap-around byte loops, the special-address chain, the scratchpad test) made each access ~0.5-1 KB
+  of code: the generated code was ~223 MB for 21,590 functions, now ~63 MB, and it compiles in ~5 min
+  instead of ~23. PS2X_MEMORY_COLD_INLINE=1: as before. PS2X_MEMORY_SCRATCHPAD_OUTLINE=1: the scratchpad test
+  (a non-constant scratchpad address) out of line as well (the port sets it). The out-of-line store tests the
+  scratchpad first (it is special: what came next before). PS2X_HOT_STATS=1 also counts these out-of-line
+  accesses (per 64 KB of address, listed with 64 added to the size).
+- PS2_VADD_C/PS2_VSUB_C (an operand known clamped), FPU_ADD/SUB/MUL_S_KN/_NK/_KK (ps2_fpu_add_k etc.: a known
+  clamped operand not clamped again; ps2_vclamp is idempotent - the same bits).
+- ps2_register_cache.h: RC_VDECL/RC_VLD/RC_VST and RC_ADECL/RC_ALD/RC_AST - VU0's vf registers and ACC in
+  SIMD locals.
+- ps2_runtime.h: PS2_CALL_TARGET_IN (a function's table entry without the bounds test).
+
+ps2xRecomp (options, each off unless the game's config turns it on):
+- `vu0_register_cache` (register_cache.cpp): ctx->vu0_vf[n] and ctx->vu0_acc in SIMD locals rv_<n>/rvacc,
+  written through to the context after the line that writes them, loaded again after a call (a VU0 micro
+  program changes them) - as the FPU's registers. Before, every VU0 macro instruction loaded its operands from
+  the context and stored its result there, and a guest store (which may alias the context for the C++
+  compiler) forced the next instruction to load them again.
+- `vu0_fold_blends` (foldVuConstantBlends): a VU0 instruction's destination-field blend with a constant mask
+  (_mm_blendv_ps / PS2_VBLEND with _mm_set_epi32 of -1/0 - MSVC keeps it a variable blend) as _mm_blend_ps
+  with an immediate, or no blend when every field is written; PS2_VADD/PS2_VSUB(x, mul_res) after
+  `mul_res = PS2_VMUL...` as PS2_VADD_C/PS2_VSUB_C.
+- `fpu_clamp_elision` (elideFpuClamps, after the register cache): an FPU ADD/SUB/MUL operand that is clamped
+  already - an rf_<n> last written by ADD/SUB/MUL/DIV/SQRT/RSQRT or a MOV/NEG/ABS/MAX/MIN of such, the ACC (only
+  FPU_SET_ACC writes it, always with such a result), a nested ADD/SUB/MUL - not clamped again. Followed line
+  by line: a label and a reload after a call forget, a block's end keeps what both ways agree on.
+- `minimal_goto_pc_stores` (with minimal_pc_stores): ctx->pc not stored before a forward jump inside the
+  function - nothing at its label reads it before storing it, except a branch whose delay slot is also entered
+  (its `if (ctx->pc == <delay slot>)`), whose labels keep the store (ControlFlowAnalysisResult::pcReadLabels).
+  Backward jumps keep it for their loop checkpoint.
+- `direct_calls_unchecked` (with direct_calls): a jal's table entry read with PS2_CALL_TARGET_IN - a known
+  target is a function of the table, which spans every function (checked for this game: 95,638 sites, all
+  inside the table and on a filled slot).
+
+Measured (test PC GTX 1080 / the other PC RX 5700 XT, Amazon from its first gate, the user's settings at 1080
+lines, 240 held, game ticks 8600-13000): see TODO 94's round-5 paragraph.
+---
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -90,6 +90,11 @@ namespace ps2recomp
+         bool m_inlineLoopCheckpoints = false; // (FPS round 4)
+         bool m_indirectCallSites = false; // (FPS round 4)
+         bool m_inlineScratchpadConstants = false; // (FPS round 4)
++        bool m_vu0RegisterCache = false; // (FPS round 5)
++        bool m_vu0FoldBlends = false; // (FPS round 5)
++        bool m_fpuClampElision = false; // (FPS round 5)
++        bool m_minimalGotoPcStores = false; // (FPS round 5)
++        bool m_directCallsUnchecked = false; // (FPS round 5)
+         // (FPS round 4) Leaf functions made inline at their jal sites (RecompilerConfig::inlineLeaves):
+         // start address -> the site's call (Ps2CallLeaf_<name>) and the definitions a caller's file needs.
+         struct InlineLeaf
+diff --git a/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h b/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
+--- a/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
++++ b/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
+@@ -20,6 +20,9 @@ namespace ps2recomp
+         std::unordered_set<uint32_t> resumeEntryPoints;
+         std::unordered_set<uint32_t> indirectFallbackEntryPoints;
+         std::unordered_map<uint32_t, std::vector<uint32_t>> jumpTableTargets;
++        // (FPS round 5) Labels whose code reads ctx->pc before storing it: a branch whose delay slot is also
++        // entered (its `if (ctx->pc == <delay slot>)`), and that delay slot's label. Filled by FunctionEmitter.
++        std::unordered_set<uint32_t> pcReadLabels;
+     };
+ 
+     class ControlFlowAnalyzer
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -216,6 +216,19 @@ namespace ps2recomp
+         // (FPS round 4) A load/store at a constant scratchpad address (aligned, inside its 16 KB - what the analysis
+         // marks MMIO) made in place (PS2_SPR_LOADn / PS2_SPR_STOREn) instead of a call to runtime->Load*/Store*.
+         bool inlineScratchpadConstants = false;
++        // (FPS round 5, with registerCache) VU0's macro-mode registers (vu0_vf[n], vu0_acc) in SIMD locals too.
++        bool vu0RegisterCache = false;
++        // (FPS round 5) A VU0 instruction's constant destination-field blend folded (register_cache.h
++        // foldVuConstantBlends).
++        bool vu0FoldBlends = false;
++        // (FPS round 5, with registerCache) An FPU operand's clamp left out where its value is clamped already
++        // (register_cache.h elideFpuClamps).
++        bool fpuClampElision = false;
++        // (FPS round 5, with minimalPcStores) ctx->pc not stored before a forward jump inside the function.
++        bool minimalGotoPcStores = false;
++        // (FPS round 5, with directCalls) the target's table entry read without the bounds test
++        // (PS2_CALL_TARGET_IN): a jal's known target is a function of the table, which spans every function.
++        bool directCallsUnchecked = false;
+         std::vector<std::string> fastCodegenOnly;
+         std::vector<std::string> skipFunctions;
+         std::unordered_map<uint32_t, std::string> patches;
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -75,6 +75,11 @@ namespace ps2recomp
+             config.inlineLoopCheckpoints = toml::find_or<bool>(general, "inline_loop_checkpoints", config.inlineLoopCheckpoints);
+             config.indirectCallSites = toml::find_or<bool>(general, "indirect_call_sites", config.indirectCallSites);
+             config.inlineScratchpadConstants = toml::find_or<bool>(general, "inline_scratchpad_constants", config.inlineScratchpadConstants);
++            config.vu0RegisterCache = toml::find_or<bool>(general, "vu0_register_cache", config.vu0RegisterCache);
++            config.vu0FoldBlends = toml::find_or<bool>(general, "vu0_fold_blends", config.vu0FoldBlends);
++            config.fpuClampElision = toml::find_or<bool>(general, "fpu_clamp_elision", config.fpuClampElision);
++            config.minimalGotoPcStores = toml::find_or<bool>(general, "minimal_goto_pc_stores", config.minimalGotoPcStores);
++            config.directCallsUnchecked = toml::find_or<bool>(general, "direct_calls_unchecked", config.directCallsUnchecked);
+             if (general.contains("fast_codegen_only") && general.at("fast_codegen_only").is_array())
+             {
+                 config.fastCodegenOnly = toml::find<std::vector<std::string>>(general, "fast_codegen_only");
+@@ -323,6 +328,11 @@ namespace ps2recomp
+         general["inline_loop_checkpoints"] = config.inlineLoopCheckpoints;
+         general["indirect_call_sites"] = config.indirectCallSites;
+         general["inline_scratchpad_constants"] = config.inlineScratchpadConstants;
++        general["vu0_register_cache"] = config.vu0RegisterCache;
++        general["vu0_fold_blends"] = config.vu0FoldBlends;
++        general["fpu_clamp_elision"] = config.fpuClampElision;
++        general["minimal_goto_pc_stores"] = config.minimalGotoPcStores;
++        general["direct_calls_unchecked"] = config.directCallsUnchecked;
+         general["fast_codegen_only"] = config.fastCodegenOnly;
+         data["general"] = general;
+ 
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -183,8 +183,14 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent)
+     {
+-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
+-        if (target <= sourcePc && !isCallLikeEdge())
++        // (FPS round 5, minimal_goto_pc_stores) a forward jump inside the function: nothing at its label reads
++        // ctx->pc before storing it (minimal_pc_stores: what can look at it stores its own) unless the label
++        // tests it (pcReadLabels); a backward one keeps it for its loop checkpoint.
++        const bool backward = target <= sourcePc && !isCallLikeEdge();
++        if (backward || !m_gen.m_minimalGotoPcStores || !m_gen.minimalPcStoresFor(m_function.start) ||
++            m_analysisResult.pcReadLabels.contains(target))
++            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
++        if (backward)
+         {
+             if (m_gen.m_inlineLoopCheckpoints)
+                 m_ss << fmt::format("{}if (runtime->eeLoopCheckpoint()) {{\n", indent);
+@@ -271,8 +277,9 @@ namespace ps2recomp
+             // (another known function: its table entry read here - the runtime takes the
+             // dispatcher's way when it is empty)
+             m_ss << fmt::format(
+-                "{}if (!runtime->dispatchGuestCall(rdram, ctx, 0x{:X}u, 0x{:X}u, 0x{:X}u, PS2_CALL_TARGET(0x{:X}u))) {{\n",
+-                indent, target, branchPc(), fallthroughPc(), target);
++                "{}if (!runtime->dispatchGuestCall(rdram, ctx, 0x{:X}u, 0x{:X}u, 0x{:X}u, {}(0x{:X}u))) {{\n",
++                indent, target, branchPc(), fallthroughPc(),
++                m_gen.m_directCallsUnchecked ? "PS2_CALL_TARGET_IN" : "PS2_CALL_TARGET", target);
+             m_ss << fmt::format("{}    return;\n", indent);
+             m_ss << fmt::format("{}}}\n", indent);
+             return;
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -74,6 +74,15 @@ namespace ps2recomp
+         }
+ 
+         const std::unordered_set<uint32_t> &internalTargets = analysisResult.entryPoints;
++        for (const Instruction &inst : instructions)
++        {
++            // (FPS round 5) where ControlFlowEmitter::emitResumeFromDelaySlotEntry tests ctx->pc
++            if (inst.hasDelaySlot && internalTargets.contains(inst.address + 4u))
++            {
++                analysisResult.pcReadLabels.insert(inst.address);
++                analysisResult.pcReadLabels.insert(inst.address + 4u);
++            }
++        }
+         ConstantRegisterState constantRegisters;
+         GifDmaKickPlan gifDmaKickPlan{};
+         ss << "// Function: " << function.name << "\n";
+@@ -243,13 +252,18 @@ namespace ps2recomp
+ 
+         ss << "}\n";
+         std::string text = ss.str();
++        if (cg.m_vu0FoldBlends && cg.fastCodegenFor(function.start))
++            foldVuConstantBlends(text);
+         if (cg.m_registerCache && cg.fastCodegenFor(function.start))
+         {
+             std::string whyNot;
+-            if (!applyRegisterCache(text, whyNot, cg.m_registerWriteBack) && !whyNot.empty() && cg.m_reporter)
++            const bool cached = applyRegisterCache(text, whyNot, cg.m_registerWriteBack, cg.m_vu0RegisterCache);
++            if (!cached && !whyNot.empty() && cg.m_reporter)
+             {
+                 cg.m_reporter->warning("register-cache", function.name + " left as it is: " + whyNot);
+             }
++            if (cached && cg.m_fpuClampElision)
++                elideFpuClamps(text);
+         }
+         if (cg.m_inlineLeaves && useHeaders)
+         {
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1037,6 +1037,11 @@ namespace ps2recomp
+                 m_codeGenerator->m_inlineLoopCheckpoints = m_config.inlineLoopCheckpoints;
+                 m_codeGenerator->m_indirectCallSites = m_config.indirectCallSites;
+                 m_codeGenerator->m_inlineScratchpadConstants = m_config.inlineScratchpadConstants;
++                m_codeGenerator->m_vu0RegisterCache = m_config.vu0RegisterCache;
++                m_codeGenerator->m_vu0FoldBlends = m_config.vu0FoldBlends;
++                m_codeGenerator->m_fpuClampElision = m_config.fpuClampElision;
++                m_codeGenerator->m_minimalGotoPcStores = m_config.minimalGotoPcStores;
++                m_codeGenerator->m_directCallsUnchecked = m_config.directCallsUnchecked;
+             }
+ 
+             fs::create_directories(m_config.outputPath);
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -626,6 +626,11 @@ extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
+ // (FPS round 3) The generated code's scratchpad loads and stores inline (ps2_runtime_macros.h);
+ // PS2X_INLINE_SCRATCHPAD=0: through PS2Runtime::Load*/Store* as before.
+ extern const bool g_ps2InlineScratchpad;
++// (FPS round 5) PS2X_HOT_STATS=1: the generated code's loads/stores that take the out-of-line way
++// (ps2_runtime_macros.h Ps2ReadSlow*/Ps2WriteSlow*), counted per 64 KB of address with the special accesses
++// (listed with 64 added to the size).
++extern const bool g_ps2HotStatsOn;
++void ps2HotNoteSlowAccess(uint32_t addr, uint32_t bytes, bool store);
+ 
+ // (FPS round 3) The function-table entry of a function's address (nullptr outside the table):
+ // PS2Runtime::dispatchGuestCall's target, read by the generated code for a `jal`.
+@@ -635,6 +640,11 @@ extern const bool g_ps2InlineScratchpad;
+          ? g_ps2RecompiledFunctionTable[static_cast<uint32_t>((address) - g_ps2RecompiledFunctionTableBase) >> 2] \
+          : nullptr)
+ 
++// (FPS round 5, ps2xRecomp direct_calls_unchecked) The same entry for an address the table is known to span (a
++// function's): no bounds test.
++#define PS2_CALL_TARGET_IN(address) \
++    g_ps2RecompiledFunctionTable[static_cast<uint32_t>((address) - g_ps2RecompiledFunctionTableBase) >> 2]
++
+ // (FPS round 3) A `jal` to a generated function (`known`): its table entry read here; when that is
+ // still `known` (not replaced), the call made right here - each site its own direct call, where the
+ // dispatcher had one indirect call for every target - between PS2Runtime::callBegin and callEnd,
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -234,6 +234,10 @@ static inline float ps2_vu_rsqrt(float fs, float ft)
+ #define PS2_VMAX(a, b) ps2_vmax((__m128)(a), (__m128)(b))
+ #define PS2_VMIN(a, b) ps2_vmin((__m128)(a), (__m128)(b))
+ #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
++// (FPS round 5, ps2xRecomp vu0_fold_blends) b already clamped (a PS2_VMUL result): the same value, its clamp not
++// applied twice (ps2_vclamp is idempotent).
++#define PS2_VADD_C(a, b) ps2_vclamp(_mm_add_ps(ps2_vclamp((__m128)(a)), (__m128)(b)))
++#define PS2_VSUB_C(a, b) ps2_vclamp(_mm_sub_ps(ps2_vclamp((__m128)(a)), (__m128)(b)))
+ 
+ // Memory access helpers - Hybrid Fast/Slow Path
+ // Fast path: Direct RDRAM access (masked).
+@@ -453,6 +457,40 @@ static PS2_FORCEINLINE bool Ps2ScratchpadInlineWrite(uint32_t addr, const T &val
+     return true;
+ }
+ 
++// (FPS round 5) PS2X_MEMORY_COLD_INLINE (-DTF_MEMORY_COLD_INLINE=ON for the game): every rare path of a
++// load and a store inline at each access, as before. By default only main RAM's usual case is inline - an
++// access wholly inside its 32 MB (none that wraps around its end), then the scratchpad as before - and the
++// rest (the wrap-around, the mirrors, I/O, VU memory, the BIOS) goes to one out-of-line function per size
++// with the former inline logic unchanged. The inline copies of the rare paths made each access ~0.5-1 KB of
++// code (the generated code ~220 MB for 21,600 functions).
++#ifndef PS2X_MEMORY_COLD_INLINE
++#define PS2X_MEMORY_COLD_INLINE 0
++#endif
++// PS2X_MEMORY_SCRATCHPAD_OUTLINE (with the rare paths out of line): the scratchpad (a non-constant address there)
++// left to the out-of-line function too, so an access is only main RAM's test inline.
++#ifndef PS2X_MEMORY_SCRATCHPAD_OUTLINE
++#define PS2X_MEMORY_SCRATCHPAD_OUTLINE 0
++#endif
++// PS2X_MEMORY_MIRROR_INLINE (the default; with the rare paths out of line): main RAM's uncached mirror
++// (0x20000000-0x21FFFFFF, where the game writes its DMA lists) in the inline test as well - the address with bit
++// 29 cleared, which is that mirror's offset in RAM and leaves every other address outside RAM. The same bytes as
++// the out-of-line way (an address there is not special: Ps2FastWrite* masks it to the same offset).
++#ifndef PS2X_MEMORY_MIRROR_INLINE
++#define PS2X_MEMORY_MIRROR_INLINE 1
++#endif
++#if PS2X_MEMORY_MIRROR_INLINE
++#define PS2_RAM_INLINE_OFFSET(addr) ((addr) & 0xDFFFFFFFu)
++#else
++#define PS2_RAM_INLINE_OFFSET(addr) (addr)
++#endif
++#if PS2X_MEMORY_SCRATCHPAD_OUTLINE
++#define PS2_SPR_TRY_READ(addr, value) false
++#define PS2_SPR_TRY_WRITE(addr, value) false
++#else
++#define PS2_SPR_TRY_READ(addr, value) Ps2ScratchpadInlineRead(addr, value)
++#define PS2_SPR_TRY_WRITE(addr, value) Ps2ScratchpadInlineWrite(addr, value)
++#endif
++#if PS2X_MEMORY_COLD_INLINE
+ // Guest loads (READ8 ... READ128): main RAM inline in the generated code, the rest - the
+ // scratchpad, I/O and VU memory, the BIOS - through a call kept out of its way. (Until
+ // 2026-10-04 these were immediately invoked lambdas, which the compiler did not always inline
+@@ -481,6 +519,71 @@ PS2_READ_FUNCTIONS(32, uint32_t, Load32)
+ PS2_READ_FUNCTIONS(64, uint64_t, Load64)
+ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+ #undef PS2_READ_FUNCTIONS
++#else
++#define PS2_READ_FUNCTIONS(bits, type, load)                                                               \
++    static PS2_NOINLINE type Ps2ReadSlow##bits(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,     \
++                                               uint32_t addr)                                            \
++    {                                                                                                    \
++        if (g_ps2HotStatsOn)                                                                             \
++            ps2HotNoteSlowAccess(addr, sizeof(type), false);                                             \
++        if (addr < PS2_RAM_SIZE)                                                                         \
++            return Ps2FastRead##bits(rdram, addr);                                                       \
++        type value;                                                                                      \
++        if (Ps2ScratchpadInlineRead(addr, value))                                                        \
++            return value;                                                                                \
++        if (!PS2Runtime::isSpecialAddress(addr))                                                         \
++            return Ps2FastRead##bits(rdram, addr);                                                       \
++        return Ps2ScratchpadRead(addr, value) ? value : runtime->load(rdram, ctx, addr);                 \
++    }                                                                                                    \
++    static PS2_FORCEINLINE type Ps2Read##bits(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,    \
++                                             uint32_t addr)                                              \
++    {                                                                                                    \
++        type value;                                                                                      \
++        const uint32_t offset = PS2_RAM_INLINE_OFFSET(addr);                                             \
++        if (offset <= PS2_RAM_SIZE - sizeof(type)) [[likely]]                                            \
++        {                                                                                                \
++            std::memcpy(&value, rdram + offset, sizeof(type));                                           \
++            return value;                                                                                \
++        }                                                                                                \
++        if (PS2_SPR_TRY_READ(addr, value))                                                                \
++            return value;                                                                                \
++        return Ps2ReadSlow##bits(rdram, ctx, runtime, addr);                                             \
++    }
++PS2_READ_FUNCTIONS(8, uint8_t, Load8)
++PS2_READ_FUNCTIONS(16, uint16_t, Load16)
++PS2_READ_FUNCTIONS(32, uint32_t, Load32)
++PS2_READ_FUNCTIONS(64, uint64_t, Load64)
++PS2_READ_FUNCTIONS(128, __m128i, Load128)
++#undef PS2_READ_FUNCTIONS
++
++// The stores' rare paths (see above): as the inline form did after its main-RAM test.
++#define PS2_WRITE_SLOW_FUNCTION(bits, type, store, drain)                                                  \
++    static PS2_NOINLINE void Ps2WriteSlow##bits(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,    \
++                                                uint32_t addr, type value)                               \
++    {                                                                                                    \
++        if (g_ps2HotStatsOn)                                                                             \
++            ps2HotNoteSlowAccess(addr, sizeof(type), true);                                              \
++        if (Ps2ScratchpadInlineWrite(addr, value)) /* (the scratchpad is special: what came next) */     \
++        {                                                                                                \
++            if (drain)                                                                                   \
++                runtime->drainCompletedDmacHandlersFast(rdram);                                          \
++        }                                                                                                \
++        else if (PS2Runtime::isSpecialAddress(addr))                                                     \
++        {                                                                                                \
++            runtime->store(rdram, ctx, addr, value);                                                     \
++        }                                                                                                \
++        else                                                                                             \
++        {                                                                                                \
++            Ps2FastWrite##bits(rdram, addr, value);                                                      \
++        }                                                                                                \
++    }
++PS2_WRITE_SLOW_FUNCTION(8, uint8_t, Store8, false)
++PS2_WRITE_SLOW_FUNCTION(16, uint16_t, Store16, false)
++PS2_WRITE_SLOW_FUNCTION(32, uint32_t, Store32, true)
++PS2_WRITE_SLOW_FUNCTION(64, uint64_t, Store64, false)
++PS2_WRITE_SLOW_FUNCTION(128, __m128i, Store128, false)
++#undef PS2_WRITE_SLOW_FUNCTION
++#endif
+ 
+ // (FPS round 4) A load/store at a constant scratchpad address (the recompiler's inline_scratchpad_constants: aligned,
+ // inside its 16 KB - checked there): its memory read/written in place, as PS2Runtime::Load*/Store* do first; a 32-bit
+@@ -535,6 +638,7 @@ PS2_SPR_CONST_FUNCTIONS(128, __m128i, Load128, Store128, false)
+ #define READ64(addr) Ps2Read64(rdram, ctx, runtime, (uint32_t)(addr))
+ #define READ128(addr) Ps2Read128(rdram, ctx, runtime, (uint32_t)(addr))
+ 
++#if PS2X_MEMORY_COLD_INLINE
+ #define WRITE8(addr, val)                                                            \
+     do                                                                               \
+     {                                                                                \
+@@ -619,6 +723,77 @@ PS2_SPR_CONST_FUNCTIONS(128, __m128i, Load128, Store128, false)
+             FAST_WRITE128(_addr, _value);                                            \
+         }                                                                            \
+     } while (0)
++#else
++#define WRITE8(addr, val)                                     \
++    do                                                        \
++    {                                                         \
++        const uint32_t _addr = (addr);                        \
++        const uint8_t _value = (uint8_t)(val);                \
++        const uint32_t _off = PS2_RAM_INLINE_OFFSET(_addr);   \
++        if (_off <= PS2_RAM_SIZE - 1u) [[likely]]             \
++            std::memcpy(rdram + _off, &_value, 1u);           \
++        else if (PS2_SPR_TRY_WRITE(_addr, _value))           \
++            (void)0;                                          \
++        else                                                  \
++            Ps2WriteSlow8(rdram, ctx, runtime, _addr, _value);\
++    } while (0)
++
++#define WRITE16(addr, val)                                     \
++    do                                                         \
++    {                                                          \
++        const uint32_t _addr = (addr);                         \
++        const uint16_t _value = (uint16_t)(val);               \
++        const uint32_t _off = PS2_RAM_INLINE_OFFSET(_addr);    \
++        if (_off <= PS2_RAM_SIZE - 2u) [[likely]]              \
++            std::memcpy(rdram + _off, &_value, 2u);            \
++        else if (PS2_SPR_TRY_WRITE(_addr, _value))            \
++            (void)0;                                           \
++        else                                                   \
++            Ps2WriteSlow16(rdram, ctx, runtime, _addr, _value);\
++    } while (0)
++
++#define WRITE32(addr, val)                                                    \
++    do                                                                        \
++    {                                                                         \
++        const uint32_t _addr = (addr);                                        \
++        const uint32_t _value = (uint32_t)(val);                              \
++        const uint32_t _off = PS2_RAM_INLINE_OFFSET(_addr);                   \
++        if (_off <= PS2_RAM_SIZE - 4u) [[likely]]                             \
++            std::memcpy(rdram + _off, &_value, 4u);                           \
++        else if (PS2_SPR_TRY_WRITE(_addr, _value))                           \
++            runtime->drainCompletedDmacHandlersFast(rdram); /* (as Store32) */\
++        else                                                                  \
++            Ps2WriteSlow32(rdram, ctx, runtime, _addr, _value);               \
++    } while (0)
++
++#define WRITE64(addr, val)                                     \
++    do                                                         \
++    {                                                          \
++        const uint32_t _addr = (addr);                         \
++        const uint64_t _value = (uint64_t)(val);               \
++        const uint32_t _off = PS2_RAM_INLINE_OFFSET(_addr);    \
++        if (_off <= PS2_RAM_SIZE - 8u) [[likely]]              \
++            std::memcpy(rdram + _off, &_value, 8u);            \
++        else if (PS2_SPR_TRY_WRITE(_addr, _value))            \
++            (void)0;                                           \
++        else                                                   \
++            Ps2WriteSlow64(rdram, ctx, runtime, _addr, _value);\
++    } while (0)
++
++#define WRITE128(addr, val)                                     \
++    do                                                          \
++    {                                                           \
++        const uint32_t _addr = (addr);                          \
++        const __m128i _value = (val);                           \
++        const uint32_t _off = PS2_RAM_INLINE_OFFSET(_addr);     \
++        if (_off <= PS2_RAM_SIZE - 16u) [[likely]]              \
++            std::memcpy(rdram + _off, &_value, 16u);            \
++        else if (PS2_SPR_TRY_WRITE(_addr, _value))             \
++            (void)0;                                            \
++        else                                                    \
++            Ps2WriteSlow128(rdram, ctx, runtime, _addr, _value);\
++    } while (0)
++#endif
+ 
+ // Packed Compare Greater Than (PCGT)
+ #define PS2_PCGTW(a, b) _mm_cmpgt_epi32((__m128i)(a), (__m128i)(b))
+@@ -894,6 +1069,50 @@ static PS2_FORCEINLINE int32_t ps2_fpu_compare_key(float value)
+     return (ps2_float_bits(value) & 0x7F800000u) == 0u ? 0 : ps2_float_order(value);
+ }
+ 
++// (FPS round 5, ps2xRecomp fpu_clamp_elision) ADD/SUB/MUL with an operand already clamped (_K: known, _N: not): that
++// operand's clamp left out - the same bits, ps2_vclamp being idempotent.
++template <bool KnownA, bool KnownB>
++static PS2_FORCEINLINE __m128 ps2_fpu_operands(float a, float b, __m128 &vb)
++{
++    __m128 va = _mm_set_ss(a);
++    vb = _mm_set_ss(b);
++    if constexpr (!KnownA)
++        va = ps2_vclamp(va);
++    if constexpr (!KnownB)
++        vb = ps2_vclamp(vb);
++    return va;
++}
++template <bool KnownA, bool KnownB>
++static PS2_FORCEINLINE float ps2_fpu_add_k(float a, float b)
++{
++    __m128 vb;
++    const __m128 va = ps2_fpu_operands<KnownA, KnownB>(a, b, vb);
++    return _mm_cvtss_f32(ps2_vclamp(_mm_add_ss(va, vb)));
++}
++template <bool KnownA, bool KnownB>
++static PS2_FORCEINLINE float ps2_fpu_sub_k(float a, float b)
++{
++    __m128 vb;
++    const __m128 va = ps2_fpu_operands<KnownA, KnownB>(a, b, vb);
++    return _mm_cvtss_f32(ps2_vclamp(_mm_sub_ss(va, vb)));
++}
++template <bool KnownA, bool KnownB>
++static PS2_FORCEINLINE float ps2_fpu_mul_k(float a, float b)
++{
++    __m128 vb;
++    const __m128 va = ps2_fpu_operands<KnownA, KnownB>(a, b, vb);
++    return _mm_cvtss_f32(ps2_vclamp(_mm_mul_ss(va, vb)));
++}
++#define FPU_ADD_S_KN(a, b) ps2_fpu_add_k<true, false>((float)(a), (float)(b))
++#define FPU_ADD_S_NK(a, b) ps2_fpu_add_k<false, true>((float)(a), (float)(b))
++#define FPU_ADD_S_KK(a, b) ps2_fpu_add_k<true, true>((float)(a), (float)(b))
++#define FPU_SUB_S_KN(a, b) ps2_fpu_sub_k<true, false>((float)(a), (float)(b))
++#define FPU_SUB_S_NK(a, b) ps2_fpu_sub_k<false, true>((float)(a), (float)(b))
++#define FPU_SUB_S_KK(a, b) ps2_fpu_sub_k<true, true>((float)(a), (float)(b))
++#define FPU_MUL_S_KN(a, b) ps2_fpu_mul_k<true, false>((float)(a), (float)(b))
++#define FPU_MUL_S_NK(a, b) ps2_fpu_mul_k<false, true>((float)(a), (float)(b))
++#define FPU_MUL_S_KK(a, b) ps2_fpu_mul_k<true, true>((float)(a), (float)(b))
++
+ // FPU (COP1) operations
+ #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
+ #define FPU_ADD_S(a, b) ps2_fpu_add((float)(a), (float)(b))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1974,6 +1974,12 @@ extern const bool g_ps2DrainInline = []()
+     return (!env || *env != '0') && ps2EeFastPaths(2u);
+ }();
+ 
++extern const bool g_ps2HotStatsOn = g_ps2HotStats;
++void ps2HotNoteSlowAccess(uint32_t addr, uint32_t bytes, bool store)
++{
++    hotNoteAccess(addr & 0xFFFF0000u, bytes + 64u, store);
++}
++
+ extern const bool g_ps2InlineScratchpad = []()
+ {
+     const char *env = std::getenv("PS2X_INLINE_SCRATCHPAD");
+diff --git a/ps2xRecomp/include/ps2recomp/register_cache.h b/ps2xRecomp/include/ps2recomp/register_cache.h
+--- a/ps2xRecomp/include/ps2recomp/register_cache.h
++++ b/ps2xRecomp/include/ps2recomp/register_cache.h
+@@ -20,7 +20,26 @@ namespace ps2recomp
+     // registers written since the context was last current are stored back right before what can
+     // look at the context - a call or jump to another function, the dispatcher, a syscall or stub,
+     // a return (a loop's checkpoint too, inside its `if`) - instead of at every write.
+-    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack = false);
++    //
++    // `vu0` (RecompilerConfig::vu0RegisterCache, FPS round 5): VU0's macro-mode registers too -
++    // ctx->vu0_vf[n] in the SIMD local rv_<n>, ctx->vu0_acc in rvacc, written through to the
++    // context after the line that writes them and loaded again after a call.
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack = false, bool vu0 = false);
++
++    // (FPS round 5, RecompilerConfig::vu0FoldBlends) A VU0 instruction's destination-field blend with a
++    // constant mask - _mm_blendv_ps / PS2_VBLEND(a, b, _mm_castsi128_ps(<constant>)) - as _mm_blend_ps(a, b, imm),
++    // or b alone when every field is written (a alone when none). The same bits: blendv picks each lane by
++    // its mask's sign bit, which a constant fixes. Also PS2_VADD/PS2_VSUB(x, mul_res) where mul_res is a
++    // PS2_VMUL result as PS2_VADD_C/PS2_VSUB_C (its clamp not applied twice - the clamp is idempotent).
++    // Returns how many were folded.
++    int foldVuConstantBlends(std::string &functionText);
++
++    // (FPS round 5, RecompilerConfig::fpuClampElision; after applyRegisterCache) An FPU ADD/SUB/MUL whose operand
++    // is already clamped - an rf_<n> last written by an ADD/SUB/MUL/DIV/SQRT/RSQRT (or a MOV/NEG/ABS/MAX/MIN of
++    // such), the ACC, a nested ADD/SUB/MUL - as FPU_ADD_S_KN/_NK/_KK (that operand's clamp left out; the clamp is
++    // idempotent, so the same bits). Followed line by line: a label or a reload after a call forgets, a block's
++    // end keeps only what both ways agree on. Returns how many clamps were left out.
++    int elideFpuClamps(std::string &functionText);
+ 
+     // Whether an instruction's C++ (one or more lines) can look at ctx->pc or the delay slot's
+     // state: it hands the context to the runtime or another function, raises an exception,
+diff --git a/ps2xRecomp/src/lib/register_cache.cpp b/ps2xRecomp/src/lib/register_cache.cpp
+--- a/ps2xRecomp/src/lib/register_cache.cpp
++++ b/ps2xRecomp/src/lib/register_cache.cpp
+@@ -8,6 +8,8 @@
+ #include <vector>
+ 
+ // The FPU's registers the same way: ctx->f[n] becomes the local rf_<n>.
++// (FPS round 5, `vu0`) And VU0's (macro mode, COP2): ctx->vu0_vf[n] becomes rv_<n>, ctx->vu0_acc
++// rvacc - the 128-bit values in SIMD locals, written through to the context like the FPU's.
+ //
+ // Writes go through to the context at once (RC_SET_*, and RC_FST after a line that writes an
+ // FPU register), so the context is always current and nothing has to be written back before a
+@@ -141,8 +143,33 @@ namespace ps2recomp
+             std::bitset<32> written;
+             std::bitset<32> fpUsed;   // FPU registers
+             std::bitset<32> fpWritten;
++            std::bitset<33> vuUsed;   // (vu0) VU0's vf registers, and 32 = its ACC
+         };
+ 
++        // (vu0) ctx->vu0_vf[<literal>] or ctx->vu0_acc at `end` (just after a `ctx` word): the
++        // register (32 = ACC) and the end of its text in `after`, or -1.
++        int vuRegisterAt(std::string_view line, size_t end, size_t &after)
++        {
++            if (line.substr(end, 9) == "->vu0_vf[")
++            {
++                size_t p = end + 9;
++                const size_t digits = p;
++                while (p < line.size() && p - digits < 2 && std::isdigit(static_cast<unsigned char>(line[p])))
++                    ++p;
++                if (p == digits || p >= line.size() || line[p] != ']')
++                    return -1;
++                const int reg = std::stoi(std::string(line.substr(digits, p - digits)));
++                after = p + 1;
++                return reg < 32 ? reg : -1;
++            }
++            if (line.substr(end, 9) == "->vu0_acc" && (end + 9 >= line.size() || !isIdentChar(line[end + 9])))
++            {
++                after = end + 9;
++                return 32;
++            }
++            return -1;
++        }
++
+         // Whether the text after an lvalue at `at` assigns to it (=, op=, ++, --).
+         bool assignsAfter(std::string_view line, size_t at)
+         {
+@@ -161,10 +188,11 @@ namespace ps2recomp
+         // ctx->f[n] becomes rf_<n> (written when assigned or its address taken).
+         bool rewriteLine(std::string_view line, const std::vector<char> &code, std::string &out,
+                          Registers &regs, std::bitset<32> &fpWrites, std::bitset<32> &gprWrites,
+-                         bool writeBack, std::string &whyNot)
++                         std::bitset<33> &vuWrites, bool writeBack, bool vu0, std::string &whyNot)
+         {
+             fpWrites.reset();
+             gprWrites.reset();
++            vuWrites.reset();
+             out.clear();
+             size_t i = 0;
+             while (i < line.size())
+@@ -187,6 +215,25 @@ namespace ps2recomp
+                         break;
+                     }
+                 }
++                if (!macro && vu0 && word == "ctx")
++                {
++                    size_t after = 0;
++                    const int reg = vuRegisterAt(line, end, after);
++                    if (reg >= 0)
++                    {
++                        size_t before = out.size();
++                        while (before > 0 && out[before - 1] == ' ')
++                            --before;
++                        const bool addressTaken = before > 0 && out[before - 1] == '&' &&
++                                                  (before < 2 || out[before - 2] != '&');
++                        regs.vuUsed.set(static_cast<size_t>(reg));
++                        if (addressTaken || assignsAfter(line, after))
++                            vuWrites.set(static_cast<size_t>(reg));
++                        out.append(reg == 32 ? std::string("rvacc") : "rv_" + std::to_string(reg));
++                        i = after;
++                        continue;
++                    }
++                }
+                 if (!macro && word == "ctx" && line.substr(end, 4) == "->f[")
+                 {
+                     size_t p = end + 4;
+@@ -364,7 +411,7 @@ namespace ps2recomp
+             std::string whyNot;
+         };
+ 
+-        LineFacts analyzeLine(std::string_view line, const std::vector<char> &code)
++        LineFacts analyzeLine(std::string_view line, const std::vector<char> &code, bool vu0)
+         {
+             LineFacts facts;
+             size_t i = 0;
+@@ -384,7 +431,7 @@ namespace ps2recomp
+                 while (end < line.size() && isIdentChar(line[end]))
+                     ++end;
+                 const std::string_view word = line.substr(i, end - i);
+-                if (word.starts_with("RC_") || word.starts_with("rf_"))
++                if (word.starts_with("RC_") || word.starts_with("rf_") || word.starts_with("rv_") || word == "rvacc")
+                 {
+                     facts.cached = true;
+                 }
+@@ -408,6 +455,8 @@ namespace ps2recomp
+                             facts.whyNot = "the context's registers used directly";
+                         else if (field == "f")
+                             facts.whyNot = "an FPU register with a computed number";
++                        else if (vu0 && (field == "vu0_vf" || field == "vu0_acc"))
++                            facts.whyNot = "a VU0 register in an unknown form";
+                     }
+                     else
+                     {
+@@ -492,7 +541,7 @@ namespace ps2recomp
+         return false;
+     }
+ 
+-    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack)
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack, bool vu0)
+     {
+         whyNot.clear();
+         static constexpr std::string_view kSignatureEnd =
+@@ -524,15 +573,16 @@ namespace ps2recomp
+         std::vector<std::string> rewritten(lines.size());
+         std::vector<std::bitset<32>> fpWrites(lines.size());
+         std::vector<std::bitset<32>> gprWrites(lines.size());
++        std::vector<std::bitset<33>> vuWrites(lines.size());
+         std::vector<char> code;
+         for (size_t n = 0; n < lines.size(); ++n)
+         {
+             const std::string line = bitCastFpMoves(lines[n]);
+             markCode(line, code);
+-            if (!rewriteLine(line, code, rewritten[n], regs, fpWrites[n], gprWrites[n], writeBack, whyNot))
++            if (!rewriteLine(line, code, rewritten[n], regs, fpWrites[n], gprWrites[n], vuWrites[n], writeBack, vu0, whyNot))
+                 return false;
+         }
+-        if (regs.used.none() && regs.fpUsed.none())
++        if (regs.used.none() && regs.fpUsed.none() && regs.vuUsed.none())
+             return false;
+ 
+         std::string declare;
+@@ -559,6 +609,22 @@ namespace ps2recomp
+                 add(reload, "RC_FLD", reg);
+             }
+         }
++        for (int reg = 0; reg <= 32; ++reg)
++        {
++            if (regs.vuUsed.test(static_cast<size_t>(reg)))
++            {
++                if (reg == 32)
++                {
++                    declare.append(declare.empty() ? "" : " ").append("RC_ADECL();");
++                    reload.append(reload.empty() ? "" : " ").append("RC_ALD();");
++                }
++                else
++                {
++                    add(declare, "RC_VDECL", reg);
++                    add(reload, "RC_VLD", reg);
++                }
++            }
++        }
+ 
+         std::string out;
+         out.reserve(functionText.size() + functionText.size() / 4);
+@@ -654,6 +720,19 @@ namespace ps2recomp
+         auto putCode = [&](size_t n, std::string_view indent)
+         {
+             out.append(rewritten[n]).push_back('\n');
++            if (vuWrites[n].any())
++            {
++                // (VU0's registers go through to the context after the line, in write-back mode too)
++                std::string stores;
++                for (int reg = 0; reg < 32; ++reg)
++                {
++                    if (vuWrites[n].test(static_cast<size_t>(reg)))
++                        add(stores, "RC_VST", reg);
++                }
++                if (vuWrites[n].test(32))
++                    stores.append(stores.empty() ? "" : " ").append("RC_AST();");
++                putLine(indent, stores);
++            }
+             if (writeBack)
+             {
+                 dirty |= gprWrites[n];
+@@ -727,11 +806,13 @@ namespace ps2recomp
+             }
+ 
+             markCode(line, code);
+-            const LineFacts facts = analyzeLine(line, code);
++            const LineFacts facts = analyzeLine(line, code, vu0);
+             if (!facts.whyNot.empty())
+                 return fail(facts.whyNot, t);
+             if (fpWrites[n].any() && t.back() != ';' && t.back() != '}')
+                 return fail("an FPU register written in an unknown statement", t);
++            if (vuWrites[n].any() && t.back() != ';' && t.back() != '}')
++                return fail("a VU0 register written in an unknown statement", t);
+ 
+             if (expect == Expect::Return)
+             {
+@@ -853,4 +934,396 @@ namespace ps2recomp
+         functionText = std::move(out);
+         return true;
+     }
++
++    // (FPS round 5) foldVuConstantBlends: see register_cache.h.
++    namespace
++    {
++        // The arguments of the call whose '(' is at `open`, split at the top-level commas; `close` = its ')'.
++        bool splitArguments(std::string_view text, size_t open, std::vector<std::string_view> &args, size_t &close)
++        {
++            args.clear();
++            int depth = 0;
++            size_t start = open + 1;
++            for (size_t i = open; i < text.size(); ++i)
++            {
++                const char c = text[i];
++                if (c == '(')
++                {
++                    ++depth;
++                }
++                else if (c == ')')
++                {
++                    if (--depth == 0)
++                    {
++                        args.push_back(trim(text.substr(start, i - start)));
++                        close = i;
++                        return true;
++                    }
++                }
++                else if (c == ',' && depth == 1)
++                {
++                    args.push_back(trim(text.substr(start, i - start)));
++                    start = i + 1;
++                }
++                else if (c == '\n')
++                {
++                    return false;
++                }
++            }
++            return false;
++        }
++
++        // _mm_set_epi32(a, b, c, d) of -1 / 0 literals -> the _mm_blend_ps immediate (a = lane 3 ... d = lane 0).
++        int blendImmediate(std::string_view setCall)
++        {
++            static constexpr std::string_view kSet = "_mm_set_epi32(";
++            if (!setCall.starts_with(kSet))
++                return -1;
++            std::vector<std::string_view> args;
++            size_t close = 0;
++            if (!splitArguments(setCall, kSet.size() - 1, args, close) || close + 1 != setCall.size() || args.size() != 4)
++                return -1;
++            int imm = 0;
++            for (int k = 0; k < 4; ++k)
++            {
++                if (args[static_cast<size_t>(k)] == "-1")
++                    imm |= 1 << (3 - k);
++                else if (args[static_cast<size_t>(k)] != "0")
++                    return -1;
++            }
++            return imm;
++        }
++
++        // A name or a context field: nothing evaluated when it is dropped.
++        bool isPlainOperand(std::string_view v)
++        {
++            return !v.empty() && v.find('(') == std::string_view::npos;
++        }
++
++        int foldLine(std::string &line)
++        {
++            int folded = 0;
++            static constexpr std::string_view kCalls[] = {"_mm_blendv_ps(", "PS2_VBLEND("};
++            for (const std::string_view call : kCalls)
++            {
++                size_t at = 0;
++                while ((at = line.find(call, at)) != std::string::npos)
++                {
++                    if (at > 0 && isIdentChar(line[at - 1]))
++                    {
++                        at += call.size();
++                        continue;
++                    }
++                    std::vector<std::string_view> args;
++                    size_t close = 0;
++                    if (!splitArguments(line, at + call.size() - 1, args, close) || args.size() != 3)
++                    {
++                        at += call.size();
++                        continue;
++                    }
++                    static constexpr std::string_view kCast = "_mm_castsi128_ps(";
++                    int imm = -1;
++                    std::string_view mask = args[2];
++                    if (mask.starts_with(kCast) && mask.ends_with(")"))
++                    {
++                        const std::string_view inner = trim(mask.substr(kCast.size(), mask.size() - kCast.size() - 1));
++                        if (inner == "mask")
++                        {
++                            // the line's `__m128i mask = _mm_set_epi32(...);` before the call
++                            static constexpr std::string_view kDecl = "__m128i mask = ";
++                            const size_t decl = std::string_view(line).substr(0, at).rfind(kDecl);
++                            if (decl != std::string::npos)
++                            {
++                                const size_t from = decl + kDecl.size();
++                                const size_t semi = line.find(';', from);
++                                if (semi != std::string::npos && semi < at)
++                                    imm = blendImmediate(trim(std::string_view(line).substr(from, semi - from)));
++                            }
++                        }
++                        else
++                        {
++                            imm = blendImmediate(inner);
++                        }
++                    }
++                    if (imm < 0)
++                    {
++                        at += call.size();
++                        continue;
++                    }
++                    std::string replacement;
++                    if (imm == 15 && isPlainOperand(args[0]))
++                        replacement = "(" + std::string(args[1]) + ")";
++                    else if (imm == 0 && isPlainOperand(args[1]))
++                        replacement = "(" + std::string(args[0]) + ")";
++                    else
++                        replacement = "_mm_blend_ps(" + std::string(args[0]) + ", " + std::string(args[1]) + ", " +
++                                      std::to_string(imm) + ")";
++                    line.replace(at, close + 1 - at, replacement);
++                    at += replacement.size();
++                    ++folded;
++                }
++            }
++            // PS2_VADD/PS2_VSUB(x, mul_res) after `__m128 mul_res = PS2_VMUL...(`: mul_res is clamped already
++            if (line.find("__m128 mul_res = PS2_VMUL") != std::string::npos)
++            {
++                static constexpr std::pair<std::string_view, std::string_view> kOps[] = {
++                    {"PS2_VADD(", "PS2_VADD_C("}, {"PS2_VSUB(", "PS2_VSUB_C("}};
++                for (const auto &[from, to] : kOps)
++                {
++                    size_t at = 0;
++                    while ((at = line.find(from, at)) != std::string::npos)
++                    {
++                        std::vector<std::string_view> args;
++                        size_t close = 0;
++                        if (splitArguments(line, at + from.size() - 1, args, close) && args.size() == 2 && args[1] == "mul_res")
++                        {
++                            line.replace(at, from.size(), to);
++                            ++folded;
++                        }
++                        at += from.size();
++                    }
++                }
++            }
++            return folded;
++        }
++    }
++
++    int foldVuConstantBlends(std::string &functionText)
++    {
++        int folded = 0;
++        std::string out;
++        out.reserve(functionText.size());
++        size_t at = 0;
++        std::string line;
++        while (at < functionText.size())
++        {
++            const size_t nl = functionText.find('\n', at);
++            const size_t end = nl == std::string::npos ? functionText.size() : nl + 1;
++            line.assign(functionText, at, end - at);
++            const std::string_view t = trim(line);
++            if (!t.starts_with("//") && (line.find("blendv_ps(") != std::string::npos || line.find("PS2_VBLEND(") != std::string::npos ||
++                                        line.find("mul_res") != std::string::npos))
++                folded += foldLine(line);
++            out.append(line);
++            at = end;
++        }
++        if (folded)
++            functionText = std::move(out);
++        return folded;
++    }
++
++    // (FPS round 5) elideFpuClamps: see register_cache.h.
++    namespace
++    {
++        // rf_<n> as the whole of `v`: n, else -1.
++        int fpLocal(std::string_view v)
++        {
++            if (!v.starts_with("rf_") || v.size() < 4 || v.size() > 5)
++                return -1;
++            int n = 0;
++            for (size_t i = 3; i < v.size(); ++i)
++            {
++                if (!std::isdigit(static_cast<unsigned char>(v[i])))
++                    return -1;
++                n = n * 10 + (v[i] - '0');
++            }
++            return n < 32 ? n : -1;
++        }
++
++        struct FpuClampState
++        {
++            std::bitset<32> known; // rf_<n> holds a clamped value (an ADD/SUB/MUL/DIV/SQRT result or a copy of one)
++        };
++
++        // An operand of FPU_ADD/SUB/MUL_S: whether its value is clamped already; a nested ADD/SUB/MUL is
++        // rewritten in place (its own operands) and is clamped.
++        bool operandClamped(std::string &operand, const std::bitset<32> &known, int &elided);
++
++        // `call` = "FPU_ADD_S(a, b)" (or SUB/MUL): rewritten to FPU_ADD_S_KN(...) etc. when an operand is known
++        // clamped. Returns false when it is not that shape.
++        bool rewriteArithmetic(std::string &call, const std::bitset<32> &known, int &elided)
++        {
++            static constexpr std::string_view kOps[] = {"FPU_ADD_S(", "FPU_SUB_S(", "FPU_MUL_S("};
++            std::string_view op;
++            for (const std::string_view candidate : kOps)
++            {
++                if (call.starts_with(candidate))
++                    op = candidate;
++            }
++            if (op.empty())
++                return false;
++            std::vector<std::string_view> args;
++            size_t close = 0;
++            if (!splitArguments(call, op.size() - 1, args, close) || close + 1 != call.size() || args.size() != 2)
++                return false;
++            std::string a(args[0]), b(args[1]);
++            const bool ka = operandClamped(a, known, elided);
++            const bool kb = operandClamped(b, known, elided);
++            std::string name(op.substr(0, op.size() - 1));
++            if (ka || kb)
++            {
++                name += ka ? (kb ? "_KK" : "_KN") : "_NK";
++                elided += (ka ? 1 : 0) + (kb ? 1 : 0);
++            }
++            call = name + "(" + a + ", " + b + ")";
++            return true;
++        }
++
++        bool operandClamped(std::string &operand, const std::bitset<32> &known, int &elided)
++        {
++            const int n = fpLocal(operand);
++            if (n >= 0)
++                return known.test(static_cast<size_t>(n));
++            // FPU_SET_ACC is the only writer of the FPU's ACC, always with an ADD/SUB/MUL result (clamped); it
++            // starts at 0 and save states do not hold it.
++            if (operand == "ctx->f_acc")
++                return true;
++            return rewriteArithmetic(operand, known, elided);
++        }
++    }
++
++    int elideFpuClamps(std::string &functionText)
++    {
++        int elided = 0;
++        std::string out;
++        out.reserve(functionText.size() + functionText.size() / 16);
++        std::bitset<32> known;
++        std::vector<std::bitset<32>> blocks;
++        std::vector<char> code;
++        size_t at = 0;
++        while (at < functionText.size())
++        {
++            const size_t nl = functionText.find('\n', at);
++            const size_t end = nl == std::string::npos ? functionText.size() : nl + 1;
++            std::string line = functionText.substr(at, end - at);
++            at = end;
++            std::string_view body = line;
++            while (!body.empty() && (body.back() == '\n' || body.back() == '\r'))
++                body.remove_suffix(1);
++            const std::string_view t = trim(body);
++            if (t.empty() || t.starts_with("//") || t.starts_with("#"))
++            {
++                out.append(line);
++                continue;
++            }
++            if (t.starts_with("label_") && t.ends_with(":"))
++            {
++                known.reset(); // (a join: what reaches it is not known)
++                out.append(line);
++                continue;
++            }
++            const size_t indent = body.find_first_not_of(" \t");
++            std::string stmt(t);
++            int dest = -1;
++            bool handled = false;
++            bool destKnown = false;
++            // rf_D = <expr>;
++            if (stmt.starts_with("rf_") && stmt.ends_with(";"))
++            {
++                const size_t eq = stmt.find(" = ");
++                if (eq != std::string::npos && (dest = fpLocal(std::string_view(stmt).substr(0, eq))) >= 0)
++                {
++                    std::string expr = stmt.substr(eq + 3, stmt.size() - eq - 4);
++                    if (rewriteArithmetic(expr, known, elided))
++                    {
++                        destKnown = true;
++                        handled = true;
++                    }
++                    else
++                    {
++                        static constexpr std::string_view kCopies[] = {"FPU_MOV_S(", "FPU_NEG_S(", "FPU_ABS_S("};
++                        static constexpr std::string_view kPicks[] = {"FPU_MAX_S(", "FPU_MIN_S("};
++                        static constexpr std::string_view kResults[] = {"FPU_DIV_S(", "FPU_SQRT_S(", "FPU_RSQRT_S("};
++                        for (const std::string_view f : kCopies)
++                        {
++                            if (expr.starts_with(f) && expr.ends_with(")"))
++                            {
++                                const int s = fpLocal(std::string_view(expr).substr(f.size(), expr.size() - f.size() - 1));
++                                destKnown = s >= 0 && known.test(static_cast<size_t>(s));
++                            }
++                        }
++                        for (const std::string_view f : kPicks)
++                        {
++                            std::vector<std::string_view> args;
++                            size_t close = 0;
++                            if (expr.starts_with(f) && splitArguments(expr, f.size() - 1, args, close) && args.size() == 2 &&
++                                close + 1 == expr.size())
++                            {
++                                const int a = fpLocal(args[0]), b = fpLocal(args[1]);
++                                destKnown = a >= 0 && b >= 0 && known.test(static_cast<size_t>(a)) && known.test(static_cast<size_t>(b));
++                            }
++                        }
++                        for (const std::string_view f : kResults)
++                        {
++                            if (expr.starts_with(f))
++                                destKnown = true; // (their results are clamped: ps2_runtime_macros.h)
++                        }
++                        handled = true;
++                    }
++                    stmt = stmt.substr(0, eq + 3) + expr + ";";
++                }
++            }
++            else if (stmt.starts_with("FPU_SET_ACC(ctx, ") && stmt.ends_with(");"))
++            {
++                std::string expr = stmt.substr(17, stmt.size() - 19);
++                if (rewriteArithmetic(expr, known, elided))
++                    stmt = "FPU_SET_ACC(ctx, " + expr + ");";
++                handled = true;
++            }
++            if (handled)
++            {
++                if (dest >= 0)
++                    known.set(static_cast<size_t>(dest), destKnown);
++                out.append(body.substr(0, indent)).append(stmt).append(line.substr(body.size()));
++                continue;
++            }
++            // Anything else: every rf_<n> it assigns is no longer known; RC_FLD(n) (after a call) neither.
++            markCode(body, code);
++            const bool oneLineBlock = t.starts_with("{") && t.ends_with("}");
++            for (size_t i = 0; i < body.size(); ++i)
++            {
++                if (!code[i])
++                    continue;
++                if (!oneLineBlock && body[i] == '{')
++                {
++                    blocks.push_back(known);
++                    continue;
++                }
++                if (!oneLineBlock && body[i] == '}')
++                {
++                    if (!blocks.empty())
++                    {
++                        known &= blocks.back(); // (the way past the block and the way through it)
++                        blocks.pop_back();
++                    }
++                    continue;
++                }
++                if (body.substr(i, 3) == "rf_" && (i == 0 || !isIdentChar(body[i - 1])))
++                {
++                    size_t e = i + 3;
++                    while (e < body.size() && std::isdigit(static_cast<unsigned char>(body[e])))
++                        ++e;
++                    const int n = fpLocal(body.substr(i, e - i));
++                    if (n >= 0 && (assignsAfter(body, e) || (i > 0 && body[i - 1] == '&')))
++                        known.reset(static_cast<size_t>(n));
++                    i = e - 1;
++                    continue;
++                }
++                if (body.substr(i, 7) == "RC_FLD(")
++                {
++                    size_t e = i + 7;
++                    int n = 0;
++                    while (e < body.size() && std::isdigit(static_cast<unsigned char>(body[e])))
++                        n = n * 10 + (body[e++] - '0');
++                    if (n < 32)
++                        known.reset(static_cast<size_t>(n));
++                    i = e - 1;
++                }
++            }
++            out.append(line);
++        }
++        if (elided)
++            functionText = std::move(out);
++        return elided;
++    }
+ }
+diff --git a/ps2xRuntime/include/ps2_register_cache.h b/ps2xRuntime/include/ps2_register_cache.h
+--- a/ps2xRuntime/include/ps2_register_cache.h
++++ b/ps2xRuntime/include/ps2_register_cache.h
+@@ -41,6 +41,15 @@ static PS2_FORCEINLINE __m128i Ps2RcVec(const __m128i &reg, uint64_t low)
+ #define RC_FLD(n) (rf_##n = ctx->f[n])
+ #define RC_FST(n) (ctx->f[n] = rf_##n)
+ 
++// (FPS round 5, ps2xRecomp vu0_register_cache) VU0's macro-mode registers: ctx->vu0_vf[n] is rv_<n> in the code,
++// ctx->vu0_acc rvacc - kept in SIMD registers by the C++ compiler, stored after the line that writes them.
++#define RC_VDECL(n) __m128 rv_##n = ctx->vu0_vf[n]
++#define RC_VLD(n) (rv_##n = ctx->vu0_vf[n])
++#define RC_VST(n) (ctx->vu0_vf[n] = rv_##n)
++#define RC_ADECL() __m128 rvacc = ctx->vu0_acc
++#define RC_ALD() (rvacc = ctx->vu0_acc)
++#define RC_AST() (ctx->vu0_acc = rvacc)
++
+ #define RC_U32(n) (static_cast<uint32_t>(rc_##n))
+ #define RC_S32(n) (static_cast<int32_t>(static_cast<uint32_t>(rc_##n)))
+ #define RC_U64(n) (static_cast<uint64_t>(rc_##n))

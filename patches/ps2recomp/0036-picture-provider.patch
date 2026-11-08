@@ -1,0 +1,78 @@
+Subject: [PATCH] Display: a picture provider - the game's own renderer's picture shown in
+ place of the GS's
+
+ps2_host_display::setPictureProvider: called on the window's thread before each drawing, it
+gives a GL texture the window shows in place of the GS's picture, the overlays (FPS, the settings
+panel, the debug UI) still drawn over it. For a native renderer (Transformers' DX12 one).
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_host_display.h b/ps2xRuntime/include/runtime/ps2_host_display.h
+index fbe1a92..d9ec43f 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -101,6 +101,15 @@ namespace ps2_host_display
+     void setOverlaySqueeze(float factor);
+     float overlaySqueeze();
+ 
++    // A picture made by the game's own renderer (a native one, drawing the game's scene itself),
++    // shown in the window in place of the GS's: the provider, called on the window's thread with
++    // its GL context current before each drawing, gives a GL texture and the part of it to show
++    // (its whole width and height), or returns false to show the GS's picture. The overlays (FPS,
++    // the settings panel, the debug UI) are drawn over it as over the GS's. Null (the default): none.
++    using PictureProvider = bool (*)(unsigned int &texture, int &width, int &height);
++    void setPictureProvider(PictureProvider provider);
++    PictureProvider pictureProvider();
++
+     // Interlaced field mode: which field each VBlank shows. -1 (the default): the VBlank's, as
+     // the console scans out. 0 or 1: always the field of the even or of the odd buffer rows,
+     // for a game whose fields are not two moments by turns. The GS then leaves out what is
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index 0bae53b..b3380fd 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -667,6 +667,21 @@ namespace ps2_host_display
+         return g_overlaySqueeze.load(std::memory_order_relaxed);
+     }
+ 
++    namespace
++    {
++        std::atomic<PictureProvider> g_pictureProvider{nullptr};
++    }
++
++    void setPictureProvider(PictureProvider provider)
++    {
++        g_pictureProvider.store(provider, std::memory_order_release);
++    }
++
++    PictureProvider pictureProvider()
++    {
++        return g_pictureProvider.load(std::memory_order_acquire);
++    }
++
+     namespace
+     {
+         uint64_t g_pictureCount = 0u; // (under g_mutex)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c23e107..1f9b7f8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2983,9 +2983,19 @@ void PS2Runtime::run()
+                 dstWidth,
+                 dstHeight};
+             ps2_gpu::Picture gpuPicture;
++            unsigned int providedTexture = 0u;
++            int providedWidth = 0, providedHeight = 0;
++            const ps2_host_display::PictureProvider provider = ps2_host_display::pictureProvider();
+             const int64_t showsNs = std::chrono::duration_cast<std::chrono::nanoseconds>(shows.time_since_epoch()).count();
+             const int64_t leewayNs = std::chrono::duration_cast<std::chrono::nanoseconds>(refreshPeriod).count() / 2;
+-            if (ps2_gpu::viewActive() &&
++            if (provider && provider(providedTexture, providedWidth, providedHeight) && providedTexture != 0u)
++            {
++                // The game's own renderer's picture (ps2_host_display::setPictureProvider).
++                const Texture2D provided{providedTexture, providedWidth, providedHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                const Rectangle providedSource{0.0f, 0.0f, static_cast<float>(providedWidth), static_cast<float>(providedHeight)};
++                DrawTexturePro(provided, providedSource, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            }
++            else if (ps2_gpu::viewActive() &&
+                 (byRefresh ? ps2_gpu::pictureFor(gpuPicture, showsNs, leewayNs) : ps2_gpu::picture(gpuPicture, pictureTick)))
+             {
+                 // The GPU renderer's picture (PS2X_GPU=1, F7): a texture of its shared context.

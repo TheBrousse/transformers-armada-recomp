@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work, looks wrong or crashes.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Please never attach game data: no disc images, no extracted files,
+        no save states, no memory cards and no play recordings. Screenshots and short videos are fine.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: F1 > About shows it.
+    validations:
+      required: true
+  - type: dropdown
+    id: renderer
+    attributes:
+      label: Renderer
+      options: [Native, Emulated, Not sure]
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: Your PC
+      description: Graphics card, Windows version and screen resolution.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected. Where in the game (level, area)?
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: settings.ini
+      description: Paste the contents of settings.ini from your install folder.
+      render: ini

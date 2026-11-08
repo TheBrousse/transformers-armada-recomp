@@ -1,0 +1,932 @@
+Subject: [PATCH] EE thread (FPS): calls left unfinished continued in place, cheaper checkpoints, scratchpad stores, DMA chains
+
+The game thread (EE) is the frame-rate limit in levels (TODO 62/94). Each change runs the same guest
+code in the same order with the same EE clock (a scripted cold boot into Amazon with VIF1 on the EE
+thread: the game's state identical on every frame before and after, also with the emulated IOP
+sound server).
+
+- A call left unfinished with nothing due (PS2Runtime::dispatchGuestBranch): the callee went on
+  somewhere else - a switch's jump table into a case body the function analysis made a function of
+  its own, or a branch into an epilogue shared with the function after it. Amazon: ~650,000 times
+  a second, mostly in two game functions (0x258690, 0x1FFC70). The whole host stack returned to the
+  dispatcher, which entered that address and then every caller again one by one. Now the code is
+  entered in place, with the dispatcher's checkpoints (8 cycles) at the same points: before each
+  address it would have entered and before each caller goes on (resumedByDispatcher). A checkpoint
+  due on the way takes the old way from there. PS2X_DISPATCH_CONTINUE=0: as before.
+- The checkpoint (EeScheduler::checkpointDue, every call and loop back edge) inline in
+  eeCheckpointDue and dispatchGuestBranch; the deadline and time-slice tests one compare
+  (m_fastEndCycle); the cycles for the EE timers and the IOP held until one of them could act on
+  them (accountCyclesInline / flushHeldCycles) - their own fast paths only added them up, so they
+  get the same cycles at the same checkpoint. A timer register, a call into the IOP or a save state
+  hands them on first (ps2EeFlushHeldCycles); what moves their next point forward asks for the
+  limit again (ps2EeInvalidateHeldCycles).
+- Stores to the scratchpad straight into it (Store8..Store128): the game keeps much of its working
+  state there and each went through PS2Memory::write*'s address translation. The DMA completions'
+  drain tests its flag before the call.
+- DMA chains: a tag's VIF codes and the payload right behind it copied as one stretch.
+- VIF1: the scan tests UNPACK first; the queue's clock is read only for PS2X_MTVU_STATS.
+- The dispatcher's per-thread state (history, levels) in one thread-local.
+- PS2X_EE_STATS=1 (debugging aid): every 2 s how often the dispatcher enters guest code again and
+  why (deadlines, slices, invocations, timer interrupts, the addresses, the calls left unfinished).
+
+On a GTX 1080 / Ryzen 5 5600 test PC, Amazon from its first gate, the user's settings at 1080 lines,
+120 held, game ticks 8600-13000, with the native capture's own changes (port commit):
+58.3-58.9 -> 72.0-72.5 fps (17.0 -> 13.8 ms a frame). The other PC (RX 5700 XT): 80.3 -> 93.1 fps.
+---
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -266,6 +266,60 @@ namespace ps2x::iop
+ // dropped (a reset, a state loaded).
+ void ps2IopFlushHeldEeCycles(ps2x::iop::IopSubsystem &iop) noexcept;
+ void ps2IopDropHeldEeCycles() noexcept;
++// How many more EE cycles the IOP can be given before its next batch is due (the most there
++// is when it is parked).
++uint64_t ps2IopHeldHeadroom() noexcept;
++// The EE scheduler's cycles held back from the EE timers and the IOP (EeScheduler::
++// accountCyclesInline): handed on now (before anything looks at either), or the next hand-over
++// moved to the next checkpoint (after something made one of them due sooner). On the EE
++// thread only; elsewhere they do nothing.
++void ps2EeFlushHeldCycles() noexcept;
++void ps2EeInvalidateHeldCycles() noexcept;
++
++// PS2X_EE_STATS=1 (debugging aid): how often the dispatcher re-enters guest code and why.
++struct EeDispatchStats
++{
++    uint64_t reentries = 0, invocations = 0, deadlines = 0, slices = 0, timerIrqs = 0;
++    uint64_t events[8] = {};
++    static constexpr size_t kPcSlotsO = 4096;
++    uint64_t unwound = 0, transfers = 0;
++    bool originNoted = false;
++    uint64_t origKey[kPcSlotsO] = {};
++    uint64_t origCount[kPcSlotsO] = {};
++    void noteOrigin(uint32_t target, uint32_t pc)
++    {
++        if (originNoted)
++            return;
++        originNoted = true;
++        const uint64_t key = (static_cast<uint64_t>(target) << 32) | pc;
++        size_t i = static_cast<size_t>((key >> 2) * 2654435761u % kPcSlotsO);
++        for (size_t n = 0; n < 16; ++n, i = (i + 1) % kPcSlotsO)
++            if (origKey[i] == key || origCount[i] == 0)
++            {
++                origKey[i] = key;
++                ++origCount[i];
++                return;
++            }
++    }
++    static constexpr size_t kPcSlots = 4096;
++    uint32_t pcKey[kPcSlots] = {};
++    uint64_t pcCount[kPcSlots] = {};
++    void notePc(uint32_t pc, bool unwinding)
++    {
++        unwound += unwinding ? 1u : 0u;
++        originNoted = false;
++        size_t i = (pc >> 2) * 2654435761u % kPcSlots;
++        for (size_t n = 0; n < 16; ++n, i = (i + 1) % kPcSlots)
++            if (pcKey[i] == pc || pcCount[i] == 0)
++            {
++                pcKey[i] = pc;
++                ++pcCount[i];
++                return;
++            }
++    }
++    void printIfDue();
++};
++extern EeDispatchStats g_eeDispatchStats;
+ 
+ class EeScheduler
+ {
+@@ -290,9 +344,12 @@ public:
+     void requestStop();
+     void postEvent(EeEvent event);
+     // A checkpoint of the generated code (every call and loop back edge): the cycles it is
+-    // charged, then whether something is due. Inline (PS2Runtime::eeCheckpointDue): the common
+-    // case is a few additions and compares, the time slice's end goes out of line.
+-    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
++    // charged, then whether something is due. Inline (PS2Runtime::eeCheckpointDue,
++    // dispatchGuestBranch): the common case is a few additions and two compares; the cycles the
++    // EE timers and the IOP are owed are handed on in one go when one of them could act on them
++    // (flushHeldCycles), and the deadline / time slice checks go out of line when the EE clock
++    // reaches the earlier of the two (m_fastEndCycle) - the same answers at the same checkpoints.
++    [[nodiscard]] PS2_FORCEINLINE bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+     {
+         const uint32_t override = m_cycleScaleOverride.load(std::memory_order_relaxed);
+         const uint32_t scale = override ? override : m_defaultScale256;
+@@ -309,19 +366,9 @@ public:
+             m_unwindingForCheckpoint = true;
+             return true;
+         }
+-        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+-        if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+-        {
+-            m_checkpointPending.store(true, std::memory_order_release);
+-            m_unwindingForCheckpoint = true;
+-            return true;
+-        }
+-        if (m_eeCycle < m_sliceEndCycle)
++        if (m_eeCycle < m_fastEndCycle)
+             return false;
+-        const bool due = timeSliceExpired();
+-        if (due)
+-            m_unwindingForCheckpoint = true;
+-        return due;
++        return checkpointDeadlineOrSlice();
+     }
+     // True while generated code is unwinding to the dispatcher because a
+     // checkpoint fired. A callee that yields this way can leave ctx->pc at its
+@@ -330,6 +377,12 @@ public:
+     [[nodiscard]] bool unwindingForCheckpoint() const noexcept { return m_unwindingForCheckpoint; }
+     void clearCheckpointUnwind() noexcept { m_unwindingForCheckpoint = false; }
+     void accountCycles(uint32_t cycles) noexcept;
++    // The cycles held back from the EE timers and the IOP (accountCyclesInline) handed on now,
++    // and the point of the next hand-over worked out again.
++    void flushHeldCycles() noexcept;
++    // The next hand-over at the next checkpoint (an EE timer or the IOP may act sooner now).
++    void invalidateHeldCycles() noexcept { m_heldLimit = 0u; }
++    [[nodiscard]] bool onExecutorThread() const noexcept { return std::this_thread::get_id() == m_executorThread; }
+     // A factor for the cycles executed guest code is charged (0: PS2X_EE_CYCLE_SCALE, 1 by
+     // default). Below 1 the EE runs faster than the console's: more code fits in a VBlank.
+     void setCycleScale(double factor) noexcept;
+@@ -480,7 +533,7 @@ public:
+ private:
+     // The cycles accounted: the clock, COP0 Count, the EE timers, the IOP (accountCycles and the
+     // checkpoint).
+-    void accountCyclesInline(uint32_t cycles) noexcept
++    PS2_FORCEINLINE void accountCyclesInline(uint32_t cycles) noexcept
+     {
+         const uint64_t elapsed = cycles != 0u ? cycles : 1u;
+         m_eeCycle += elapsed;
+@@ -490,16 +543,31 @@ private:
+         {
+             m_countContext->cop0_count = static_cast<uint32_t>(m_eeCycle);
+         }
+-        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+-        m_runtime.advanceIopEeCycles(elapsed);
+-        if (m_pendingEeTimerInterrupts != 0u)
+-        {
+-            m_checkpointPending.store(true, std::memory_order_release);
+-        }
++        // The EE timers and the IOP get these cycles when one of them could act on them: their
++        // own fast paths only add them up until their next interrupt / batch, so holding them
++        // here until then (m_heldLimit: the nearer of the two, worked out at every hand-over)
++        // gives them the same cycles at the same checkpoint. Whatever looks at either in
++        // between (a timer register, a call into the IOP, a save state) hands them on first
++        // (ps2EeFlushHeldCycles), and whatever moves their next point forward asks for the
++        // limit to be worked out again (ps2EeInvalidateHeldCycles).
++        m_heldCycles += elapsed;
++        if (m_heldCycles >= m_heldLimit)
++            flushHeldCycles();
++    }
++    // The checkpoint's out-of-line part: a deadline due by the EE clock, or the time slice over.
++    [[nodiscard]] bool checkpointDeadlineOrSlice() noexcept;
++    // m_fastEndCycle again: the earlier of the next deadline and the time slice's end.
++    void refreshFastEnd() noexcept
++    {
++        const uint64_t next = m_nextDeadlineCycle.load(std::memory_order_relaxed);
++        m_fastEndCycle = (next != 0u && next < m_sliceEndCycle) ? next : m_sliceEndCycle;
+     }
+     // The running thread's time slice is over: another of its priority or above takes over,
+     // or the slice starts again.
+     [[nodiscard]] bool timeSliceExpired() noexcept;
++    uint64_t m_heldCycles = 0u;       // accounted, not yet handed to the EE timers / IOP
++    uint64_t m_heldLimit = 0u;        // ... handed on once they reach this (0: at the next checkpoint)
++    uint64_t m_fastEndCycle = 0u;     // min(next deadline, time slice end): below it nothing is due by the clock
+     uint32_t m_cycleRemainder = 0u;   // (the cycle scale's fraction carried)
+     uint32_t m_defaultScale256 = 256u; // PS2X_EE_CYCLE_SCALE
+     bool m_unwindingForCheckpoint = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -100,9 +100,18 @@ namespace
+     }
+ }
+ 
++// PS2X_EE_STATS=1: the dispatcher's way back in counted (debugging aid; printed every 2 s).
++EeDispatchStats g_eeDispatchStats;
++namespace
++{
++    // The scheduler whose held cycles ps2EeFlushHeldCycles / ps2EeInvalidateHeldCycles reach.
++    EeScheduler *g_heldCyclesScheduler = nullptr;
++}
++
+ EeScheduler::EeScheduler(PS2Runtime &runtime)
+     : m_runtime(runtime)
+ {
++    g_heldCyclesScheduler = this;
+     m_defaultScale256 = cycleScale256();
+     if (const char *turbo = std::getenv("PS2X_TURBO_VSYNCS"))
+         m_turboUntilVSync = std::strtoull(turbo, nullptr, 10);
+@@ -184,6 +193,8 @@ void EeScheduler::skipHostTimeTo(std::chrono::steady_clock::time_point deadline)
+ 
+ EeScheduler::~EeScheduler()
+ {
++    if (g_heldCyclesScheduler == this)
++        g_heldCyclesScheduler = nullptr;
+     requestStop();
+ }
+ 
+@@ -223,6 +234,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_insideInterrupt = false;
+     m_pendingEeTimerInterrupts = 0u;
+     m_eeCycle = 0u;
++    m_heldCycles = 0u;
++    m_heldLimit = 0u;
+     m_sliceEndCycle = kDefaultTimeSliceCycles;
+     m_stopRequested.store(false, std::memory_order_release);
+     m_checkpointPending.store(false, std::memory_order_release);
+@@ -407,6 +420,10 @@ void EeScheduler::run()
+             continue;
+         }
+         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        ++g_eeDispatchStats.reentries;
++        g_eeDispatchStats.notePc(context.pc, m_unwindingForCheckpoint);
++        if ((g_eeDispatchStats.reentries & 0xFFFu) == 0u)
++            g_eeDispatchStats.printIfDue();
+ 
+         if (checkpointDue(kGuestDispatchCycles))
+         {
+@@ -427,6 +444,7 @@ void EeScheduler::run()
+         }
+         catch (const EeDispatcherTransfer &)
+         {
++            ++g_eeDispatchStats.transfers;
+             m_countContext = nullptr;
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+@@ -488,6 +506,7 @@ void EeScheduler::postEvent(EeEvent event)
+ 
+     {
+         std::lock_guard lock(m_eventMutex);
++        ++g_eeDispatchStats.events[static_cast<size_t>(event.type) & 7u];
+         m_events.push_back(event);
+         m_eventsPosted.store(true, std::memory_order_seq_cst);
+         m_checkpointPending.store(true, std::memory_order_seq_cst);
+@@ -531,6 +550,104 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     accountCyclesInline(cycles);
+ }
+ 
++void EeScheduler::flushHeldCycles() noexcept
++{
++    const uint64_t held = m_heldCycles;
++    m_heldCycles = 0u;
++    PS2Memory &memory = m_runtime.memory();
++    if (held != 0u)
++    {
++        // (as accountCyclesInline did at every checkpoint before: the timers, then the IOP)
++        m_pendingEeTimerInterrupts |= memory.advanceEeTimers(held);
++        m_runtime.advanceIopEeCycles(held);
++        if (m_pendingEeTimerInterrupts != 0u)
++        {
++            ++g_eeDispatchStats.timerIrqs;
++            m_checkpointPending.store(true, std::memory_order_release);
++        }
++    }
++    // The timers add cycles up without acting while they stay below their next interrupt and
++    // no GIF count is to be cleared (PS2Memory::advanceEeTimers), the IOP below its next batch.
++    const uint64_t timers = (!memory.m_gifFqcSet && memory.m_eeTimerInterrupts == 0u &&
++                             memory.m_eeTimerDue > memory.m_eeTimerCycles)
++                                ? memory.m_eeTimerDue - memory.m_eeTimerCycles
++                                : 0u;
++    m_heldLimit = std::min(timers, ps2IopHeldHeadroom());
++}
++
++bool EeScheduler::checkpointDeadlineOrSlice() noexcept
++{
++    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
++    if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
++    {
++        ++g_eeDispatchStats.deadlines;
++        m_checkpointPending.store(true, std::memory_order_release);
++        m_unwindingForCheckpoint = true;
++        return true;
++    }
++    if (m_eeCycle < m_sliceEndCycle)
++    {
++        refreshFastEnd();
++        return false;
++    }
++    const bool due = timeSliceExpired();
++    g_eeDispatchStats.slices += due ? 1u : 0u;
++    if (due)
++        m_unwindingForCheckpoint = true;
++    else
++        refreshFastEnd();
++    return due;
++}
++
++void EeDispatchStats::printIfDue()
++{
++    static const bool on = std::getenv("PS2X_EE_STATS") && *std::getenv("PS2X_EE_STATS") == '1';
++    if (!on)
++        return;
++    static auto last = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    const double secs = std::chrono::duration<double>(now - last).count();
++    if (secs < 2.0)
++        return;
++    last = now;
++    std::fprintf(stderr, "[ee stats] a second: re-entries %.0f, invocations %.0f, deadlines %.0f, slices %.0f, events vbs %.0f vbe %.0f dmac %.0f wake %.0f alarm %.0f, timer irqs %.0f\n",
++                 reentries / secs, invocations / secs, deadlines / secs, slices / secs, events[1] / secs, events[2] / secs,
++                 events[3] / secs, events[4] / secs, events[5] / secs, timerIrqs / secs);
++    std::vector<std::pair<uint64_t, uint32_t>> top;
++    for (size_t i = 0; i < kPcSlots; ++i)
++        if (pcCount[i])
++            top.push_back({pcCount[i], pcKey[i]});
++    std::sort(top.rbegin(), top.rend());
++    std::fprintf(stderr, "[ee stats]   unwound-for-checkpoint %.0f; top re-entry pcs:", unwound / secs);
++    for (size_t i = 0; i < top.size() && i < 12; ++i)
++        std::fprintf(stderr, " %08x:%.0f", top[i].second, top[i].first / secs);
++    std::vector<std::pair<uint64_t, uint64_t>> orig;
++    for (size_t i = 0; i < kPcSlotsO; ++i)
++        if (origCount[i])
++            orig.push_back({origCount[i], origKey[i]});
++    std::sort(orig.rbegin(), orig.rend());
++    std::fprintf(stderr, "\n[ee stats]   dispatcher transfers (throws) %.0f; calls left to the dispatcher (callee -> pc):", transfers / secs);
++    for (size_t i = 0; i < orig.size() && i < 12; ++i)
++        std::fprintf(stderr, " %08x->%08x:%.0f", static_cast<uint32_t>(orig[i].second >> 32), static_cast<uint32_t>(orig[i].second),
++                     orig[i].first / secs);
++    std::fprintf(stderr, "\n");
++    *this = EeDispatchStats{};
++}
++
++void ps2EeFlushHeldCycles() noexcept
++{
++    EeScheduler *scheduler = g_heldCyclesScheduler;
++    if (scheduler && scheduler->onExecutorThread())
++        scheduler->flushHeldCycles();
++}
++
++void ps2EeInvalidateHeldCycles() noexcept
++{
++    EeScheduler *scheduler = g_heldCyclesScheduler;
++    if (scheduler && scheduler->onExecutorThread())
++        scheduler->invalidateHeldCycles();
++}
++
+ void EeScheduler::skipIdleCycles() noexcept
+ {
+     constexpr uint64_t kStep = 65536u; // short enough for the timers and the IOP to keep up
+@@ -1245,6 +1362,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+ {
+     assertExecutor();
+     invocation.sequence = ++m_invocationSequence;
++    ++g_eeDispatchStats.invocations;
+     m_pendingInvocations.push_back(std::move(invocation));
+     m_checkpointPending.store(true, std::memory_order_release);
+ }
+@@ -2313,6 +2431,7 @@ void EeScheduler::updateNextDeadline()
+     if (m_deadlines.empty())
+     {
+         m_nextDeadlineCycle.store(0u, std::memory_order_release);
++        refreshFastEnd();
+         return;
+     }
+     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+@@ -2325,6 +2444,7 @@ void EeScheduler::updateNextDeadline()
+                                          return left.sequence < right.sequence;
+                                      });
+     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
++    refreshFastEnd();
+ }
+ 
+ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
+@@ -2344,6 +2464,7 @@ void EeScheduler::renewTimeSlice()
+ {
+     m_sliceEndCycle = m_eeCycle + kDefaultTimeSliceCycles;
+     m_timeSliceExpired = false;
++    refreshFastEnd();
+ }
+ 
+ void EeScheduler::copyMainContextToRuntime()
+@@ -2825,6 +2946,9 @@ void EeScheduler::loadState(ps2x::StateReader &in)
+     m_pendingEeTimerInterrupts = in.u32();
+     m_eeCycle = in.u64();
+     m_sliceEndCycle = in.u64();
++    // (cycles held from the timeline before the load are not the loaded one's)
++    m_heldCycles = 0u;
++    m_heldLimit = 0u;
+     m_insideInterrupt = false;
+     m_unwindingForCheckpoint = false;
+     m_countContext = nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -5,6 +5,9 @@
+ #include "runtime/ps2_vu1_native.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
++// (EeScheduler.cpp: the scheduler's cycles held back from the timers - see ee_scheduler.h)
++void ps2EeFlushHeldCycles() noexcept;
++void ps2EeInvalidateHeldCycles() noexcept;
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -496,6 +499,7 @@ void PS2Memory::resetEeTimers() noexcept
+     m_eeTimerDue = 0u;
+     m_eeTimerInterrupts = 0u;
+     m_gifFqcSet = true;
++    ps2EeInvalidateHeldCycles();
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimersSlow(uint64_t eeCycles) noexcept
+@@ -1289,16 +1293,24 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
+     if (address == 0x10003020u) // GIF_STAT
++    {
+         m_gifFqcSet = true;
++        ps2EeInvalidateHeldCycles(); // (the count is cleared at the next checkpoint, as before)
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        ps2EeFlushHeldCycles(); // (the cycles up to the last checkpoint, as the timers had them before)
+         catchUpEeTimers();
+         struct DueAgain // (the write can move the next interrupt)
+         {
+             PS2Memory &memory;
+-            ~DueAgain() { memory.m_eeTimerDue = memory.cyclesUntilNextEeTimerInterrupt(); }
++            ~DueAgain()
++            {
++                memory.m_eeTimerDue = memory.cyclesUntilNextEeTimerInterrupt();
++                ps2EeInvalidateHeldCycles();
++            }
+         } dueAgain{*this};
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+@@ -1713,11 +1725,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                         }
+ 
+-                        if (transferTagData)
+-                            appendVifTagData(currentTagAddr);
++                        // (FPS) The tag's VIF codes and a payload right behind it (CNT, NEXT, CALL, RET,
++                        // END) are one stretch of memory: one copy instead of two. Thousands of tags a
++                        // frame in a level's display list.
++                        const uint64_t mergedBytes = 8ull + static_cast<uint64_t>(tagQwc) * 16ull;
++                        if (transferTagData && hasPayload && dataAddr == currentTagAddr + 16u &&
++                            static_cast<uint64_t>(physTag) + 8ull + mergedBytes <= tagMax)
++                        {
++                            chainBuf.insert(chainBuf.end(), tp + 8u, tp + 8u + mergedBytes);
++                        }
++                        else
++                        {
++                            if (transferTagData)
++                                appendVifTagData(currentTagAddr);
+ 
+-                        if (hasPayload)
+-                            appendData(dataAddr, tagQwc);
++                            if (hasPayload)
++                                appendData(dataAddr, tagQwc);
++                        }
+                         endMadr = dataAddr + (hasPayload ? static_cast<uint32_t>(tagQwc) * 16u : 0u);
+                         if (irq && tieEnabled)
+                             endChain = true;
+@@ -1909,6 +1933,7 @@ void PS2Memory::processPendingTransfers()
+         uint32_t &gifStat = m_ioRegisters[kGifStat];
+         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+         m_gifFqcSet = true;
++        ps2EeInvalidateHeldCycles();
+     }
+ 
+     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+@@ -2542,6 +2567,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        ps2EeFlushHeldCycles();
+         catchUpEeTimers();
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -182,7 +182,18 @@ namespace
+         bool wrapped = false;
+     };
+ 
+-    thread_local DispatchHistory g_dispatchHistory;
++    // (FPS) The dispatcher's state per thread in one place: the history (pushDispatchPc), the call
++    // levels and which callers the dispatcher would have entered again (dispatchGuestBranch) - its
++    // address worked out once a call instead of at every use (a thread-local's look-up each time
++    // was ~3% of the game's thread).
++    constexpr uint32_t kDispatchLevels = 256u;
++    struct DispatchThread
++    {
++        DispatchHistory history;
++        uint32_t level = 0u;
++        bool resumedByDispatcher[kDispatchLevels] = {};
++    };
++    thread_local DispatchThread g_dispatchThread;
+ 
+     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+     {
+@@ -226,9 +237,21 @@ namespace
+         return true;
+     }
+ 
+-    void pushDispatchPc(uint32_t pc)
++    // (FPS) The dispatcher's call levels on this thread and, per level, whether that caller is one the
++    // dispatcher would have entered again after a callee below went on elsewhere (dispatchGuestBranch).
++    // PS2X_DISPATCH_CONTINUE=0: a call left unfinished returns to the dispatcher as before (an A/B).
++    bool dispatchContinuation()
++    {
++        static const bool on = []()
++        {
++            const char *env = std::getenv("PS2X_DISPATCH_CONTINUE");
++            return !env || *env != '0';
++        }();
++        return on;
++    }
++
++    void pushDispatchPc(DispatchHistory &h, uint32_t pc)
+     {
+-        DispatchHistory &h = g_dispatchHistory;
+         h.pcs[h.next] = pc;
+         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
+         if (h.next == 0u)
+@@ -239,7 +262,7 @@ namespace
+ 
+     std::string formatDispatchHistory()
+     {
+-        const DispatchHistory &h = g_dispatchHistory;
++        const DispatchHistory &h = g_dispatchThread.history;
+         const uint32_t count = h.wrapped ? static_cast<uint32_t>(h.pcs.size()) : h.next;
+         if (count == 0u)
+         {
+@@ -707,6 +730,14 @@ void ps2IopDropHeldEeCycles() noexcept
+ {
+     g_iopHeldEeCycles = 0u;
+     g_iopHeldLimit = 0u; // (worked out again at the next checkpoint)
++    ps2EeInvalidateHeldCycles();
++}
++
++uint64_t ps2IopHeldHeadroom() noexcept
++{
++    if (g_iopParked)
++        return std::numeric_limits<uint64_t>::max();
++    return g_iopHeldLimit > g_iopHeldEeCycles ? g_iopHeldLimit - g_iopHeldEeCycles : 0u;
+ }
+ 
+ namespace
+@@ -715,8 +746,16 @@ namespace
+     // after (the call may run it ahead).
+     struct IopCall
+     {
+-        explicit IopCall(ps2x::iop::IopSubsystem &subsystem) : iop(subsystem) { ps2IopFlushHeldEeCycles(iop); }
+-        ~IopCall() { g_iopHeldLimit = iop.eeCyclesUntilRun(); }
++        explicit IopCall(ps2x::iop::IopSubsystem &subsystem) : iop(subsystem)
++        {
++            ps2EeFlushHeldCycles(); // (the scheduler's held cycles first, as they were handed on before)
++            ps2IopFlushHeldEeCycles(iop);
++        }
++        ~IopCall()
++        {
++            g_iopHeldLimit = iop.eeCyclesUntilRun();
++            ps2EeInvalidateHeldCycles();
++        }
+         IopCall(const IopCall &) = delete;
+         IopCall &operator=(const IopCall &) = delete;
+         ps2x::iop::IopSubsystem &iop;
+@@ -787,6 +826,7 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ 
+ void PS2Runtime::resetIop()
+ {
++    ps2EeFlushHeldCycles();
+     g_iopParked = false;
+     ps2IopDropHeldEeCycles();
+     m_iopSubsystem->reset();
+@@ -794,9 +834,11 @@ void PS2Runtime::resetIop()
+ 
+ void PS2Runtime::setIopParked(bool parked) noexcept
+ {
++    ps2EeFlushHeldCycles(); // (what was held goes the way it went before; then the IOP's limit again)
+     if (parked && !g_iopParked)
+         ps2IopDropHeldEeCycles();
+     g_iopParked = parked;
++    ps2EeInvalidateHeldCycles();
+ }
+ 
+ bool PS2Runtime::iopParked() const noexcept
+@@ -1517,7 +1559,7 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+ 
+ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+-    pushDispatchPc(address);
++    pushDispatchPc(g_dispatchThread.history, address);
+ 
+     if (RecompiledFunction *entry = functionEntry(address); entry && *entry != nullptr)
+     {
+@@ -1772,8 +1814,23 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    pushDispatchPc(targetPc); // (as lookupFunction records it)
++    DispatchThread &thread = g_dispatchThread;
++    pushDispatchPc(thread.history, targetPc); // (as lookupFunction records it)
+     const uint32_t entryPc = ctx->pc;
++    // (FPS) The call's level among the dispatcher's calls on this thread, kept for the way back
++    // from a call left unfinished (below). A level beyond the table takes the old way.
++    const uint32_t level = thread.level + 1u;
++    struct LevelScope
++    {
++        DispatchThread &t;
++        LevelScope(DispatchThread &thread, uint32_t l) : t(thread)
++        {
++            t.level = l;
++            if (l < kDispatchLevels)
++                t.resumedByDispatcher[l] = false;
++        }
++        ~LevelScope() { --t.level; }
++    } levelScope{thread, level};
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1789,6 +1846,44 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         ctx->pc = fallthroughPc;
+     }
+ 
++    // (FPS) A call left unfinished with nothing due: the callee went on somewhere else - a switch's
++    // jump table into a case body the function analysis made a function of its own, or a branch into
++    // an epilogue shared with the function after it (Amazon: ~650,000 times a second, mostly in
++    // two game functions). Before, the whole host stack returned to the dispatcher, which entered
++    // that address and then every caller again one by one, each with its own checkpoint (8 cycles)
++    // - most of the game thread's dispatch time. Now the code is entered here, with the same
++    // checkpoints at the same points: the dispatcher's before each address it would have entered,
++    // and one before each caller goes on (resumedByDispatcher: the callers this host stack
++    // holds, which the dispatcher would have entered again). The same guest code in the same order
++    // with the same EE clock; only the host's stack differs. When a checkpoint is due on the way,
++    // the old way is taken from there (the stack returns to the dispatcher).
++    if (ctx->pc != fallthroughPc && m_eeScheduler && !m_eeScheduler->unwindingForCheckpoint() && level < kDispatchLevels &&
++        dispatchContinuation())
++    {
++        for (uint32_t l = 1u; l < level; ++l)
++            thread.resumedByDispatcher[l] = true;
++        while (ctx->pc != fallthroughPc)
++        {
++            if (m_eeScheduler->unwindingForCheckpoint())
++                return false;
++            const RecompiledFunction *entry = functionEntry(ctx->pc);
++            if (!entry || !*entry)
++                return false; // (the dispatcher reports it, as before)
++            if (m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++                return false; // (the dispatcher's own checkpoint before entering it)
++            const uint32_t continuePc = ctx->pc;
++            pushDispatchPc(thread.history, continuePc);
++            (*entry)(rdram, ctx, this);
++            if (isStopRequested() || ctx->pc == 0u || ctx->pc == continuePc)
++                return false; // (the dispatcher's business: a thread's end, a loop that yielded at its start)
++        }
++        // This call's caller goes on here: the dispatcher's checkpoint before entering it again.
++        if (m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++            return false;
++        m_eeScheduler->clearCheckpointUnwind();
++        return true;
++    }
++
+     if (ctx->pc == fallthroughPc)
+     {
+         // The call completed and execution continues here, so any checkpoint
+@@ -1796,9 +1891,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         if (m_eeScheduler)
+         {
+             m_eeScheduler->clearCheckpointUnwind();
++            // A caller the dispatcher would have entered again (a callee below went on elsewhere):
++            // its checkpoint, as above.
++            if (level < kDispatchLevels && thread.resumedByDispatcher[level])
++            {
++                thread.resumedByDispatcher[level] = false;
++                if (m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++                    return false;
++                m_eeScheduler->clearCheckpointUnwind();
++            }
+         }
+         return true;
+     }
++    g_eeDispatchStats.noteOrigin(targetPc, ctx->pc);
+     return false;
+ }
+ 
+@@ -1898,8 +2003,14 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+     raiseCop0Exception(ctx, EXCEPTION_BREAKPOINT);
+ }
+ 
++bool ps2EeFastPaths(unsigned bit) noexcept; // (EeScheduler.cpp: PS2X_EE_FASTPATHS, bit 2)
++
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
++    // (FPS: nothing queued - by far the common case - without the call that returns the causes)
++    static const bool fast = ps2EeFastPaths(2u);
++    if (fast && !m_memory.m_completedDmacPending.load(std::memory_order_acquire))
++        return;
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+@@ -2493,9 +2604,32 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+     }
+ }
+ 
++namespace
++{
++    // (FPS) A store to the scratchpad (0x70000000, 16 KB): straight into it, as PS2Memory::write*
++    // does after its checks (no other effect: no code region, no register there). The game keeps
++    // much of its working state there - every such store went through the general path, which
++    // was most of the EE thread's translateAddress time. Unaligned ones keep the general path
++    // (its address error).
++    template <typename T>
++    inline bool storeScratchpadFast(uint32_t vaddr, const T &value)
++    {
++        const uint32_t offset = vaddr - PS2_SCRATCHPAD_BASE;
++        if (offset > PS2_SCRATCHPAD_SIZE - sizeof(T) || (vaddr & (sizeof(T) - 1u)) != 0u)
++            return false;
++        uint8_t *scratchpad = ps2GetScratchpadHostPtr();
++        if (!scratchpad)
++            return false;
++        std::memcpy(scratchpad + offset, &value, sizeof(T));
++        return true;
++    }
++}
++
+ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
++    if (storeScratchpadFast(vaddr, value))
++        return;
+     try
+     {
+         m_memory.write8(vaddr, value);
+@@ -2509,6 +2643,8 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
+ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
++    if (storeScratchpadFast(vaddr, value))
++        return;
+     try
+     {
+         m_memory.write16(vaddr, value);
+@@ -2522,6 +2658,11 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
++    if (storeScratchpadFast(vaddr, value))
++    {
++        drainCompletedDmacHandlers(rdram); // (as after every 32-bit store before)
++        return;
++    }
+     try
+     {
+         m_memory.write32(vaddr, value);
+@@ -2536,6 +2677,8 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
++    if (storeScratchpadFast(vaddr, value))
++        return;
+     try
+     {
+         m_memory.write64(vaddr, value);
+@@ -2551,6 +2694,8 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
+     alignas(16) uint64_t _parts[2];
+     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
+     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
++    if (storeScratchpadFast(vaddr, _parts))
++        return;
+     try
+     {
+         m_memory.write128(vaddr, value);
+diff --git a/ps2xRuntime/src/lib/ps2_savestate.cpp b/ps2xRuntime/src/lib/ps2_savestate.cpp
+--- a/ps2xRuntime/src/lib/ps2_savestate.cpp
++++ b/ps2xRuntime/src/lib/ps2_savestate.cpp
+@@ -145,6 +145,7 @@ struct PS2StateAccess
+             std::lock_guard<std::mutex> lock(memory.m_completedDmacMutex);
+             out.podVector(memory.m_completedDmacCauses);
+         }
++        ps2EeFlushHeldCycles(); // (the EE scheduler's held cycles, as the timers had them before)
+         memory.catchUpEeTimers(); // (raises nothing: a step ends before an interrupt)
+         out.pod(memory.m_eeTimers);
+ 
+@@ -235,6 +236,7 @@ struct PS2StateAccess
+         memory.m_eeTimerDue = 0u; // (the next advance works it out)
+         memory.m_eeTimerInterrupts = 0u;
+         memory.m_gifFqcSet = true;
++        ps2EeInvalidateHeldCycles();
+ 
+         GifArbiter &arbiter = runtime.m_gifArbiter;
+         arbiter.m_queue.clear();
+@@ -504,7 +506,9 @@ struct PS2StateAccess
+ 
+     static void saveIop(PS2Runtime &runtime, ps2x::StateWriter &out)
+     {
++        ps2EeFlushHeldCycles();
+         ps2IopFlushHeldEeCycles(*runtime.m_iopSubsystem); // (what the EE held for it, in its balance)
++        ps2EeInvalidateHeldCycles();
+         runtime.m_iopSubsystem->saveState(out);
+         runtime.m_iopHost->saveState(out);
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+@@ -750,7 +750,34 @@ namespace
+                     memory.queueCompletedDmacCause(kQueuedIntcCauseFlag | kIntcVif1);
+             }
+ 
+-            if (opcode == kStcycl)
++            // (FPS: UNPACK - most of a display list's codes - tested first; the others after, as before)
++            if ((opcode & 0x60u) == 0x60u) // UNPACK
++            {
++                const uint32_t vn = (opcode >> 2) & 3u;
++                const uint32_t vl = opcode & 3u;
++                const uint32_t bitsPerComponent = vl == 0u ? 32u : (vl == 1u ? 16u : (vl == 2u ? 8u : (vn == 3u ? 4u : 16u)));
++                const uint32_t bitsPerVector = (vl == 3u && vn == 3u) ? 16u : (vn + 1u) * bitsPerComponent;
++                const uint32_t bytesPerVector = (bitsPerVector + 7u) / 8u;
++                const uint32_t writeCount = num == 0u ? 256u : num;
++                uint32_t cl = s.cycle & 0xFFu;
++                uint32_t wl = (s.cycle >> 8) & 0xFFu;
++                if (cl == 0u)
++                    cl = 1u;
++                if (wl == 0u)
++                    wl = 1u;
++                uint32_t sourceCount = writeCount;
++                if (cl < wl)
++                {
++                    uint32_t remainder = writeCount % wl;
++                    if (remainder > cl)
++                        remainder = cl;
++                    sourceCount = (writeCount / wl) * cl + remainder;
++                }
++                pos += (sourceCount * bytesPerVector + 3u) & ~3u;
++                if (pos > sizeBytes)
++                    break;
++            }
++            else if (opcode == kStcycl)
+             {
+                 s.cycle = imm;
+             }
+@@ -785,32 +812,6 @@ namespace
+                 pos += chunkQw * 16u;
+                 s.num = qwCount - chunkQw; // whatever is missing arrives with the next transfer
+             }
+-            else if ((opcode & 0x60u) == 0x60u) // UNPACK
+-            {
+-                const uint32_t vn = (opcode >> 2) & 3u;
+-                const uint32_t vl = opcode & 3u;
+-                const uint32_t bitsPerComponent = vl == 0u ? 32u : (vl == 1u ? 16u : (vl == 2u ? 8u : (vn == 3u ? 4u : 16u)));
+-                const uint32_t bitsPerVector = (vl == 3u && vn == 3u) ? 16u : (vn + 1u) * bitsPerComponent;
+-                const uint32_t bytesPerVector = (bitsPerVector + 7u) / 8u;
+-                const uint32_t writeCount = num == 0u ? 256u : num;
+-                uint32_t cl = s.cycle & 0xFFu;
+-                uint32_t wl = (s.cycle >> 8) & 0xFFu;
+-                if (cl == 0u)
+-                    cl = 1u;
+-                if (wl == 0u)
+-                    wl = 1u;
+-                uint32_t sourceCount = writeCount;
+-                if (cl < wl)
+-                {
+-                    uint32_t remainder = writeCount % wl;
+-                    if (remainder > cl)
+-                        remainder = cl;
+-                    sourceCount = (writeCount / wl) * cl + remainder;
+-                }
+-                pos += (sourceCount * bytesPerVector + 3u) & ~3u;
+-                if (pos > sizeBytes)
+-                    break;
+-            }
+         }
+     }
+ }
+@@ -872,7 +873,9 @@ namespace ps2vif1
+             return;
+         }
+ 
+-        const auto start = std::chrono::steady_clock::now();
++        // (FPS: the clock only for the statistics - QueryPerformanceCounter at every transfer and wait cost
++        // the game's thread measurably on some machines)
++        const auto start = statsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         const bool waited = waitFor(*w, [&]()
+                                     { return w->transfersQueued.load() - w->transfersDone.load() < kTransfersAhead; });
+         if (statsEnabled())
+@@ -949,7 +952,9 @@ namespace ps2vif1
+             return;
+         const uint64_t target = w->queued.load();
+         const uint64_t position = g_ahead.posted;
+-        const auto start = std::chrono::steady_clock::now();
++        // (FPS: the clock only for the statistics - QueryPerformanceCounter at every transfer and wait cost
++        // the game's thread measurably on some machines)
++        const auto start = statsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         const bool waited = waitFor(*w, [&]()
+                                     { return w->done.load() >= target; });
+         waitGs(position);
+@@ -1172,7 +1177,9 @@ namespace ps2vif1
+             return false;
+ 
+         const uint64_t target = a.settled;
+-        const auto start = std::chrono::steady_clock::now();
++        // (FPS: the clock only for the statistics - QueryPerformanceCounter at every transfer and wait cost
++        // the game's thread measurably on some machines)
++        const auto start = statsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         const bool waited = g_processed.load(std::memory_order_acquire) < target;
+         if (waited)
+             waitProcessed(target);

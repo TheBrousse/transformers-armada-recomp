@@ -1,0 +1,52 @@
+Subject: [PATCH] Presentation: the DXGI swap chain by default
+
+GL's swap presented as 'Composed: Copy with GPU GDI' (PresentMon, a 240 Hz FreeSync screen, a level
+at 120 pictures a second): its pictures reached the screen 10.4 ms apart, 44.5 ms at the 99th
+percentile, the desktop's compositor held to that rhythm. The flip-model swap chain is flipped to
+the screen full screen ('Independent Flip'): 8.3 ms apart, 12.5 ms at the 99th percentile.
+PS2X_PRESENT=gl: GL's own swap as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_host_present.h | 2 +-
+ ps2xRuntime/src/lib/ps2_host_present.cpp       | 8 +++++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_present.h b/ps2xRuntime/include/runtime/ps2_host_present.h
+index d4b7a55..e01d478 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_present.h
++++ b/ps2xRuntime/include/runtime/ps2_host_present.h
+@@ -10,7 +10,7 @@
+ // 65 pictures a second of the 120 handed to it (the screen refreshing with each). With the screen's
+ // refresh fixed (FreeSync off, or the game not in front) the desktop composes them all.
+ //
+-// PS2X_PRESENT=dxgi (off by default, a trial): a DXGI flip-model swap chain presents instead, the
++// The DXGI swap chain (the default since 2026-10-24; PS2X_PRESENT=gl: GL's swap): a DXGI flip-model swap chain presents, the
+ // way Direct3D games show theirs. The window's drawing (raylib's, unchanged) goes into one of three
+ // textures in turn; a thread of its own copies it into a texture of Direct3D 11's
+ // (WGL_NV_DX_interop2) and the swap chain presents that (ps2_host_present_dxgi.cpp). Full screen is
+diff --git a/ps2xRuntime/src/lib/ps2_host_present.cpp b/ps2xRuntime/src/lib/ps2_host_present.cpp
+index 8b01eda..19e29bc 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present.cpp
+@@ -23,10 +23,16 @@ namespace ps2_host_present
+         int g_width = 0, g_height = 0;
+         bool g_drawing = false;
+ 
++        // The DXGI swap chain by default since 2026-10-24 (PS2X_PRESENT=gl: GL's own swap). Measured
++        // with PresentMon on the user's 240 Hz FreeSync screen, a level at 120 pictures a second: GL's
++        // swap presented as "Composed: Copy with GPU GDI" - the desktop's compositor waited on each
++        // copy, its pictures 10.4 ms apart (44.5 ms at the 99th percentile) and the whole desktop held
++        // to that rhythm (the mouse, other games); the swap chain is flipped to the screen
++        // ("Independent Flip"): 8.3 ms apart, 12.5 ms at the 99th percentile, the desktop left alone.
+         bool requested()
+         {
+             const char *env = std::getenv("PS2X_PRESENT");
+-            return env && std::strcmp(env, "dxgi") == 0;
++            return !(env && std::strcmp(env, "gl") == 0);
+         }
+     }
+ 
+-- 
+2.54.0.windows.1
+

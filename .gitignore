@@ -1,0 +1,66 @@
+# Game data: bring your own disc. Never commit any of it.
+*.iso
+*.ISO
+*.bin
+*.img
+game/
+SLUS_206.68
+
+# Everything derived from the game executable
+work/
+
+# Build output and test runs
+out/
+build/
+build.log
+runs/
+# Reference saves for testing (game data: never committed)
+cards/
+ps2_log.txt
+
+# Save states hold the game's memory (and the memory card they were made with)
+states/
+*.ps2state
+# Play recordings (F2, TF_PLAY_RECORD): a save state or the memory card inside
+/Recordings/
+*.tfrec/
+
+# Texture packs (PCSX2-style replacements): someone else's art, bring your own
+/replacements/
+/textures/
+
+# Local scratch / reference checkouts
+_work/
+_elfcheck/
+_reference/
+__pycache__/
+*.pyc
+.vs/
+imgui.ini
+
+# The settings panel's choices (F5 while playing), and copies of them kept before a change
+settings.ini
+settings.ini.bak*
+
+# The renderer's compiled shaders, written while playing (an update would otherwise take them for
+# the player's own work: kept on a my-changes branch and deleted, so every shader compiled again)
+/shader cache/
+
+# The HD texture set made by tools\make_hd_textures.ps1 from your disc (game data: never committed)
+/hd_textures/
+
+# Local data, never committed: the mods built from your discs, your saves,
+# texture/movie dumps and work folders, downloaded tools
+/Mods/
+/Saves/
+/movies_hd/
+/texture_dumps/
+/texture_dumps_hq/
+/texture_pack_work/
+/ThirdParty/
+/mods-repo/
+
+
+# setup.ps1's remembered disc path (yours only) and update.ps1's own log
+/.setup.json
+/update.log

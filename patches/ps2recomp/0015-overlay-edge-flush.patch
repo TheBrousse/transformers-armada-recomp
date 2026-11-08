@@ -1,0 +1,33 @@
+Subject: [PATCH] Widescreen overlays: menus flush with the picture edges
+
+The game draws its 2D for 4:3; narrowed to keep its shape on a wider picture, a menu banner,
+box or button bar drawn from the 4:3 edge floated in from the sides. Vertices at the 4:3 edge
+now stay at the edge (PS2X_OVERLAY_FLUSH=0: the old way).
+---
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 8f7f06e..69289ca 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -458,9 +458,22 @@ namespace
+             t_overlayTag.placed = true;
+         }
+         const float pivot = t_overlayTag.anchor == 1 ? left : (t_overlayTag.anchor == 2 ? left + width : left + width * 0.5f);
++        // A menu's banner, box or button bar drawn from the 4:3 picture's edge keeps its end at the
++        // wider picture's edge (the vertices at the edge stay where they are, the others are narrowed),
++        // as a game made for widescreen draws them: flush with the sides, not floating in from them.
++        // PS2X_OVERLAY_FLUSH=0: narrowed whole.
++        static const bool flush = []()
++        {
++            const char *env = std::getenv("PS2X_OVERLAY_FLUSH");
++            return !(env && *env == '0');
++        }();
++        const float edge = width * 0.005f;
+         for (int i = 0; i < count; ++i)
+         {
+             out[i] = in[i];
++            const float x = in[i].x; // (in the same units as left: the frame offset already applied)
++            if (flush && (x <= left + edge || x >= left + width - edge))
++                continue;
+             out[i].x = pivot + (in[i].x - pivot) * t_overlayTag.factor;
+         }
+         return true;

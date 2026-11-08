@@ -1,0 +1,368 @@
+Subject: [PATCH] Runtime: the game's vibration on Xbox (XInput) controllers (TODO 200)
+
+A gamepad read through GLFW had no rumble; only the native DualSense / DualShock 4 path (0008) vibrated. On
+Windows ps2_xinput_rumble writes the motors of the first connected XInput pad while a GLFW gamepad drives the PS2
+pad, from the same guest actuator data the Sony path uses (small on/off -> wRightMotorSpeed, large 0..255 ->
+wLeftMotorSpeed, scaled by PS2X_SONYPAD_RUMBLE). Ticked on the window thread, so the motors stop when the window
+loses focus, while the game's input is blocked, when the game stops reading the pad for 300 ms (paused,
+loading) and at exit; a state load clears the guest motors (Sony pads too). XInput1_4.dll, else XInput9_1_0.dll,
+loaded at run time on the first vibration: no new link dependency. Never in a hidden window.
+PS2X_XINPUT_TRACE=1 logs the motor changes; =2 also calls in a hidden window without a pad (test machines).
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 16a2479..b6ffdf0 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -413,6 +413,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_sony_pad.cpp
+     src/lib/ps2_sony_pad_host.cpp
++    src/lib/ps2_xinput_rumble.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_xinput_rumble.h b/ps2xRuntime/include/runtime/ps2_xinput_rumble.h
+new file mode 100644
+index 0000000..b216dd5
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_xinput_rumble.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++// The game's vibration on an Xbox (XInput) controller (TODO 200). A gamepad read through GLFW (raylib) has no
++// rumble, so on Windows the motors are written with XInput: the first connected XInput pad, while the gamepad that
++// drives the PS2 pad is a GLFW one (the native Sony path, ps2_sony_pad.h, has its own motors). The values are the
++// game's own actuator data (ps2x::sonypad::guestMotors, set by the libpad / libvib HLE): the small motor on/off ->
++// wRightMotorSpeed (the high-frequency motor), the large one 0..255 -> wLeftMotorSpeed (the low-frequency motor),
++// both scaled by PS2X_SONYPAD_RUMBLE (0..100, the Vibration setting, read at start).
++//
++// The motors stop whenever the game is not taking the pad: the window unfocused, the game's input blocked (the F1
++// menu, the settings panel), the game not reading the pad for a moment (paused, loading, a state being loaded: its
++// motors are cleared), the gamepad no longer the GLFW one, and at exit (stop). XInput1_4.dll is loaded when first
++// needed, else XInput9_1_0.dll: no new link dependency, and nothing happens on a machine without either.
++// A hidden window (PS2X_WINDOW_HIDDEN, an unattended run) never takes the controller.
++// PS2X_XINPUT_TRACE=1 logs each motor change ("[xinput] ..."); =2 also makes the calls in a hidden or unfocused
++// window and without a GLFW gamepad (to user 0 when none is connected: the call then answers "not connected"), so a
++// test machine can show that the game's vibration reaches XInput.
++
++#include <cstdint>
++
++namespace ps2x::xinput
++{
++    struct Speeds
++    {
++        uint16_t left = 0u;  // wLeftMotorSpeed: the low-frequency motor (the PS2's large motor)
++        uint16_t right = 0u; // wRightMotorSpeed: the high-frequency motor (the PS2's small motor)
++        bool operator==(const Speeds &o) const { return left == o.left && right == o.right; }
++        bool operator!=(const Speeds &o) const { return !(*this == o); }
++    };
++    // The XInput speeds for the guest's motors at percent (0..100).
++    Speeds speedsFor(bool small, uint8_t large, int percent);
++
++    // The host pad backend's read (any thread): whether a GLFW gamepad (not the native Sony pad) drives the pad.
++    void notePadRead(bool glfwGamepad);
++    // The window thread, each frame: the motors as the game has them, or off (above).
++    void tick(bool focused, bool inputBlocked);
++    // The motors off (the runtime's exit, after the window loop).
++    void stop();
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 3dfd767..0f1c66e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -7,6 +7,7 @@ void ps2CaptureFrameAtVSync(PS2Runtime &runtime, uint64_t tick);
+ #include "ps2_runtime_macros.h"
+ #include "runtime/ps2_host_display.h"
+ #include "runtime/ps2_savestate.h"
++#include "runtime/ps2_sony_pad.h"
+ #include "runtime/ps2_vif1_thread.h"
+ 
+ #include <algorithm>
+@@ -2697,6 +2698,10 @@ bool EeScheduler::serviceStateRequests()
+             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loadStart).count();
+             std::cerr << "[state] loaded " << load.string() << " in " << static_cast<int>(ms + 0.5) << " ms (vblank " << m_vsyncTick
+                       << "; " << reason << ")" << std::endl;
++            // (TODO 200) The motors as the loaded moment has them: off until the game sets them again (a vibration
++            // running when the state was loaded does not carry on, on a Sony pad or an XInput one).
++            for (int port = 0; port < 2; ++port)
++                ps2x::sonypad::setGuestMotors(port, ps2x::sonypad::Motors{});
+             if (m_stateLoadedHook)
+                 m_stateLoadedHook();
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 59e2b9e..c892b47 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_stick_response.h"
+ #include "runtime/ps2_settings.h"
+ #include "runtime/ps2_sony_pad.h"
++#include "runtime/ps2_xinput_rumble.h"
+ #include "runtime/ps2_host_input.h"
+ #include "ps2_host_backend.h"
+ #include <vector>
+@@ -582,6 +583,8 @@ namespace ps2_host_input
+     void updateFromWindow()
+     {
+         collectWatchedKeyPresses();
++        // (TODO 200) The motors of a GLFW (XInput) gamepad, each window frame: the game's, or off.
++        ps2x::xinput::tick(IsWindowReady() && IsWindowFocused(), g_gameInputBlocked.load(std::memory_order_relaxed));
+         const MouseConfig &config = mouseConfig();
+         const bool mappedByGame = g_mouseMappedByGame.load(std::memory_order_relaxed);
+         if (config.test)
+@@ -727,6 +730,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     }
+ 
+     const int gamepad = live && !sonyPad && ps2x::sonypad::glfwGamepadsAllowed() ? firstGamepad() : -1;
++    // (TODO 200: a GLFW gamepad gets the game's vibration through XInput, ps2_xinput_rumble.h)
++    ps2x::xinput::notePadRead(gamepad >= 0);
+     if (gamepad >= 0)
+     {
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP), PAD_UP);
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+index 3f37188..6f92ebc 100644
+--- a/ps2xRuntime/src/lib/ps2_sony_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -2,6 +2,7 @@
+ // our earlier launcher's SonyPad.cs, cross-checked with Linux hid-playstation and SDL's hidapi drivers), the guest's vibration
+ // (libpad / libvib actuator data) and the PS2 pad report. Pure functions plus the small glue the pad backend calls.
+ #include "runtime/ps2_sony_pad.h"
++#include "runtime/ps2_xinput_rumble.h"
+ #include "raylib.h" // its GamepadButton codes, IsWindowReady
+ 
+ #include <algorithm>
+@@ -573,6 +574,7 @@ namespace ps2x::sonypad
+ 
+     void shutdown()
+     {
++        xinput::stop(); // (an XInput pad's motors too: ps2_xinput_rumble.h)
+         if (g_started.load(std::memory_order_acquire))
+             host::stop();
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_xinput_rumble.cpp b/ps2xRuntime/src/lib/ps2_xinput_rumble.cpp
+new file mode 100644
+index 0000000..9e5c63a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_xinput_rumble.cpp
+@@ -0,0 +1,221 @@
++// XInput vibration for GLFW gamepads (TODO 200): see ps2_xinput_rumble.h.
++#include "runtime/ps2_xinput_rumble.h"
++#include "runtime/ps2_sony_pad.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h> // this file never includes raylib, whose names clash with it
++#endif
++
++namespace ps2x::xinput
++{
++    Speeds speedsFor(bool small, uint8_t large, int percent)
++    {
++        const uint32_t p = static_cast<uint32_t>(std::clamp(percent, 0, 100));
++        Speeds s;
++        s.left = static_cast<uint16_t>(static_cast<uint32_t>(large) * 257u * p / 100u);
++        s.right = small ? static_cast<uint16_t>(65535u * p / 100u) : uint16_t{0};
++        return s;
++    }
++
++    namespace
++    {
++        std::atomic<bool> g_glfwGamepad{false};
++        std::atomic<int64_t> g_lastReadMs{LLONG_MIN / 2};
++
++        int64_t nowMs()
++        {
++            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        }
++
++        bool environmentOn(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return v && *v && *v != '0';
++        }
++
++        // A read this long ago is a game not taking the pad (paused, loading, a state being loaded).
++        constexpr int64_t kReadStaleMs = 300;
++        // How often a missing XInput pad is looked for (XInputGetState of an empty slot is slow).
++        constexpr int64_t kScanMs = 1000;
++
++        struct Settings
++        {
++            int percent = 100;
++            int trace = 0; // PS2X_XINPUT_TRACE
++            bool hidden = false;
++        };
++        const Settings &settings()
++        {
++            static const Settings s = []()
++            {
++                Settings out;
++                if (const char *env = std::getenv("PS2X_SONYPAD_RUMBLE"); env && *env)
++                    out.percent = std::clamp(std::atoi(env), 0, 100);
++                if (const char *env = std::getenv("PS2X_XINPUT_TRACE"); env && *env)
++                    out.trace = std::clamp(std::atoi(env), 0, 2);
++                out.hidden = environmentOn("PS2X_WINDOW_HIDDEN");
++                return out;
++            }();
++            return s;
++        }
++
++#if defined(_WIN32)
++        // XINPUT_STATE / XINPUT_VIBRATION as xinput.h has them (kept here: no xinput.h, no import library).
++        struct PadState
++        {
++            DWORD packet;
++            WORD buttons;
++            BYTE leftTrigger, rightTrigger;
++            SHORT thumbLX, thumbLY, thumbRX, thumbRY;
++        };
++        struct Vibration
++        {
++            WORD left, right;
++        };
++        using GetStateFn = DWORD(WINAPI *)(DWORD, PadState *);
++        using SetStateFn = DWORD(WINAPI *)(DWORD, Vibration *);
++
++        struct Api
++        {
++            GetStateFn getState = nullptr;
++            SetStateFn setState = nullptr;
++        };
++        // Loaded the first time the game vibrates (the window thread only).
++        const Api &api()
++        {
++            static const Api a = []()
++            {
++                Api out;
++                for (const wchar_t *dll : {L"xinput1_4.dll", L"xinput9_1_0.dll"})
++                {
++                    HMODULE module = LoadLibraryW(dll);
++                    if (!module)
++                        continue;
++                    out.getState = reinterpret_cast<GetStateFn>(reinterpret_cast<void *>(GetProcAddress(module, "XInputGetState")));
++                    out.setState = reinterpret_cast<SetStateFn>(reinterpret_cast<void *>(GetProcAddress(module, "XInputSetState")));
++                    if (out.getState && out.setState)
++                    {
++                        std::fprintf(stderr, "[xinput] vibration for Xbox controllers: %ls\n", dll);
++                        return out;
++                    }
++                    out = Api{};
++                    FreeLibrary(module);
++                }
++                std::fprintf(stderr, "[xinput] no XInput DLL: Xbox controllers do not vibrate\n");
++                return out;
++            }();
++            return a;
++        }
++
++        // The window thread's.
++        int g_user = -1;      // the XInput pad written to; -1: none found yet
++        int64_t g_nextScan = 0;
++        Speeds g_written;     // what the pad was last told (off: it is never touched before the game vibrates)
++
++        int firstConnectedUser()
++        {
++            for (DWORD i = 0; i < 4; ++i)
++            {
++                PadState state{};
++                if (api().getState(i, &state) == ERROR_SUCCESS)
++                    return static_cast<int>(i);
++            }
++            return -1;
++        }
++
++        void write(const Speeds &s, const char *why)
++        {
++            Vibration v{s.left, s.right};
++            const DWORD result = api().setState(static_cast<DWORD>(g_user), &v);
++            if (settings().trace)
++            {
++                const sonypad::Motors m = sonypad::guestMotors(0);
++                std::fprintf(stderr, "[xinput] motors: guest small %s large %u -> left %u right %u, user %d (%s): %s\n",
++                             m.small ? "on" : "off", static_cast<unsigned>(m.large), static_cast<unsigned>(s.left),
++                             static_cast<unsigned>(s.right), g_user, why,
++                             result == ERROR_SUCCESS ? "ok" : result == ERROR_DEVICE_NOT_CONNECTED ? "not connected" : "error");
++            }
++            if (result == ERROR_SUCCESS)
++                g_written = s;
++            else
++            {
++                g_written = Speeds{}; // (a pad that went away is off; one found again starts from off)
++                g_user = -1;
++            }
++        }
++#endif
++    }
++
++    void notePadRead(bool glfwGamepad)
++    {
++        g_glfwGamepad.store(glfwGamepad, std::memory_order_relaxed);
++        g_lastReadMs.store(nowMs(), std::memory_order_relaxed);
++    }
++
++    void tick(bool focused, bool inputBlocked)
++    {
++#if defined(_WIN32)
++        const Settings &cfg = settings();
++        const bool test = cfg.trace >= 2;
++        if (cfg.hidden && !test)
++            return;
++        const int64_t now = nowMs();
++        const bool reading = now - g_lastReadMs.load(std::memory_order_relaxed) < kReadStaleMs;
++        const bool active = reading && !inputBlocked && (test || (focused && g_glfwGamepad.load(std::memory_order_relaxed)));
++        Speeds want;
++        if (active)
++        {
++            const sonypad::Motors m = sonypad::guestMotors(0);
++            want = speedsFor(m.small, m.large, cfg.percent);
++        }
++        if (want == g_written)
++            return;
++        // (only here, the first time the game vibrates: a game that never does never loads XInput)
++        if (!api().setState)
++            return;
++        if (g_user < 0)
++        {
++            if (want == Speeds{})
++            {
++                g_written = Speeds{};
++                return;
++            }
++            if (now < g_nextScan)
++                return;
++            g_nextScan = now + kScanMs;
++            g_user = firstConnectedUser();
++            if (g_user < 0)
++            {
++                if (!test)
++                    return;
++                g_user = 0; // (the test mode's call to an empty slot)
++            }
++        }
++        write(want, active ? "the game" : "off: the game is not taking the pad");
++#else
++        (void)focused;
++        (void)inputBlocked;
++#endif
++    }
++
++    void stop()
++    {
++#if defined(_WIN32)
++        if (g_user >= 0 && g_written != Speeds{} && api().setState)
++            write(Speeds{}, "off: exit");
++#endif
++    }
++}

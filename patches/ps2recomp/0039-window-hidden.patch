@@ -1,0 +1,31 @@
+Subject: [PATCH] Window: PS2X_WINDOW_HIDDEN=1 keeps the window hidden
+
+For test machines running the game unattended: the window is created hidden (raylib
+FLAG_WINDOW_HIDDEN) and stays out of full screen; the game draws to it as before (screenshots,
+the native renderer's pictures work the same).
+---
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1f9b7f8..d1be642 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1052,7 +1052,10 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        // PS2X_WINDOW_HIDDEN=1: the window never shown (test machines running the game unattended):
++        // it is made hidden and stays out of full screen; the game draws to it all the same.
++        const bool hiddenWindow = std::getenv("PS2X_WINDOW_HIDDEN") && *std::getenv("PS2X_WINDOW_HIDDEN") == '1';
++        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (hiddenWindow ? FLAG_WINDOW_HIDDEN : 0u));
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         // PS2X_PRESENT=dxgi: the window's pictures through a DXGI swap chain (ps2_host_present.h),
+         // started before full screen, which is the screen's exact size with it.
+@@ -1079,7 +1082,7 @@ bool PS2Runtime::initialize(const char *title)
+                                   static_cast<int>(origin.y) + (GetMonitorHeight(monitor) - GetScreenHeight()) / 2);
+             }
+         }
+-        if (const char *full = std::getenv("PS2X_FULLSCREEN"); full && *full && *full != '0')
++        if (const char *full = std::getenv("PS2X_FULLSCREEN"); full && *full && *full != '0' && !hiddenWindow)
+             setDisplayMode(*full == '2' ? 2 : 1);
+         ps2_host_display::setWindow(GetWindowHandle()); // (its screen's vertical blanks: the refresh)
+         {

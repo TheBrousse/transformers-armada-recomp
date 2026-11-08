@@ -1,0 +1,32 @@
+Subject: [PATCH] GS read-back ahead: the capture already taken, without
+ waiting
+
+A small region read back every frame (Transformers' 64 x 64 lens-flare occlusion buffer) held the EE until the GS thread reached it; a frame that missed its VBlank by that wait lost a whole frame. It is now answered from the capture already taken (the frame before's). PS2X_READBACK_STALE=0: wait as before.
+---
+ ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 3cdcb5b..1ea2393 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -321,7 +321,18 @@ bool GSThreadedBackend::ReadbackAhead(const GSTransferCommand &command, uint8_t
+         m_readbackPending = false;
+         publish();
+     }
+-    waitCaptured(position, captureNumber);
++    // The capture already taken (the frame before's, as a rule) without waiting for this one: a
++    // small region read back every frame - Transformers' 64 x 64 occlusion buffer for its lens
++    // flares' visibility - otherwise holds the EE until the GS thread gets to it, and a frame that
++    // misses its VBlank by that wait loses a whole frame (Deep Amazon replayed: a quarter fewer
++    // such frames). PS2X_READBACK_STALE=0: wait for this frame's, as before.
++    static const bool stale = []()
++    {
++        const char *env = std::getenv("PS2X_READBACK_STALE");
++        return !(env && *env == '0');
++    }();
++    if (!stale || m_capturesTaken.load(std::memory_order_acquire) == 0u)
++        waitCaptured(position, captureNumber);
+     {
+         std::lock_guard<std::mutex> lock(m_captureMutex);
+         bytes = std::min(maxBytes, m_capturedBytes);

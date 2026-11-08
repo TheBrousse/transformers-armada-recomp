@@ -1,0 +1,681 @@
+Subject: [PATCH] GS GPU renderer: settings lowered when the card falls behind; GPU resets told, not fatal (TODO 202)
+
+Patch 0087 fitted the Resolution and Multisampling to the card's memory; on the GTX 1080 the game still crashed at
+7x8 with 4 samples (5-10 pictures a second, then a GPU reset by Windows and 0xC0000409 in NVIDIA's OpenGL driver).
+Memory was not the cause: the card was too slow.
+
+The GPU-time watch (Impl::watchGpuTime): at each presentation a GPU timestamp is queued beside the GPU's clock at
+that moment; when it comes back, the distance is how far behind the GPU was (its backlog; the game's own slowness
+leaves none). Behind by more than 150 ms over most of the last 16 presentations, or by more than 800 ms once (also
+for a timestamp still out), the settings go one step down the ladder 0087 uses (8 samples to 4, the Resolution
+down to 4, samples to 2 and none, the Resolution further) for the rest of the run, judged afresh 3 s later. The
+step (Impl::rescaleAll) sends every buffer to local memory as a buffer pushed out of the cache is, and makes the
+pictures, the composing textures and the multisampled copies again at the new scale (old pictures deleted once
+no presentation shows them). The settings stay as chosen; one log line a step. PS2X_GPU_TIME_WATCH=0 turns it
+off; PS2X_GPU_SLOW_TEST=<ms> or x<n> (tests) measures each backlog that much longer or n times as long;
+PS2X_GPU_TIME_LOG=1 logs the backlog once a second. Measured on an RX 7900 XTX at Resolution 8 with 8 samples
+(Amazon): a median backlog of 4 ms (27 at most), so no step there.
+
+The batch cap (Impl::capBatch), the part that kept the GTX 1080 alive: on it, the reset came from ONE batch, not
+from the frame rate - at Resolution 6 without samples its frames took ~40 ms of the GPU, then one batch of a busy
+scene (hundreds of thousands of vertices over the same pixels) took 300 ms and a later one passed 2 s (reset at
+any setting from 5x6 up; 14 minutes fine at Resolution 2). A batch now ends at 65536 vertices (as at any other
+batch boundary) and goes to the GPU at once (glFlush), so no single piece of GPU work grows past what the card does
+in well under a second. Checked there: Resolution 6 without samples, which reset after ~170 s, ran 14 minutes with
+no GPU event. On the RX 7900 XTX it ends ~4.5 batches more a picture, the same frame rate.
+PS2X_GPU_BATCH_VERTICES=<n>: the cap (0: none). With PS2X_GPU_STATS or PS2X_GPU_PROFILE, a piece of GPU work over
+250 ms is logged as it is seen (pass and kind).
+
+Robust contexts: raylib's window context is made with GLFW_CONTEXT_ROBUSTNESS = LOSE_CONTEXT_ON_RESET (a line
+added to the fetched raylib source by CMakeLists.txt; PS2X_GL_ROBUST=0 at run time leaves it out), and the GS
+renderer's context asks the same. A GPU reset is then told (glGetGraphicsResetStatus) instead of the driver
+ending the program: the game logs it, shows a message saying what to lower (not in a hidden window) and ends
+with exit code 202. A lost context cannot be had back (the window's own is lost too). Drivers without
+WGL_ARB_create_context_robustness (AMD's) keep plain contexts, as before. PS2X_GPU_RESET_TEST=<VBlank> (tests):
+as if the reset came then.
+
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index b6ffdf05..456c030a 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -82,6 +82,27 @@ else()
+         GIT_PROGRESS TRUE
+     )
+     FetchContent_MakeAvailable(raylib)
++    # (TODO 202) The window's OpenGL context made robust ("lose context on reset"): when Windows resets a GPU that
++    # fell too far behind, the driver tells the program (glGetGraphicsResetStatus) instead of ending it - NVIDIA's
++    # OpenGL driver ends a program with a non-robust context there (0xC0000409). The GS renderer's own context shares
++    # with this one and asks the same (gs_gpu.cpp). raylib has no option for it, so its window hints get one line,
++    # added once to the fetched source; PS2X_GL_ROBUST=0 at run time leaves the context as raylib makes it.
++    if(DEFINED raylib_SOURCE_DIR AND EXISTS "${raylib_SOURCE_DIR}/src/platforms/rcore_desktop_glfw.c")
++        set(_ps2x_rcore "${raylib_SOURCE_DIR}/src/platforms/rcore_desktop_glfw.c")
++        file(READ "${_ps2x_rcore}" _ps2x_rcore_text)
++        if(NOT _ps2x_rcore_text MATCHES "PS2X_GL_ROBUST")
++            # (on the same line, before the line's comment: the line numbers stay)
++            set(_ps2x_hints "    glfwDefaultWindowHints();")
++            string(REPLACE "${_ps2x_hints}"
++                "${_ps2x_hints} if (!getenv(\"PS2X_GL_ROBUST\") || getenv(\"PS2X_GL_ROBUST\")[0] != '0') glfwWindowHint(GLFW_CONTEXT_ROBUSTNESS, GLFW_LOSE_CONTEXT_ON_RESET); /* PS2X_GL_ROBUST: PS2Recomp, TODO 202 */"
++                _ps2x_rcore_new "${_ps2x_rcore_text}")
++            if(_ps2x_rcore_new STREQUAL _ps2x_rcore_text)
++                message(WARNING "raylib's window hints not found: its context stays non-robust (TODO 202)")
++            else()
++                file(WRITE "${_ps2x_rcore}" "${_ps2x_rcore_new}")
++            endif()
++        endif()
++    endif()
+ 
+     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+         FetchContent_Declare(
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 57d1a6ba..10f54fb5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -30,6 +30,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
+ #include <filesystem>
+ #include <functional>
+ #include <initializer_list>
+@@ -64,6 +65,30 @@ namespace
+     std::atomic<bool> g_view{false};
+     std::atomic<int> g_scaleX{1}, g_scaleY{1}; // GL pixels per GS pixel across and down (chosen with the window)
+     std::atomic<int> g_msaaMost{8};            // the most samples the graphics card's memory allows (fitToMemory)
++    bool g_robust = false;                     // (TODO 202) both contexts told of a GPU reset (createContext)
++
++    void gpuResetMessage(const char *text); // (at the end of the file: Windows' own headers there)
++
++    // (TODO 202) The GPU was reset under the game: its contexts are lost - the window's too, so what was on the GPU,
++    // the game's own drawing included, cannot be had back. The game ends with a message and a log line saying what
++    // to change (instead of being ended by the driver with no word). Exit code 202. PS2X_GPU_RESET_TEST=<VBlank>
++    // (tests): as if the reset came then.
++    [[noreturn]] void gpuWasReset(unsigned status, int sx, int sy, int samples)
++    {
++        const char *whose = status == 0x8253 ? "by this game's drawing" : status == 0x8254 ? "by another program" : "for a reason not given";
++        char text[640];
++        std::snprintf(text, sizeof(text),
++                      "The graphics card was reset by Windows (%s): it fell too far behind with the emulated renderer at "
++                      "Resolution %dx%d with %d samples.\n\nThe game has to close. Lower Graphics > Resolution or Multisampling, "
++                      "or choose the native renderer (Graphics > Renderer), and start it again.",
++                      whose, sx, sy, samples);
++        std::fprintf(stderr, "[gpu] the GPU was reset (status %#x, %s) at Resolution %dx%d with %d samples: the game ends (TODO 202)\n",
++                     status, whose, sx, sy, samples);
++        std::fflush(nullptr); // (every stream: the log, a draw log)
++        if (!envFlag("PS2X_WINDOW_HIDDEN", false))
++            gpuResetMessage(text);
++        std::_Exit(202);
++    }
+ 
+     // PS2X_GPU_MSAA as asked (4 when not given), no more than the card's memory allows.
+     int msaaAsked()
+@@ -109,40 +134,54 @@ namespace
+         return (1160.0 + 26.6 * pixels + 14.6 * pixels * std::max(samples, 0)) * 7.0 / 6.0;
+     }
+ 
++    // (TODO 202) One step down the ladder the renderer lowers its settings by, for the card's memory (fitToMemory)
++    // and for its time (the GPU-time watch, Impl::watchGpuTime): 8 samples to 4 first, then the Resolution down to
++    // 4 (across before down when they differ), then the samples to 2 and none, then the Resolution further. False
++    // when there is no step left (1x1 without samples).
++    bool lowerOneStep(int &sx, int &sy, int &samples)
++    {
++        const auto lowerScale = [&]()
++        {
++            if (sx >= sy && sx > 1)
++                --sx;
++            else if (sy > 1)
++                --sy;
++        };
++        if (samples > 4)
++            samples = 4;
++        else if (std::max(sx, sy) > 4)
++            lowerScale();
++        else if (samples > 0)
++            samples = samples > 2 ? 2 : 0;
++        else if (sx > 1 || sy > 1)
++            lowerScale();
++        else
++            return false;
++        return true;
++    }
++
++    // PS2X_GPU_MSAA as the renderer takes it: 0, 2, 4 or 8.
++    int samplesAsked()
++    {
++        const int samples = std::min(envInt("PS2X_GPU_MSAA", 4), 8);
++        return samples >= 8 ? 8 : (samples >= 4 ? 4 : (samples >= 2 ? 2 : 0));
++    }
++
+     // (TODO 202) At Resolution 8 with 8x multisampling the renderer holds about 10 GB, more than many cards have
+-    // (a GTX 1080: 8 GB). There the GPU's work stalled until Windows reset it, and NVIDIA's OpenGL driver ends the
+-    // program when that happens (0xC0000409 in nvoglv64.dll, two seconds after the driver's reset event). So the
+-    // Resolution and Multisampling asked are lowered, for this run only (the settings stay as chosen), until the
+-    // renderer fits in 85% of the card's memory: 8 samples to 4 first, then the Resolution down to 4, then the
+-    // samples to 2 and none, then the Resolution further.
++    // (a GTX 1080: 8 GB). So the Resolution and Multisampling asked are lowered, for this run only (the settings
++    // stay as chosen), until the renderer fits in 85% of the card's memory (lowerOneStep's ladder). Memory was not
++    // the whole of it - fitted, the GTX 1080 still ran out of time (Impl::watchGpuTime) - but a card short of
++    // memory pages its buffers in and out, and starts much slower than it need be.
+     void fitToMemory(int &sx, int &sy)
+     {
+         const int card = cardMemoryMb();
+-        int samples = std::min(envInt("PS2X_GPU_MSAA", 4), 8);
+-        samples = samples >= 8 ? 8 : (samples >= 4 ? 4 : (samples >= 2 ? 2 : 0));
++        int samples = samplesAsked();
+         const int askedX = sx, askedY = sy, askedSamples = samples;
+         if (card <= 0)
+             return;
+         const double budget = card * 0.85;
+-        const auto lowerScale = [&]()
++        while (memoryNeededMb(sx, sy, samples) > budget && lowerOneStep(sx, sy, samples))
+         {
+-            if (sx >= sy && sx > 1)
+-                --sx;
+-            else if (sy > 1)
+-                --sy;
+-        };
+-        while (memoryNeededMb(sx, sy, samples) > budget)
+-        {
+-            if (samples > 4)
+-                samples = 4;
+-            else if (std::max(sx, sy) > 4)
+-                lowerScale();
+-            else if (samples > 0)
+-                samples = samples > 2 ? 2 : 0;
+-            else if (sx > 1 || sy > 1)
+-                lowerScale();
+-            else
+-                break;
+         }
+         g_msaaMost.store(samples);
+         if (sx != askedX || sy != askedY || samples != askedSamples)
+@@ -212,6 +251,23 @@ bool ps2_gpu::createContext()
+         return false;
+     }
+     glfwDefaultWindowHints();
++    // (TODO 202) A context made robust is told of a GPU reset (glGetGraphicsResetStatus, watchGpuTime) where a plain
++    // one has the program ended by NVIDIA's driver. One sharing with the window's must ask what the window's has
++    // (raylib's, made robust by PS2Recomp's CMakeLists unless PS2X_GL_ROBUST=0), else it is not made.
++    {
++        GLint strategy = 0;
++        glGetIntegerv(0x8256 /* GL_RESET_NOTIFICATION_STRATEGY */, &strategy);
++        while (glGetError() != GL_NO_ERROR)
++        {
++        }
++        const int asked = glfwGetWindowAttrib(window, GLFW_CONTEXT_ROBUSTNESS);
++        g_robust = strategy == 0x8252 /* GL_LOSE_CONTEXT_ON_RESET */ || asked == GLFW_LOSE_CONTEXT_ON_RESET;
++        std::fprintf(stderr, "[gpu] the window's context: reset notification %#x, robustness %#x; the driver %s robust contexts (TODO 202)\n",
++                     static_cast<unsigned>(strategy), static_cast<unsigned>(asked),
++                     glfwExtensionSupported("WGL_ARB_create_context_robustness") ? "makes" : "does not make");
++        if (g_robust)
++            glfwWindowHint(GLFW_CONTEXT_ROBUSTNESS, GLFW_LOSE_CONTEXT_ON_RESET);
++    }
+     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+     glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+@@ -226,6 +282,19 @@ bool ps2_gpu::createContext()
+         if (g_context)
+             break;
+     }
++    if (!g_context && g_robust) // (a driver that takes no robust context for sharing: the plain one, as before)
++    {
++        g_robust = false;
++        glfwWindowHint(GLFW_CONTEXT_ROBUSTNESS, GLFW_NO_ROBUSTNESS);
++        for (const int minor : {6, 5})
++        {
++            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
++            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, minor);
++            g_context = glfwCreateWindow(16, 16, "GS", nullptr, window);
++            if (g_context)
++                break;
++        }
++    }
+     glfwMakeContextCurrent(window);
+     if (!g_context)
+     {
+@@ -270,8 +339,9 @@ bool ps2_gpu::createContext()
+     fitToMemory(scaleX, scaleY);
+     g_scaleX.store(scaleX);
+     g_scaleY.store(scaleY);
+-    std::fprintf(stderr, "[gpu] OpenGL context for the GS renderer created (%s)\n",
+-                 reinterpret_cast<const char *>(glGetString(GL_RENDERER)));
++    std::fprintf(stderr, "[gpu] OpenGL context for the GS renderer created (%s)%s\n",
++                 reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
++                 g_robust ? ", robust: a GPU reset is told to the game (TODO 202)" : ", not robust (PS2X_GL_ROBUST=0 or the driver)");
+     return true;
+ }
+ 
+@@ -973,6 +1043,65 @@ struct GSGpuRenderer::Impl
+     // waits for the GPU to finish the older one before making more (two frames' pictures in flight).
+     std::array<int, 2> presentedSlots{{-1, -1}};
+     void makePictureSlots(size_t count);
++
++    // ---- the GPU's time (TODO 202) ----
++    // A card too slow for the Resolution and Multisampling asked falls further and further behind; once a stretch of
++    // its work took about 2 s, Windows reset the GPU and NVIDIA's OpenGL driver ended the program (the GTX 1080 at
++    // 7x8 with 4 samples, Amazon: 5-10 pictures a second, then 0xC0000409 at 248 s). So at each presentation a GPU
++    // timestamp is queued with the GPU's clock at that moment beside it: when the timestamp comes back, its distance
++    // from that clock is how far behind the GPU was (its backlog - not the game's own slowness: a GPU waiting for the
++    // game has none). Behind by more than kSlowLagMs over most of the last 16 presentations, or by more than
++    // kSpikeLagMs once (also counted for a timestamp still not back), the settings go one step down lowerOneStep's
++    // ladder for the rest of the run (rescaleAll), and are judged afresh after a few seconds. The settings stay as
++    // chosen. PS2X_GPU_TIME_WATCH=0: off. PS2X_GPU_SLOW_TEST=<ms> or x<n> (tests): each backlog measured as that much
++    // longer, or n times as long - a slow card on a fast one. PS2X_GPU_TIME_LOG=1: the backlogs once a second.
++    static constexpr double kSlowLagMs = 150.0, kSpikeLagMs = 800.0;
++    struct LagQuery
++    {
++        GLuint query = 0u;
++        GLint64 issued = 0;
++    };
++    std::deque<LagQuery> lagQueries;
++    std::vector<GLuint> lagPool;
++    std::array<double, 16> lagRecent{};
++    size_t lagRecentCount = 0u, lagRecentNext = 0u;
++    bool timeWatch = false;
++    double slowTestAdd = 0.0, slowTestTimes = 1.0;
++    bool timeLog = false;
++    std::chrono::steady_clock::time_point timeWatchFrom{}; // (judged from then on: the start, and a few s after each step)
++    std::chrono::steady_clock::time_point timeLogAt{};
++    double timeLogMost = 0.0;
++    int scaleLimit = 1 << 14; // (init's: the largest viewport and texture the driver takes)
++    int samplesNow = 0;       // the samples the scene and the moments are drawn with (the less of the two settings)
++    struct RetiredPicture
++    {
++        GLuint texture = 0u;
++        uint64_t until = 0u; // (deleted once nextPicture has passed this: no presentation shows it then)
++    };
++    std::vector<RetiredPicture> retiredPictures;
++    int fitScale(int scale, int &viewport) const;
++    double slowTested(double ms) const { return ms * slowTestTimes + slowTestAdd; }
++    void watchGpuTime(uint64_t tick);
++    // (TODO 202) A batch ended at this many vertices (PS2X_GPU_BATCH_VERTICES, 0: no end) and handed to the GPU at once:
++    // a GPU job is one batch, and on the GTX 1080 one of a busy scene's batches (hundreds of thousands of vertices
++    // drawn over the same pixels) took 300 ms at Resolution 6 - and one later passed Windows' 2 s limit, at any
++    // setting from 5x6 up. Ended there, a batch's work is bounded, and each part goes to the GPU as its own job.
++    size_t batchVertexCap = 0u;
++    uint64_t statCapped = 0u;
++    void capBatch()
++    {
++        if (batchVertexCap != 0u && vertices.size() >= batchVertexCap)
++        {
++            flushWhy = 12;
++            flush();
++            glFlush();
++            ++statCapped;
++        }
++    }
++    using ResetStatusFn = GLenum(APIENTRY *)();
++    ResetStatusFn resetStatus = nullptr; // (glGetGraphicsResetStatus, robust contexts: TODO 202)
++    uint64_t resetTestTick = 0u;          // (PS2X_GPU_RESET_TEST)
++    void rescaleAll(int sx, int sy, int samples);
+     GLuint composed = 0u;
+     // PS2X_GPU_AA=1 (off by default): the picture's edges smoothed (kFxaa) as it is made - composed
+     // (and its field pass drawn) into composed / composedFields, then smoothed into the picture.
+@@ -1514,9 +1643,10 @@ struct GSGpuRenderer::Impl
+     std::unordered_map<std::string, int> passIndex;
+     // (and why batches ended)
+     int flushWhy = 0;
+-    uint64_t flushCounts[12] = {};
+-    static constexpr const char *kFlushWhy[12] = {"other", "target", "replacement slots", "source slots", "memory texture",
+-                                                  "self texture", "shadow", "transfer", "load", "field sources", "grow", "native"};
++    uint64_t flushCounts[13] = {};
++    static constexpr const char *kFlushWhy[13] = {"other", "target", "replacement slots", "source slots", "memory texture",
++                                                  "self texture", "shadow", "transfer", "load", "field sources", "grow", "native",
++                                                  "size"};
+     int passEntry(const std::string &name)
+     {
+         const auto found = passIndex.find(name);
+@@ -1576,6 +1706,15 @@ struct GSGpuRenderer::Impl
+             GLuint64 ns = 0u;
+             glGetQueryObjectui64v(query, GL_QUERY_RESULT, &ns);
+             gpuMs[queryPending[done].kind] += static_cast<double>(ns) / 1.0e6;
++            // (TODO 202: one piece of GPU work near Windows' 2 s limit, told as it is seen)
++            if (static_cast<double>(ns) / 1.0e6 > 250.0)
++            {
++                static const char *const kKinds[5] = {"draws", "field pictures", "loads", "write-backs", "presentation"};
++                const int pass = queryPending[done].pass;
++                std::fprintf(stderr, "[gpu] one piece of GPU work took %.0f ms: %s%s%s\n", static_cast<double>(ns) / 1.0e6,
++                             kKinds[std::clamp(queryPending[done].kind, 0, 4)], pass >= 0 ? ", " : "",
++                             pass >= 0 ? passTimes[static_cast<size_t>(pass)].name.c_str() : "");
++            }
+             if (queryPending[done].pass >= 0)
+                 passTimes[static_cast<size_t>(queryPending[done].pass)].ms += static_cast<double>(ns) / 1.0e6;
+             if (const GLuint invocations = queryPending[done].invocations)
+@@ -1606,6 +1745,7 @@ struct GSGpuRenderer::Impl
+     void registerPages(Target &t);
+     void unregisterPages(Target &t);
+     void evictTarget();
++    void dropTarget(Target &t);
+     void ensureLoaded(Target &t);
+     bool batchUses(const Target &t) const;
+     void barrier();
+@@ -1682,19 +1822,9 @@ bool GSGpuRenderer::Impl::init()
+     glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH, &maxWidth);
+     glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT, &maxHeight);
+     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
+-    const int limit = std::min({maxViewport[0], maxViewport[1], maxWidth, maxHeight, maxTexture});
+-    const auto fit = [limit](int scale, int &viewport)
+-    {
+-        while (scale > 1 && kMaxCoord * scale > limit)
+-            --scale;
+-        viewport = kMaxCoord;
+-        while (viewport < kMaxCoord * scale)
+-            viewport *= 2;
+-        viewport = std::min(viewport, limit);
+-        return scale;
+-    };
+-    scaleX = fit(g_scaleX.load(), viewportX);
+-    scaleY = fit(g_scaleY.load(), viewportY);
++    scaleLimit = std::min({maxViewport[0], maxViewport[1], maxWidth, maxHeight, maxTexture});
++    scaleX = fitScale(g_scaleX.load(), viewportX);
++    scaleY = fitScale(g_scaleY.load(), viewportY);
+     // Above the console's resolution each field is kept whole: filling lines in from their
+     // neighbours leaves stripes there.
+     fields = envFlag("PS2X_GPU_FIELDS", scaleY > 1);
+@@ -2072,6 +2202,30 @@ bool GSGpuRenderer::Impl::init()
+     glDisable(GL_DEPTH_TEST);
+     glDisable(GL_BLEND);
+     glProvokingVertex(GL_LAST_VERTEX_CONVENTION); // flat shading takes the last vertex's colour
++    // (TODO 202) The GPU-time watch (watchGpuTime)
++    samplesNow = std::max(sceneMsaa, msaaSamples);
++    timeWatch = envFlag("PS2X_GPU_TIME_WATCH", true);
++    if (const char *env = std::getenv("PS2X_GPU_SLOW_TEST"); env && *env)
++    {
++        if (*env == 'x' || *env == 'X')
++            slowTestTimes = std::max(1.0, std::atof(env + 1));
++        else
++            slowTestAdd = std::max(0.0, std::atof(env));
++        std::fprintf(stderr, "[gpu] PS2X_GPU_SLOW_TEST=%s: each GPU backlog measured as %s (a test)\n", env,
++                     slowTestTimes > 1.0 ? "that many times as long" : "that many ms longer");
++    }
++    timeLog = envFlag("PS2X_GPU_TIME_LOG", false);
++    batchVertexCap = static_cast<size_t>(std::max(0, envInt("PS2X_GPU_BATCH_VERTICES", 65536)));
++    if (g_robust)
++    {
++        resetStatus = reinterpret_cast<ResetStatusFn>(glfwGetProcAddress("glGetGraphicsResetStatus"));
++        if (!resetStatus)
++            resetStatus = reinterpret_cast<ResetStatusFn>(glfwGetProcAddress("glGetGraphicsResetStatusARB"));
++    }
++    if (const char *env = std::getenv("PS2X_GPU_RESET_TEST"); env && *env)
++        resetTestTick = std::strtoull(env, nullptr, 10);
++    timeWatchFrom = std::chrono::steady_clock::now() + std::chrono::seconds(5); // (the first pictures: shaders and textures coming in)
++    timeLogAt = std::chrono::steady_clock::now();
+     ready = true;
+     if (scaleX == scaleY)
+         std::fprintf(stderr, "[gpu] renderer ready on the GS thread (%s): scale %d (%dx%d pictures)\n",
+@@ -2408,8 +2562,13 @@ void GSGpuRenderer::Impl::evictTarget()
+             victim = it;
+     if (victim == targets.end())
+         return;
+-    Target &t = **victim;
+-    // What only it has goes to local memory first.
++    dropTarget(**victim);
++    targets.erase(victim);
++}
++
++// A buffer's textures given up: what only it has goes to local memory first (its next use loads it from there).
++void GSGpuRenderer::Impl::dropTarget(Target &t)
++{
+     PageList owned;
+     for (uint16_t page : t.pages)
+         if (owner[page] == &t)
+@@ -2419,8 +2578,201 @@ void GSGpuRenderer::Impl::evictTarget()
+     unregisterPages(t);
+     dropNative(t);
+     glDeleteTextures(1, &t.tex);
++    t.tex = 0u;
+     dropShadows(t);
+-    targets.erase(victim);
++}
++
++int GSGpuRenderer::Impl::fitScale(int scale, int &viewport) const
++{
++    while (scale > 1 && kMaxCoord * scale > scaleLimit)
++        --scale;
++    viewport = kMaxCoord;
++    while (viewport < kMaxCoord * scale)
++        viewport *= 2;
++    viewport = std::min(viewport, scaleLimit);
++    return scale;
++}
++
++// (TODO 202) The Resolution and samples changed while the game runs (watchGpuTime's step down): every buffer goes to
++// local memory and is made again at the new scale on its next use (as a buffer pushed out of the cache is), the
++// pictures and the composing textures are made again at the new size (the old pictures kept until no presentation
++// shows them any more), the multisampled copies with the new samples.
++void GSGpuRenderer::Impl::rescaleAll(int sx, int sy, int samples)
++{
++    flush();
++    while (!targets.empty())
++    {
++        dropTarget(*targets.back());
++        targets.pop_back();
++    }
++    batchFrame = batchDepth = nullptr;
++    alphaCopyOf = nullptr;
++    scaleX = fitScale(sx, viewportX);
++    scaleY = fitScale(sy, viewportY);
++    g_scaleX.store(scaleX);
++    g_scaleY.store(scaleY);
++    fields = envFlag("PS2X_GPU_FIELDS", scaleY > 1);
++    glBindFramebuffer(GL_FRAMEBUFFER, drawFbo);
++    glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, viewportX);
++    glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, viewportY);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    samples = samples > 1 ? samples : 0;
++    if (samples < samplesNow)
++    {
++        sceneMsaa = std::min(sceneMsaa, samples);
++        msaaSamples = std::min(msaaSamples, samples);
++        samplesNow = samples;
++        g_msaaMost.store(samples);
++    }
++    if (msDepthSamples)
++        glDeleteTextures(1, &msDepthSamples); // (its samples and size are the old ones: made again when needed)
++    msDepthSamples = 0u;
++    msDepthSamplesW = msDepthSamplesH = 0;
++    if (msResolveTex)
++        glDeleteTextures(1, &msResolveTex);
++    msResolveTex = 0u;
++    msResolveW = msResolveH = 0;
++    for (MomentLayer &layer : momentLayers)
++        layer.width = 0; // (made again on their next use, at the new scale and samples)
++
++    for (size_t i = 0; i < pictureSlots; ++i)
++    {
++        if (pictures[i])
++            retiredPictures.push_back(RetiredPicture{pictures[i], nextPicture + kMaxPictures});
++        pictures[i] = 0u;
++    }
++    const size_t slots = pictureSlots;
++    pictureSlots = 0u;
++    pictureLevels = 1;
++    while (std::max(kPictureWidth * scaleX, kPictureHeight * scaleY) >> pictureLevels)
++        ++pictureLevels;
++    if (!envFlag("PS2X_GPU_PICTURE_MIPS", true))
++        pictureLevels = 1;
++    makePictureSlots(slots);
++    if (composed)
++        glDeleteTextures(1, &composed);
++    composed = makeTexture(GL_RGBA8, kPictureWidth * scaleX, kPictureHeight * scaleY, GL_LINEAR);
++    if (composedFields)
++    {
++        glDeleteTextures(1, &composedFields);
++        composedFields = makeTexture(GL_RGBA8, kPictureWidth * scaleX, kPictureHeight * scaleY, GL_LINEAR);
++    }
++}
++
++// (TODO 202) The GPU-time watch (the members' comment, "the GPU's time"): at each presentation.
++void GSGpuRenderer::Impl::watchGpuTime(uint64_t tick)
++{
++    // A GPU reset told (robust contexts): the game ends with word of it (gpuWasReset).
++    if (resetStatus || resetTestTick)
++    {
++        GLenum status = resetStatus ? resetStatus() : GL_NO_ERROR;
++        if (status == GL_NO_ERROR && resetTestTick && tick >= resetTestTick)
++            status = 0x8253; // (GL_GUILTY_CONTEXT_RESET: the test's)
++        if (status != GL_NO_ERROR)
++            gpuWasReset(status, scaleX, scaleY, samplesNow);
++    }
++    if (!retiredPictures.empty())
++    {
++        std::lock_guard<std::mutex> lock(g_pictureMutex);
++        for (auto it = retiredPictures.begin(); it != retiredPictures.end();)
++        {
++            bool shown = false;
++            for (const Published &p : g_published)
++                shown = shown || (p.valid && p.texture == it->texture);
++            if (!shown && nextPicture > it->until)
++            {
++                glDeleteTextures(1, &it->texture);
++                it = retiredPictures.erase(it);
++            }
++            else
++                ++it;
++        }
++    }
++    if (!timeWatch)
++        return;
++    GLint64 now = 0;
++    glGetInteger64v(GL_TIMESTAMP, &now);
++    double worst = 0.0;
++    while (!lagQueries.empty())
++    {
++        GLint available = 0;
++        glGetQueryObjectiv(lagQueries.front().query, GL_QUERY_RESULT_AVAILABLE, &available);
++        if (!available)
++            break;
++        GLint64 done = 0;
++        glGetQueryObjecti64v(lagQueries.front().query, GL_QUERY_RESULT, &done);
++        const double lag = slowTested(static_cast<double>(std::max<GLint64>(0, done - lagQueries.front().issued)) / 1.0e6);
++        lagRecent[lagRecentNext] = lag;
++        lagRecentNext = (lagRecentNext + 1u) % lagRecent.size();
++        lagRecentCount = std::min(lagRecentCount + 1u, lagRecent.size());
++        worst = std::max(worst, lag);
++        lagPool.push_back(lagQueries.front().query);
++        lagQueries.pop_front();
++    }
++    if (!lagQueries.empty()) // (one still out: behind by at least this much)
++        worst = std::max(worst, slowTested(static_cast<double>(std::max<GLint64>(0, now - lagQueries.front().issued)) / 1.0e6));
++    if (lagQueries.size() < 64u)
++    {
++        GLuint query = 0u;
++        if (lagPool.empty())
++            glGenQueries(1, &query);
++        else
++        {
++            query = lagPool.back();
++            lagPool.pop_back();
++        }
++        glQueryCounter(query, GL_TIMESTAMP);
++        lagQueries.push_back(LagQuery{query, now});
++    }
++
++    double median = 0.0;
++    if (lagRecentCount > 0u)
++    {
++        std::array<double, 16> sorted = lagRecent;
++        std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(lagRecentCount));
++        median = sorted[lagRecentCount / 2u];
++    }
++    const auto clock = std::chrono::steady_clock::now();
++    if (timeLog)
++    {
++        timeLogMost = std::max(timeLogMost, worst);
++        if (clock - timeLogAt >= std::chrono::seconds(1))
++        {
++            std::fprintf(stderr, "[gpu] GPU backlog: median %.1f ms, most %.1f ms this second (%zu out)\n", median, timeLogMost,
++                         lagQueries.size());
++            timeLogMost = 0.0;
++            timeLogAt = clock;
++        }
++    }
++    if (clock < timeWatchFrom)
++    {
++        lagRecentCount = lagRecentNext = 0u; // (judged only on what comes after)
++        return;
++    }
++    const bool slow = lagRecentCount == lagRecent.size() && median > kSlowLagMs;
++    const bool spike = worst > kSpikeLagMs;
++    if (!slow && !spike)
++        return;
++    int sx = scaleX, sy = scaleY, samples = samplesNow;
++    if (!lowerOneStep(sx, sy, samples))
++    {
++        std::fprintf(stderr, "[gpu] the graphics card is behind by %.0f ms (median %.0f) at the lowest settings already (TODO 202)\n",
++                     worst, median);
++        timeWatch = false;
++        return;
++    }
++    std::fprintf(stderr,
++                 "[gpu] the graphics card fell behind (%s: %.0f ms, the median of the last %zu %.0f ms): Resolution %dx%d with %d samples "
++                 "drawn at %dx%d with %d samples from now on, for this run - the settings stay as chosen (TODO 202)\n",
++                 spike ? "once" : "most of the time", spike ? worst : median, lagRecentCount, median, scaleX, scaleY, samplesNow, sx,
++                 sy, samples);
++    rescaleAll(sx, sy, samples);
++    for (const LagQuery &q : lagQueries)
++        lagPool.push_back(q.query);
++    lagQueries.clear();
++    lagRecentCount = lagRecentNext = 0u;
++    timeWatchFrom = clock + std::chrono::seconds(3);
+ }
+ 
+ // The buffer the GPU keeps for a base, width and layout, with at least `rowsNeeded` rows
+@@ -6334,7 +6686,7 @@ void GSGpuRenderer::Impl::printStats()
+                          order[i]->counted ? 100.0 * static_cast<double>(order[i]->depthFailed) / static_cast<double>(order[i]->counted) : 0.0,
+                          order[i]->counted ? 100.0 * static_cast<double>(order[i]->alphaDiscarded) / static_cast<double>(order[i]->counted) : 0.0);
+         std::fprintf(stderr, "[gpu]     batches ended, per VBlank:");
+-        for (int i = 0; i < 12; ++i)
++        for (int i = 0; i < 13; ++i)
+             if (flushCounts[i])
+                 std::fprintf(stderr, " %s %.1f", kFlushWhy[i], static_cast<double>(flushCounts[i]) / statPresents);
+         std::fprintf(stderr, "\n");
+@@ -6716,6 +7068,7 @@ void GSGpuRenderer::drawMesh(const uint8_t *mesh, uint32_t bytes, uint32_t field
+     {
+         if (r.stateLeftOut || !r.begin())
+             return;
++        r.capBatch();
+         if (r.stateDirty)
+             r.prepareDraw();
+         if (!r.drawUsable)
+@@ -6742,6 +7095,7 @@ void GSGpuRenderer::drawPrimitives(const GSVertex *vertices, uint32_t count, uin
+         return;
+     if (g_drawLog.file && g_drawLog.open)
+         g_drawLog.add(r.state, vertices, count, each);
++    r.capBatch();
+     if (r.stateDirty)
+         r.prepareDraw();
+     r.statPrims += count;
+@@ -7032,6 +7386,7 @@ void GSGpuRenderer::present(const GSPresentationRequest &request)
+         if (r.secondFieldLeftOut)
+             ps2_host_display::noteSecondFieldLeftOut();
+     }
++    r.watchGpuTime(request.vsyncTick); // (TODO 202: lower settings for this run when the card falls far behind)
+     if (r.stats)
+         r.printStats();
+ }
+@@ -7106,3 +7461,22 @@ void GSGpuRenderer::downloadAll()
+         pages[page] = static_cast<uint16_t>(page);
+     r.download(pages);
+ }
++
++// (TODO 202) The message for gpuWasReset. Declared by hand: windows.h and raylib.h name the same functions
++// (CloseWindow, ShowCursor) and do not go into one file.
++#if defined(_WIN32)
++extern "C" __declspec(dllimport) int __stdcall MessageBoxA(void *window, const char *text, const char *caption, unsigned int type);
++namespace
++{
++    void gpuResetMessage(const char *text)
++    {
++        // MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST
++        MessageBoxA(nullptr, text, "Transformers", 0x0u | 0x10u | 0x10000u | 0x40000u);
++    }
++}
++#else
++namespace
++{
++    void gpuResetMessage(const char *) {}
++}
++#endif

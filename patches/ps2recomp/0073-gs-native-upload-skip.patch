@@ -1,0 +1,616 @@
+Subject: [PATCH] GS: host-to-local uploads left out while a native renderer draws alone
+
+While ps2_host_display::gsNativeAlone() (nothing draws from GS memory), a host-to-local
+upload in a colour or indexed format (CT32/24/16/16S, T8, T4) is not queued for the GS
+thread: its data is kept in a shadow (each destination's last data, in order of the last
+writes). It reaches GS memory when anything needs it: the emulated drawing back on (a lost
+device), a local-to-host or local-to-local transfer, a VRAM snapshot (all of it, in order);
+a reader of GS memory outside the GS (gsupload::ensureWhole: the native renderer's light
+maps) has the destinations that reach into its region written first and their turn on the GS
+thread waited for. Top-byte uploads (T8H/T4HL/T4HH: the light maps) and depth formats are
+made as before (and recorded, so the replays keep their place). PS2X_GS_SKIP_UPLOADS=0:
+every upload made, as before; =check: every upload made, and the blocks a skip would have
+left stale marked - gsupload::staleAt / reportRead for readers. PS2X_GS_NATIVE_LOG=1 adds a
+10 s count line. (Transformers roadmap N4: the uploads.)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 6e56280..22cf985 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -16,6 +16,35 @@
+ // VRAM writes) are queued and return at once; calls that observe the result (VRAM reads,
+ // snapshots, local-to-host transfers, presentation) first wait until the queue has been
+ // processed up to that point. PS2X_GS_SYNC=1 keeps the backend on the calling thread.
++// (Roadmap N4, the uploads) While the native renderer draws alone, nothing draws from GS memory: the game's
++// host-to-local uploads of its textures - streamed into GS memory every frame, 30,000-100,000 transfers a second
++// in a level - are not made (PS2X_GS_SKIP_UPLOADS; the GS thread's swizzling and the ring's copy saved) except
++// those a reader needs: the top-byte formats (T8H/T4HL/T4HH - the light maps, which the native renderer reads
++// from GS memory) and the depth formats. What a skipped upload would have written is kept in a shadow (each
++// destination's last data) and written to GS memory in order the moment anything needs it whole: the emulated
++// drawing back on (a lost device), a local-to-host or local-to-local transfer, a state snapshot.
++// PS2X_GS_SKIP_UPLOADS=0: every upload made, as before; =check: every upload made, and GS memory's blocks that a
++// skip would have left stale are marked - readers ask staleAt() and report what they would have read wrong.
++namespace gsupload
++{
++    enum class Mode : uint8_t
++    {
++        Off,
++        On,
++        Check,
++    };
++    Mode mode();
++    // (check mode) Whether the byte at `address` in GS memory would be stale had the uploads been skipped:
++    // `topByte` = the reader reads the top byte of 32-bit words only (a T8H/T4HL/T4HH view: the light maps).
++    bool staleAt(uint32_t address, bool topByte);
++    // (check mode) A reader's verdict, counted and the first ones logged ("[gs:skip] check ...").
++    void reportRead(const char *what, uint32_t tbp, uint32_t psm, uint32_t staleBytes, uint32_t bytes);
++    // (on) A reader of GS memory (the native renderer's light maps, any thread): the bytes [first, last) made as the
++    // uploads would have left them - the skipped uploads that reach into them written in order, and their turn on
++    // the GS thread waited for - before it reads. Nothing to do (no wait) when none of them was left out.
++    void ensureWhole(uint64_t first, uint64_t last);
++}
++
+ class GSThreadedBackend final : public GSRasterBackend
+ {
+ public:
+@@ -121,6 +150,15 @@ private:
+     // thread does (m_runOwner). Everything else on the producer side goes through a
+     // Producer, which ends the calling thread's own run or waits for another thread's.
+     class Producer;
++    // (gsupload) The skip's two steps, the producer's lock held: whether a host-to-local transfer starting now is
++    // left out (its data then kept in the shadow), and the shadow written to GS memory in order (replay).
++    bool skipUpload(const GSTransferCommand &command);
++    void replayShadow();
++public:
++    void ensureWhole(uint64_t first, uint64_t last); // (gsupload::ensureWhole's work)
++private:
++    void sendTransfer(const GSTransferCommand &command);
++    void sendUpload(const uint8_t *data, uint32_t sizeBytes);
+     void beginRun(uint32_t verticesEach); // with the lock held
+     void endRun() const;                  // by its owner; the lock stays held
+     mutable Record *m_run = nullptr;
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index f9be701..fe1bb57 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -23,6 +23,14 @@
+ #include <cstring>
+ #include <string>
+ #include <type_traits>
++#include <atomic>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++#include "runtime/gs/ps2_gs_psmct16.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include "runtime/gs/ps2_gs_psmt4.h"
++#include "runtime/gs/ps2_gs_psmt8.h"
+ 
+ namespace
+ {
+@@ -101,6 +109,120 @@ namespace
+                a.trxreg.rrw == b.trxreg.rrw && a.trxreg.rrh == b.trxreg.rrh;
+     }
+ 
++    // ---- gsupload: the uploads left out while the native renderer draws alone ----
++    // A host-to-local upload in a format nothing reads from GS memory then: the colour and indexed formats
++    // (CT32/24/16/16S, T8, T4). The top-byte views (T8H/T4HL/T4HH: the light maps, read by the native
++    // renderer) and the depth formats are made as before.
++    bool skippableFormat(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case 0x00: case 0x01: case 0x02: case 0x0A: case 0x13: case 0x14:
++            return true;
++        default:
++            return false;
++        }
++    }
++    bool topByteFormat(uint32_t psm) { return psm == 0x1B || psm == 0x24 || psm == 0x2C; }
++
++    // The shadow: each destination's last upload (skipped or made, in the order they came), written back in
++    // that order when GS memory has to be whole. A destination = the transfer's BITBLTBUF/TRXPOS/TRXREG;
++    // its last data overwrites all of its rectangle, so writing every destination's last data in the order
++    // of those last writes leaves GS memory as the uploads would have.
++    struct ShadowEntry
++    {
++        GSTransferCommand command{};
++        std::vector<uint8_t> bytes;
++        uint64_t sequence = 0u;
++        uint64_t first = 0u, last = 0u; // the bytes of GS memory it can write (the 32-bit footprint: no less)
++        bool dirty = false;             // its data in the shadow alone (a skipped upload not written since)
++    };
++    // A destination: base 14 bits, width 6, format 6, x 11, y 11 | width 12, height 12 - packed.
++    struct ShadowKey
++    {
++        uint64_t where = 0u;
++        uint32_t size = 0u;
++        bool operator==(const ShadowKey &o) const { return where == o.where && size == o.size; }
++    };
++    struct ShadowKeyHash
++    {
++        size_t operator()(const ShadowKey &k) const { return static_cast<size_t>((k.where ^ (static_cast<uint64_t>(k.size) << 40)) * 0x9E3779B97F4A7C15ull); }
++    };
++    ShadowKey shadowKey(const GSTransferCommand &c)
++    {
++        ShadowKey k;
++        k.where = static_cast<uint64_t>(c.bitbltbuf.dbp & 0x3FFFu) | static_cast<uint64_t>(c.bitbltbuf.dbw & 0x3Fu) << 14 |
++                  static_cast<uint64_t>(c.bitbltbuf.dpsm & 0x3Fu) << 20 | static_cast<uint64_t>(c.trxpos.dsax & 0x7FFu) << 26 |
++                  static_cast<uint64_t>(c.trxpos.dsay & 0x7FFu) << 37;
++        k.size = static_cast<uint32_t>(c.trxreg.rrw & 0xFFFu) | static_cast<uint32_t>(c.trxreg.rrh & 0xFFFu) << 12;
++        return k;
++    }
++
++    struct UploadSkip
++    {
++        std::unordered_map<ShadowKey, ShadowEntry, ShadowKeyHash> shadow;
++        ShadowEntry *current = nullptr; // the transfer whose data is arriving (skipped or recorded)
++        bool currentSent = false;       // made as well (a kept format): its data also goes to the GS
++        uint64_t sequence = 0u, shadowBytes = 0u;
++        std::atomic<bool> pending{false}; // anything skipped since the last replay (read without the lock by the drawing calls)
++        // counted (PS2X_GS_NATIVE_LOG): every 10 s
++        uint64_t skipped = 0u, skippedBytes = 0u, kept = 0u, keptBytes = 0u, replays = 0u, replayed = 0u, evicted = 0u;
++        uint64_t ensures = 0u, ensureWrites = 0u; // (readers' regions made whole: calls that wrote anything, destinations written)
++        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
++    } g_upload;
++
++    constexpr uint64_t kShadowCap = 256ull * 1024u * 1024u; // (beyond it the oldest destinations go: long since overwritten)
++
++    // (check mode) GS memory's blocks: bit 0 = its low bytes would be stale, bit 1 = its top bytes (of 32-bit words).
++    std::atomic<uint8_t> g_stale[16384] = {};
++
++    GSThreadedBackend *g_backend = nullptr; // (the one backend: ensureWhole's)
++
++    uint32_t gsAddress(uint32_t psm, uint32_t dbp, uint32_t dbw, uint32_t x, uint32_t y)
++    {
++        switch (psm)
++        {
++        case 0x02: case 0x32: return GSPSMCT16::addrPSMCT16(dbp, dbw, x, y);
++        case 0x0A: case 0x3A: return GSPSMCT16::addrPSMCT16S(dbp, dbw, x, y);
++        case 0x13: return GSPSMT8::addrPSMT8(dbp, dbw, x, y);
++        case 0x14: return GSPSMT4::addrPSMT4(dbp, dbw, x, y) >> 1u; // (nibbles)
++        default: return GSPSMCT32::addrPSMCT32(dbp, dbw, x, y);
++        }
++    }
++
++    // (check mode) The blocks a host-to-local transfer writes: `set` stale bits set, `clear` cleared. Sampled every
++    // 8 pixels and at the rectangle's last row and column (no block of any format is narrower or lower than 8).
++    void markTransfer(const GSTransferCommand &c, uint8_t set, uint8_t clear)
++    {
++        const uint32_t w = std::max<uint32_t>(c.trxreg.rrw, 1u), h = std::max<uint32_t>(c.trxreg.rrh, 1u);
++        const auto mark = [&](uint32_t x, uint32_t y)
++        {
++            const uint32_t block = (gsAddress(c.bitbltbuf.dpsm, c.bitbltbuf.dbp, c.bitbltbuf.dbw, (c.trxpos.dsax + x) & 0x7FFu,
++                                              (c.trxpos.dsay + y) & 0x7FFu) >> 8) & 16383u;
++            const uint8_t was = g_stale[block].load(std::memory_order_relaxed);
++            g_stale[block].store(static_cast<uint8_t>((was & ~clear) | set), std::memory_order_relaxed);
++        };
++        for (uint32_t y = 0;; y = std::min(y + 8u, h - 1u))
++        {
++            for (uint32_t x = 0;; x = std::min(x + 8u, w - 1u))
++            {
++                mark(x, y);
++                if (x == w - 1u)
++                    break;
++            }
++            if (y == h - 1u)
++                break;
++        }
++    }
++
++    struct CheckCounts
++    {
++        std::mutex mutex;
++        uint64_t reads = 0u, staleReads = 0u, staleBytes = 0u, skippable = 0u, kept = 0u, localReads = 0u, localStale = 0u;
++        int told = 0;
++        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
++    } g_check;
++
+     inline void cpuRelax()
+     {
+ #if defined(USE_SSE2NEON)
+@@ -111,6 +233,53 @@ namespace
+     }
+ }
+ 
++namespace gsupload
++{
++    Mode mode()
++    {
++        static const Mode selected = []()
++        {
++            const char *env = std::getenv("PS2X_GS_SKIP_UPLOADS");
++            if (env && *env == '0')
++                return Mode::Off;
++            if (env && std::strcmp(env, "check") == 0)
++                return Mode::Check;
++            return Mode::On;
++        }();
++        return selected;
++    }
++
++    bool staleAt(uint32_t address, bool topByte)
++    {
++        const uint8_t bits = g_stale[(address >> 8) & 16383u].load(std::memory_order_relaxed);
++        return topByte ? (bits & 2u) != 0u : bits != 0u;
++    }
++
++    void ensureWhole(uint64_t first, uint64_t last)
++    {
++        if (mode() == Mode::On && g_upload.pending.load(std::memory_order_acquire) && g_backend)
++            g_backend->ensureWhole(first, last);
++    }
++
++    void reportRead(const char *what, uint32_t tbp, uint32_t psm, uint32_t staleBytes, uint32_t bytes)
++    {
++        CheckCounts &k = g_check;
++        std::lock_guard<std::mutex> lock(k.mutex);
++        ++k.reads;
++        if (staleBytes)
++        {
++            ++k.staleReads;
++            k.staleBytes += staleBytes;
++            if (k.told < 30)
++            {
++                ++k.told;
++                std::fprintf(stderr, "[gs:skip] check: %s of tbp %x psm %x reads %u of its %u bytes where a skip would have left GS memory stale\n",
++                             what, tbp, psm, staleBytes, bytes);
++            }
++        }
++    }
++}
++
+ bool GSThreadedBackend::enabled()
+ {
+     static const bool threaded = []()
+@@ -136,6 +305,7 @@ GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
+     }
+     m_thread = std::thread([this]()
+                            { ThreadNaming::SetCurrentThreadName("GsBackend"); run(); });
++    g_backend = this;
+ }
+ 
+ 
+@@ -366,6 +536,12 @@ void GSThreadedBackend::captureIfSettled()
+ 
+ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (g_upload.pending && !ps2_host_display::gsNativeAlone())
++    {
++        Producer lock(*this);
++        if (g_upload.pending)
++            replayShadow(); // (gsupload: the emulated drawing back on)
++    }
+     {
+         Producer lock(*this);
+         if (!m_stateSent || !gsSameDrawState(m_sentState, batch.state))
+@@ -380,6 +556,12 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+ 
+ void GSThreadedBackend::SetDrawState(const GSDrawState &state)
+ {
++    if (g_upload.pending && !ps2_host_display::gsNativeAlone())
++    {
++        Producer lock(*this);
++        if (g_upload.pending)
++            replayShadow(); // (gsupload: the emulated drawing back on)
++    }
+     Producer lock(*this);
+     m_sentState = state;
+     m_stateSent = true;
+@@ -432,16 +614,220 @@ void GSThreadedBackend::SubmitMesh(const uint8_t *mesh, uint32_t bytes, uint32_t
+ 
+ void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
++    if (g_upload.pending && !ps2_host_display::gsNativeAlone())
++    {
++        Producer lock(*this);
++        if (g_upload.pending)
++            replayShadow(); // (gsupload: the emulated drawing back on)
++    }
+     Producer lock(*this);
+     const ClutPayload payload{tex0, texclut};
+     std::memcpy(reserve(Op::LoadClut, sizeof(payload)), &payload, sizeof(payload));
+     publish();
+ }
+ 
++bool GSThreadedBackend::skipUpload(const GSTransferCommand &command)
++{
++    UploadSkip &u = g_upload;
++    u.current = nullptr;
++    u.currentSent = true;
++    const gsupload::Mode mode = gsupload::mode();
++    if (mode == gsupload::Mode::Off)
++        return false;
++    const bool alone = ps2_host_display::gsNativeAlone();
++    if (mode == gsupload::Mode::Check)
++    {
++        // Every upload made; GS memory's blocks marked as a skip would have left them.
++        if (command.direction == 0u && alone)
++        {
++            std::lock_guard<std::mutex> lock(g_check.mutex);
++            if (skippableFormat(command.bitbltbuf.dpsm))
++            {
++                ++g_check.skippable;
++                markTransfer(command, command.bitbltbuf.dpsm == 0x01u ? 1u : 3u, 0u);
++            }
++            else
++            {
++                ++g_check.kept;
++                markTransfer(command, 0u, topByteFormat(command.bitbltbuf.dpsm) ? 2u : 3u);
++            }
++        }
++        else if (command.direction == 0u)
++            markTransfer(command, 0u, 3u); // (drawing on: made, and the GS draws from it)
++        else
++        {
++            // A local read: what it reads would differ where a skip left GS memory stale.
++            const GSTransferCommand &c = command;
++            uint32_t stale = 0u;
++            const uint32_t w = std::max<uint32_t>(c.trxreg.rrw, 1u), h = std::max<uint32_t>(c.trxreg.rrh, 1u);
++            for (uint32_t y = 0; y < h; y += 8u)
++                for (uint32_t x = 0; x < w; x += 8u)
++                    if (gsupload::staleAt(gsAddress(c.bitbltbuf.spsm, c.bitbltbuf.sbp, c.bitbltbuf.sbw, (c.trxpos.ssax + x) & 0x7FFu,
++                                                    (c.trxpos.ssay + y) & 0x7FFu),
++                                          false))
++                        ++stale;
++            gsupload::reportRead(command.direction == 1u ? "a local-to-host transfer" : "a local-to-local transfer", c.bitbltbuf.sbp,
++                                 c.bitbltbuf.spsm, stale, 0u);
++        }
++        return false;
++    }
++    // On: anything that reads GS memory, or the GS drawing again, gets it whole first.
++    if (!alone || command.direction != 0u)
++    {
++        if (u.pending)
++            replayShadow();
++        return false;
++    }
++    ShadowEntry &e = u.shadow[shadowKey(command)];
++    if (e.sequence == 0u)
++    {
++        e.command = command;
++        e.first = static_cast<uint64_t>(command.bitbltbuf.dbp) * kBlockBytes;
++        e.last = e.first + footprintBytes(command.bitbltbuf.dbw, command.trxpos.dsax + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u,
++                                          command.trxpos.dsay + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u);
++    }
++    u.shadowBytes -= std::min<uint64_t>(u.shadowBytes, e.bytes.size());
++    e.bytes.clear();
++    e.sequence = ++u.sequence;
++    u.current = &e;
++    u.currentSent = !skippableFormat(command.bitbltbuf.dpsm);
++    e.dirty = !u.currentSent;
++    if (u.currentSent)
++    {
++        ++u.kept;
++        return false; // (made, and recorded: the replay keeps it in its place among the skipped)
++    }
++    ++u.skipped;
++    u.pending = true;
++    return true;
++}
++
++void GSThreadedBackend::replayShadow()
++{
++    UploadSkip &u = g_upload;
++    u.current = nullptr;
++    u.pending = false;
++    std::vector<ShadowEntry *> order;
++    order.reserve(u.shadow.size());
++    for (auto &kv : u.shadow)
++        order.push_back(&kv.second);
++    std::sort(order.begin(), order.end(), [](const ShadowEntry *a, const ShadowEntry *b) { return a->sequence < b->sequence; });
++    for (ShadowEntry *e : order)
++    {
++        sendTransfer(e->command);
++        if (!e->bytes.empty())
++            sendUpload(e->bytes.data(), static_cast<uint32_t>(e->bytes.size()));
++        e->dirty = false;
++        ++u.replayed;
++    }
++    reserve(Op::TextureFlush, 0u); // (the flushes left out meanwhile: one for them all)
++    publish();
++    ++u.replays;
++    std::fprintf(stderr, "[gs:skip] GS memory made whole: %zu destinations written (%.1f MB) - %s\n", order.size(), u.shadowBytes / 1048576.0,
++                 ps2_host_display::gsNativeAlone() ? "a local transfer reads it" : "the emulated drawing is back");
++}
++
++void GSThreadedBackend::ensureWhole(uint64_t first, uint64_t last)
++{
++    UploadSkip &u = g_upload;
++    uint64_t position = 0u;
++    for (int attempt = 0;; ++attempt)
++    {
++        if (attempt > 0)
++            std::this_thread::yield(); // (the lock let go: the producer finishes the transfer it is in)
++        Producer lock(*this);
++        if (!u.pending.load(std::memory_order_relaxed))
++            return;
++        // (a transfer the GS thread is taking - its data still arriving - is not cut into: its turn ends first)
++        if (m_uploadBytesLeft != 0u && !(u.current && !u.currentSent))
++        {
++            if (attempt < 2000)
++                continue;
++            return;
++        }
++        std::vector<ShadowEntry *> order;
++        bool dirty = false;
++        for (auto &kv : u.shadow)
++        {
++            ShadowEntry &e = kv.second;
++            if (&e == u.current || e.last <= first || e.first >= last)
++                continue;
++            order.push_back(&e);
++            dirty = dirty || e.dirty;
++        }
++        if (!dirty)
++            return;
++        // The destinations that reach into it, in the order of their last writes (the made ones again too: their
++        // place among the skipped) - the transfer whose data is arriving left as it was.
++        std::sort(order.begin(), order.end(), [](const ShadowEntry *a, const ShadowEntry *b) { return a->sequence < b->sequence; });
++        const uint64_t bytesLeft = m_uploadBytesLeft;
++        const bool readbackPending = m_readbackPending;
++        for (ShadowEntry *e : order)
++        {
++            sendTransfer(e->command);
++            if (!e->bytes.empty())
++                sendUpload(e->bytes.data(), static_cast<uint32_t>(e->bytes.size()));
++            e->dirty = false;
++        }
++        m_uploadBytesLeft = bytesLeft;
++        m_readbackPending = readbackPending;
++        ++u.ensures;
++        u.ensureWrites += order.size();
++        publish();
++        position = m_writePos;
++        break;
++    }
++    waitConsumed(position);
++}
++
++void GSThreadedBackend::sendTransfer(const GSTransferCommand &command)
++{
++    m_readbackPending = false;
++    m_uploadBytesLeft = 0u;
++    if (command.direction == 0u || command.direction == 2u)
++    {
++        const uint64_t first = static_cast<uint64_t>(command.bitbltbuf.dbp) * kBlockBytes;
++        const uint32_t x1 = command.trxpos.dsax + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u;
++        const uint32_t y1 = command.trxpos.dsay + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u;
++        noteWrite(first, first + footprintBytes(command.bitbltbuf.dbw, x1, y1));
++        if (command.direction == 0u)
++            m_uploadBytesLeft = (static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh *
++                                 transferBits(command.bitbltbuf.dpsm) + 7u) / 8u;
++    }
++    std::memcpy(reserve(Op::BeginTransfer, sizeof(command)), &command, sizeof(command));
++    publish();
++}
++
++void GSThreadedBackend::sendUpload(const uint8_t *data, uint32_t sizeBytes)
++{
++    m_uploadBytesLeft -= std::min<uint64_t>(m_uploadBytesLeft, sizeBytes);
++    // The backend tracks transfer progress, so large uploads can arrive in pieces.
++    for (uint32_t offset = 0u; offset < sizeBytes;)
++    {
++        const uint32_t chunk = std::min(kUploadChunk, sizeBytes - offset);
++        auto *payload = static_cast<UploadPayload *>(reserve(Op::UploadImage, sizeof(UploadPayload) + chunk));
++        payload->bytes = chunk;
++        std::memcpy(payload + 1, data + offset, chunk);
++        offset += chunk;
++        publish();
++    }
++}
++
+ void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     Producer lock(*this);
+     m_servedBytes = m_capturedBytes; // a new transfer: nothing of an earlier readback is left to hand out
++    if (skipUpload(command))
++    {
++        // (gsupload) Left out: its data goes to the shadow (UploadImage), nothing to the GS thread.
++        m_readbackPending = false;
++        const uint64_t first = static_cast<uint64_t>(command.bitbltbuf.dbp) * kBlockBytes;
++        const uint32_t x1 = command.trxpos.dsax + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u;
++        const uint32_t y1 = command.trxpos.dsay + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u;
++        noteWrite(first, first + footprintBytes(command.bitbltbuf.dbw, x1, y1)); // (a watched readback's region written all the same)
++        m_uploadBytesLeft = (static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh * transferBits(command.bitbltbuf.dpsm) + 7u) / 8u;
++        return;
++    }
+     if (command.direction == 1u)
+     {
+         // Local to host: held back until the data is asked for (ConsumeLocalToHostBytes),
+@@ -471,6 +857,39 @@ void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     if (!data || sizeBytes == 0u)
+         return;
+     Producer lock(*this);
++    UploadSkip &u = g_upload;
++    if (u.current)
++    {
++        // (gsupload) Kept in the shadow: the destination's last data. A skipped transfer's data goes nowhere else.
++        const uint64_t room = m_uploadBytesLeft ? std::min<uint64_t>(m_uploadBytesLeft, sizeBytes) : sizeBytes;
++        u.current->bytes.insert(u.current->bytes.end(), data, data + room);
++        u.shadowBytes += room;
++        (u.currentSent ? u.keptBytes : u.skippedBytes) += room;
++        if (!u.currentSent)
++        {
++            m_uploadBytesLeft -= std::min<uint64_t>(m_uploadBytesLeft, sizeBytes);
++            if (m_uploadBytesLeft == 0u)
++                u.current = nullptr;
++            if (u.shadowBytes > kShadowCap)
++            {
++                // The oldest destinations dropped: long since overwritten by later ones as a rule.
++                std::vector<std::pair<uint64_t, ShadowKey>> old;
++                for (auto &kv : u.shadow)
++                    old.emplace_back(kv.second.sequence, kv.first);
++                std::sort(old.begin(), old.end(), [](const auto &x, const auto &y) { return x.first < y.first; });
++                for (size_t i = 0; i < old.size() && u.shadowBytes > kShadowCap / 2u; ++i)
++                {
++                    auto it = u.shadow.find(old[i].second);
++                    if (&it->second == u.current)
++                        continue;
++                    u.shadowBytes -= std::min<uint64_t>(u.shadowBytes, it->second.bytes.size());
++                    u.shadow.erase(it);
++                    ++u.evicted;
++                }
++            }
++            return;
++        }
++    }
+     m_uploadBytesLeft -= std::min<uint64_t>(m_uploadBytesLeft, sizeBytes);
+     // The backend tracks transfer progress, so large uploads can arrive in pieces.
+     for (uint32_t offset = 0u; offset < sizeBytes;)
+@@ -482,10 +901,16 @@ void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         offset += chunk;
+         publish();
+     }
++    if (u.current && m_uploadBytesLeft == 0u)
++        u.current = nullptr;
+ }
+ 
+ void GSThreadedBackend::TextureFlush()
+ {
++    // (gsupload) While the native renderer draws alone nothing samples the GS's texture cache: the flush - some 16,000 a
++    // second, each waking the GS thread - is left out; a replay of the shadow ends with one.
++    if (gsupload::mode() == gsupload::Mode::On && ps2_host_display::gsNativeAlone())
++        return;
+     Producer lock(*this);
+     reserve(Op::TextureFlush, 0u);
+     publish();
+@@ -717,6 +1142,12 @@ uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, u
+ 
+ void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
++    if (g_upload.pending)
++    {
++        Producer lock(*this);
++        if (g_upload.pending)
++            const_cast<GSThreadedBackend *>(this)->replayShadow(); // (gsupload: a snapshot wants GS memory whole)
++    }
+     const_cast<GSThreadedBackend *>(this)->downloadFromGpu();
+     drain();
+     m_inner->SnapshotVram(out);
+@@ -848,6 +1279,25 @@ void GSThreadedBackend::run()
+                             if (aloneCounts[k])
+                                 line += std::string(" ") + kOpNames[k] + " " + std::to_string(aloneCounts[k]);
+                         std::fprintf(stderr, "[gs] alone, 10 s:%s\n", line.c_str());
++                        if (gsupload::mode() == gsupload::Mode::On)
++                        {
++                            UploadSkip &u = g_upload; // (read without the producer's lock: counts for a log line)
++                            std::fprintf(stderr, "[gs:skip] 10 s: %llu uploads left out (%.1f MB), %llu made (%.1f MB); shadow %zu destinations %.1f MB; %llu replays, %llu dropped; readers' regions made whole %llu times (%llu destinations)\n",
++                                         static_cast<unsigned long long>(u.skipped), u.skippedBytes / 1048576.0, static_cast<unsigned long long>(u.kept),
++                                         u.keptBytes / 1048576.0, u.shadow.size(), u.shadowBytes / 1048576.0, static_cast<unsigned long long>(u.replays),
++                                         static_cast<unsigned long long>(u.evicted), static_cast<unsigned long long>(u.ensures),
++                                         static_cast<unsigned long long>(u.ensureWrites));
++                            u.skipped = u.skippedBytes = u.kept = u.keptBytes = u.ensures = u.ensureWrites = 0u;
++                        }
++                        else if (gsupload::mode() == gsupload::Mode::Check)
++                        {
++                            std::lock_guard<std::mutex> lock(g_check.mutex);
++                            std::fprintf(stderr, "[gs:skip] check, 10 s: %llu uploads a skip would leave out, %llu it would make; readers: %llu reads, %llu of them on stale bytes (%llu bytes)\n",
++                                         static_cast<unsigned long long>(g_check.skippable), static_cast<unsigned long long>(g_check.kept),
++                                         static_cast<unsigned long long>(g_check.reads), static_cast<unsigned long long>(g_check.staleReads),
++                                         static_cast<unsigned long long>(g_check.staleBytes));
++                            g_check.skippable = g_check.kept = g_check.reads = g_check.staleReads = g_check.staleBytes = 0u;
++                        }
+                         std::fill(std::begin(aloneCounts), std::end(aloneCounts), 0u);
+                         aloneSince = now;
+                     }

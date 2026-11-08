@@ -1,0 +1,15 @@
+{
+  "title": "Transformers",
+  "region": "USA",
+  "serial": "SLUS-20668",
+  "elf_name": "SLUS_206.68",
+  "elf_crc32": "74c982c0",
+  "elf_size": 6088572,
+  "iso_size": 2900951040,
+  "comment": "Code/data are linked into a single 'main' section. These ranges were found by scanning for return/prologue density and are the only places the function finder will look for code.",
+  "code_regions": [
+    ["0x00100008", "0x005DCB80"],
+    ["0x006186A4", "0x00619BD0"],
+    ["0x00671980", "0x006ADF20"]
+  ]
+}

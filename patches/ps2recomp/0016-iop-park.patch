@@ -1,0 +1,66 @@
+Subject: [PATCH] The IOP can be parked
+
+A game whose IOP work is done on the host (Transformers: its sound server native) parks the
+IOP: it is no longer run with the EE's time, so its interpreter and its SPU2 stop costing
+the EE thread. Calls into it (module loads, RPCs) still run it. Off again at a reset.
+---
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index c761e87..d03c206 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -294,6 +294,10 @@ public:
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
++    // A game whose IOP work is done on the host (its sound server native) parks the IOP: it is
++    // no longer run with the EE's time (calls into it still run it). Off at a reset.
++    void setIopParked(bool parked) noexcept;
++    [[nodiscard]] bool iopParked() const noexcept;
+     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
+     bool freeIopMemory(uint32_t address);
+     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 23be41c..fe3e26d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -673,6 +673,7 @@ namespace
+     // batch is due and handed over before anything else reaches it: the same runs at the same
+     // checkpoints, without three calls at each one.
+     uint64_t g_iopHeldEeCycles = 0u;
++    bool g_iopParked = false; // setIopParked
+     uint64_t g_iopHeldLimit = 0u;
+ }
+ 
+@@ -762,6 +763,8 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    if (g_iopParked)
++        return;
+     g_iopHeldEeCycles += eeCycles;
+     if (g_iopHeldEeCycles >= g_iopHeldLimit)
+         ps2IopFlushHeldEeCycles(*m_iopSubsystem);
+@@ -769,10 +772,23 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ 
+ void PS2Runtime::resetIop()
+ {
++    g_iopParked = false;
+     ps2IopDropHeldEeCycles();
+     m_iopSubsystem->reset();
+ }
+ 
++void PS2Runtime::setIopParked(bool parked) noexcept
++{
++    if (parked && !g_iopParked)
++        ps2IopDropHeldEeCycles();
++    g_iopParked = parked;
++}
++
++bool PS2Runtime::iopParked() const noexcept
++{
++    return g_iopParked;
++}
++
+ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+ {
+     return m_iopSubsystem->debugSnapshot();

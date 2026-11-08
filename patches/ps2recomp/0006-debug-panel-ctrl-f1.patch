@@ -1,0 +1,19 @@
+Subject: [PATCH] debug panel: Ctrl+F1 opens the runtime debugger
+
+F1 alone is left to the port: the Transformers port draws its mod menu there
+(through the debug UI callbacks, with the same ImGui).
+
+diff --git a/ps2xRuntime/src/lib/ps2_debug_panel.cpp b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index c9aa2c6..f5a5d65 100644
+--- a/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -2206,7 +2206,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
+         return;
+     }
+ 
+-    if (IsKeyPressed(KEY_F1))
++    // Ctrl+F1: F1 alone is the game's mod menu (a port's debug UI callback draws it).
++    if (IsKeyPressed(KEY_F1) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
+     {
+         toggleVisible();
+     }

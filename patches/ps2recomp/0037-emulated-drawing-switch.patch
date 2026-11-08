@@ -1,0 +1,73 @@
+Subject: [PATCH] Display: the emulated drawing switched off for a native renderer
+
+ps2_host_display::setEmulatedDrawing(false): the GS draws no primitive (nor native mesh), while
+DMA, VIF1, VU1 (its programs' register writes and events), GS registers, uploads and read-backs go
+on as before. For a native renderer drawing the frame itself (Transformers' DX12 one, TF_NATIVE_ONLY).
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_host_display.h b/ps2xRuntime/include/runtime/ps2_host_display.h
+index d9ec43f..f8e1af4 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -110,6 +110,14 @@ namespace ps2_host_display
+     void setPictureProvider(PictureProvider provider);
+     PictureProvider pictureProvider();
+ 
++    // The emulated drawing switched off (a native renderer drawing the frame itself): the GS draws
++    // no primitive, while everything the EE can observe goes on - DMA, VIF1 and VU1 (its programs
++    // send register writes and events along with their primitives: skipping them hung a level's
++    // load), GS registers, uploads (host to local) and read-backs (local to host: memory the EE
++    // itself wrote). On (true) by default.
++    void setEmulatedDrawing(bool on);
++    bool emulatedDrawing();
++
+     // Interlaced field mode: which field each VBlank shows. -1 (the default): the VBlank's, as
+     // the console scans out. 0 or 1: always the field of the even or of the odd buffer rows,
+     // for a game whose fields are not two moments by turns. The GS then leaves out what is
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index b3380fd..2862cb1 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -682,6 +682,21 @@ namespace ps2_host_display
+         return g_pictureProvider.load(std::memory_order_acquire);
+     }
+ 
++    namespace
++    {
++        std::atomic<bool> g_emulatedDrawing{true};
++    }
++
++    void setEmulatedDrawing(bool on)
++    {
++        g_emulatedDrawing.store(on, std::memory_order_release);
++    }
++
++    bool emulatedDrawing()
++    {
++        return g_emulatedDrawing.load(std::memory_order_acquire);
++    }
++
+     namespace
+     {
+         uint64_t g_pictureCount = 0u; // (under g_mutex)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 88dd2a7..5c75138 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1318,7 +1318,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+                 writeRegisterUnlocked(GS_REG_PRIM, (gsmesh::loadLE64(gsmesh::vertexTag(data, f)) >> 47) & 0x7FFu);
+                 if (m_drawStateDirty || m_drawStateShownField != ps2_host_display::shownField())
+                     refreshDrawState();
+-                if (m_drawsLeftOut)
++                if (m_drawsLeftOut || !ps2_host_display::emulatedDrawing())
+                     ++t_meshStats.leftOut;
+                 else
+                 {
+@@ -2358,7 +2358,7 @@ void GS::vertexKick(bool drawing)
+         if (m_drawStateDirty || m_drawStateShownField != ps2_host_display::shownField())
+             refreshDrawState();
+     }
+-    if (drawing && m_backend && !m_drawsLeftOut)
++    if (drawing && m_backend && !m_drawsLeftOut && ps2_host_display::emulatedDrawing())
+     {
+         const auto submit = [&](const GSVertex *vertices)
+         {

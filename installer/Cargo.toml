@@ -1,0 +1,18 @@
+[package]
+name = "tfa-setup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+description = "Transformers Armada PC version - setup: your discs in, the game out (a window over setup.ps1)"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.17"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

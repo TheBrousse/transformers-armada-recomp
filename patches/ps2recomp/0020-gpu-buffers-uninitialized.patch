@@ -1,0 +1,191 @@
+Subject: [PATCH] GPU renderer: vertex and mesh buffers grown without zeroing,
+ triangles written in place
+
+The frame's vertex list and mesh words were value-initialized on every resize (zeroed, then
+written over at once), and triangles went in by push_back one vertex at a time. A
+default-initializing allocator for those buffers and in-place writes into the room made for
+them: about 4-5% more frames a second uncapped in Transformers (the GS thread the limit).
+---
+ ps2xRuntime/src/lib/gs/gs_gpu.cpp | 63 +++++++++++++++++++++++++------
+ 1 file changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 478fdbc..faa0f9c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -36,6 +36,7 @@
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ namespace
+@@ -463,6 +464,32 @@ namespace
+         return texture;
+     }
+ 
++    // A vector that leaves new elements uninitialized (resize does not zero them): the frame's
++    // vertex and mesh buffers are written right after they grow, and the zeroing showed up as a
++    // tenth of the GS thread's time (2026-10-22, Transformers' meshes).
++    template <class T>
++    struct DefaultInit : std::allocator<T>
++    {
++        template <class U>
++        struct rebind
++        {
++            using other = DefaultInit<U>;
++        };
++        DefaultInit() = default;
++        template <class U>
++        DefaultInit(const DefaultInit<U> &) noexcept
++        {
++        }
++        template <class U, class... Args>
++        void construct(U *at, Args &&...args)
++        {
++            if constexpr (sizeof...(Args) == 0)
++                ::new (static_cast<void *>(at)) U;
++            else
++                ::new (static_cast<void *>(at)) U(std::forward<Args>(args)...);
++        }
++    };
++
+     struct GpuVertex
+     {
+         float x, y;
+@@ -472,6 +499,7 @@ namespace
+         uint32_t packed; // draw index | fog << 24
+     };
+     static_assert(sizeof(GpuVertex) == 32, "vertex layout");
++    using VertexList = std::vector<GpuVertex, DefaultInit<GpuVertex>>;
+ 
+     // A draw's registers as the shader's Draw struct has them (std430: vectors of four).
+     struct GpuDraw
+@@ -718,7 +746,7 @@ struct GSGpuRenderer::Impl
+     // ---- the batch: draws into one frame buffer (and depth buffer), one draw call ----
+     Target *batchFrame = nullptr; // (kept after a flush: the next draws usually go on there)
+     Target *batchDepth = nullptr;
+-    std::vector<GpuVertex> vertices;
++    VertexList vertices;
+     std::vector<GpuDraw> draws;
+     std::vector<uint32_t> cluts; // CLUT copies, 256 words each
+     uint64_t batchClutVersion = 0u;
+@@ -740,7 +768,7 @@ struct GSGpuRenderer::Impl
+     };
+     struct ShadowBatch
+     {
+-        std::vector<GpuVertex> vertices;
++        VertexList vertices;
+         std::vector<FoldCandidate> foldCandidates;
+         std::array<GLuint, 4> sources{};
+         std::array<GLuint, 4> views{};
+@@ -759,7 +787,8 @@ struct GSGpuRenderer::Impl
+     int meshMode = 0; // PS2X_GPU_MESHES: 0 off, 1 made here exactly, 2 made on the GPU (the default), 3 both, compared
+     GLuint meshProgram = 0u, meshDataBuffer = 0u, meshTableBuffer = 0u;
+     GLint meshTrianglesLocation = -1, meshTriangleBaseLocation = -1, meshZeroLocation = -1;
+-    std::vector<uint32_t> meshWords, meshJobs, meshTriangles;
++    std::vector<uint32_t, DefaultInit<uint32_t>> meshWords;
++    std::vector<uint32_t> meshJobs, meshTriangles;
+     uint64_t statMeshTriangles = 0u;
+     // (PS2X_GPU_MESHES=3: the vertices made here too, and the GPU's compared with them)
+     std::vector<std::pair<uint32_t, GpuVertex>> meshExpected;
+@@ -877,7 +906,7 @@ struct GSGpuRenderer::Impl
+     uint64_t statFolded = 0u;
+     std::vector<FoldCandidate> foldCandidates; // (the main list's)
+     bool repeatable(const GpuDraw &d) const;
+-    void foldRepeats(std::vector<GpuVertex> &list, std::vector<FoldCandidate> &candidates);
++    void foldRepeats(VertexList &list, std::vector<FoldCandidate> &candidates);
+     GLuint dualProgram = 0u;
+     GLint dualTargetLocation = -1, dualSourceSizeLocation = -1, dualSourceScaleLocation = -1;
+     uint64_t fieldClock = 0u;
+@@ -1143,7 +1172,7 @@ struct GSGpuRenderer::Impl
+     bool carry = true;
+     int carryNow = 0;
+     std::vector<CarryRun> carryRuns[2];
+-    std::vector<GpuVertex> carryStore[2];
++    VertexList carryStore[2];
+     std::vector<uint32_t> carryOrder;
+     std::vector<CarrySlot> carrySlots = std::vector<CarrySlot>(kCarrySlots);
+     std::vector<uint32_t> carrySlotsUsed;
+@@ -3804,6 +3833,11 @@ void GSGpuRenderer::Impl::appendPrimitives(const GSVertex *in, uint32_t count, u
+         const int mode = texMode;
+         if (const size_t needed = vertices.size() + static_cast<size_t>(count) * 3u; needed > vertices.capacity())
+             vertices.reserve(std::max(needed, vertices.capacity() * 2u)); // (growing as push_back would)
++        // (written in place: the room for all of them made at once - uninitialized - and cut back to
++        // what was written; push_back for each vertex was a sixth of the GS thread's time)
++        const size_t first = vertices.size();
++        vertices.resize(first + static_cast<size_t>(count) * 3u);
++        GpuVertex *write = vertices.data() + first;
+         uint64_t culled = 0u;
+         for (uint32_t p = 0; p < count; ++p)
+         {
+@@ -3847,9 +3881,10 @@ void GSGpuRenderer::Impl::appendPrimitives(const GSVertex *in, uint32_t count, u
+                     out.q = 0.0f;
+                 }
+                 out.packed = draw | (static_cast<uint32_t>(s.fog) << 24u);
+-                vertices.push_back(out);
++                *write++ = out;
+             }
+         }
++        vertices.resize(static_cast<size_t>(write - vertices.data()));
+         statCulled += culled;
+         break;
+     }
+@@ -4031,7 +4066,7 @@ bool GSGpuRenderer::Impl::repeatable(const GpuDraw &d) const
+ 
+ // (candidates: the entries that may fold and where their primitives begin in the list, noted
+ // as the entries were made - the batch's other runs are not looked at.)
+-void GSGpuRenderer::Impl::foldRepeats(std::vector<GpuVertex> &list, std::vector<FoldCandidate> &candidates)
++void GSGpuRenderer::Impl::foldRepeats(VertexList &list, std::vector<FoldCandidate> &candidates)
+ {
+     struct Cut
+     {
+@@ -4827,7 +4862,7 @@ bool GSGpuRenderer::Impl::carryFrom(const MomentSegment &a, const MomentSegment
+     key |= key == 0u ? 1u : 0u;
+     const bool kept = carryKind(key, false);
+     std::vector<CarryRun> &now = carryRuns[carryNow];
+-    std::vector<GpuVertex> &store = carryStore[carryNow];
++    VertexList &store = carryStore[carryNow];
+     uint32_t stored = ~0u;
+     if (kept)
+     {
+@@ -4845,7 +4880,7 @@ bool GSGpuRenderer::Impl::carryFrom(const MomentSegment &a, const MomentSegment
+     if (slot->count > kCarryDense)
+         return false; // (as it is: neither looked for nor counted)
+     const std::vector<CarryRun> &before = carryRuns[1 - carryNow];
+-    const std::vector<GpuVertex> &beforeStore = carryStore[1 - carryNow];
++    const VertexList &beforeStore = carryStore[1 - carryNow];
+     const float bx = vertices[b.first].x, by = vertices[b.first].y + shift;
+     const auto near = [&](const CarryRun &r) { return std::max(std::fabs(r.x - bx), std::fabs(r.y - by)); };
+     constexpr float kSame = 0.13f; // (the GS's sixteenths of a pixel, twice)
+@@ -6107,14 +6142,18 @@ void GSGpuRenderer::Impl::addMeshJob(const uint8_t *mesh, const gsmesh::Header &
+     meshJobs.insert(meshJobs.end(), {data, drawIndex | (texMode == 2 ? 1u << 24 : 0u), ofxBits, ofyBits});
+     const size_t firstSlot = vertices.size();
+     uint32_t made = 0u;
++    const size_t tableAt = meshTriangles.size();
++    meshTriangles.resize(tableAt + 2u * (header.count > 2u ? header.count - 2u : 0u));
++    uint32_t *table = meshTriangles.data() + tableAt;
+     for (uint32_t v = 2u; v < header.count; ++v)
+     {
+         if (((static_cast<uint32_t>(gsmesh::kickBits(masks[0], masks[1], v)) >> 15) & 1u) != 0u)
+             continue; // (ADC: it does not kick)
+-        meshTriangles.push_back(static_cast<uint32_t>(firstSlot + 3u * made));
+-        meshTriangles.push_back(job << 5 | v);
++        table[2u * made] = static_cast<uint32_t>(firstSlot + 3u * made);
++        table[2u * made + 1u] = job << 5 | v;
+         ++made;
+     }
++    meshTriangles.resize(tableAt + 2u * made);
+     vertices.resize(firstSlot + 3u * made);
+     statPrims += made;
+     if (batchMoments)
+@@ -6192,7 +6231,7 @@ void GSGpuRenderer::Impl::expandMeshes()
+     if (meshMode == 3 && !meshExpected.empty())
+     {
+         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+-        std::vector<GpuVertex> got(vertices.size());
++        VertexList got(vertices.size());
+         glBindBuffer(GL_ARRAY_BUFFER, vbo);
+         glGetBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(got.size() * sizeof(GpuVertex)), got.data());
+         static const char *names[8] = {"x", "y", "z", "rgba", "s", "t", "q", "packed"};

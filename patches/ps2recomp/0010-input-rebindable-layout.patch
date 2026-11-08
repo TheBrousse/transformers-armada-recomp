@@ -1,0 +1,348 @@
+Subject: [PATCH] input: a rebindable keyboard and mouse layout
+
+The layout of 0009 as data: for each pad button and stick direction a list of keys or mouse
+buttons, PS2X_KEYMAP at start, ps2_host_input::setKeyBindings while running (the game's
+controls menu), keyBindings / defaultKeyBindings / keyName / keyCode for it.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_input.h b/ps2xRuntime/include/runtime/ps2_host_input.h
+index 01ee5d4..a060da4 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_input.h
++++ b/ps2xRuntime/include/runtime/ps2_host_input.h
+@@ -1,6 +1,8 @@
+ #ifndef PS2_HOST_INPUT_H
+ #define PS2_HOST_INPUT_H
+ 
++#include <string>
++
+ // Keyboard and mouse as a pad (see ps2_pad.cpp for the key map).
+ //
+ // The pad backend reads keys and gamepads whenever the game polls the pad. What only the
+@@ -49,6 +51,20 @@ namespace ps2_host_input
+     // them (takeKeyPresses: the presses since the last call) once per game frame.
+     void watchKey(int key);
+     int takeKeyPresses(int key);
++
++    // The keyboard and mouse layout: for each pad button and stick direction, the keys and mouse
++    // buttons that press it, as "cross=X;circle=C,BACKSPACE;r1=LEFT_ALT,MOUSE_LEFT;lup=W;..."
++    // (up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select, lup ldown
++    // lleft lright rup rdown rleft rright). PS2X_KEYMAP at start; setKeyBindings from then on (the
++    // inputs it names replace the defaults, the others keep theirs). Key names: A-Z, 0-9, F1-F12,
++    // raylib's KEY_ names without KEY_ (SPACE, LEFT_SHIFT, KP_0, ...), MOUSE_LEFT / RIGHT / MIDDLE /
++    // SIDE / EXTRA.
++    void setKeyBindings(const std::string &layout);
++    std::string keyBindings();
++    std::string defaultKeyBindings();
++    std::string keyName(int code);         // a raylib key code, or mouseButtonCode's
++    int keyCode(const std::string &name);  // -1: no such key
++    int mouseButtonCode(int button);       // a raylib mouse button as a code of the layout
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 5768499..5ec5436 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -2,6 +2,8 @@
+ #include "runtime/ps2_sony_pad.h"
+ #include "runtime/ps2_host_input.h"
+ #include "ps2_host_backend.h"
++#include <vector>
++#include <cctype>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -219,8 +221,201 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // The keyboard and mouse layout: a list of keys (raylib key codes) or mouse buttons
++    // (kMouseCode + raylib's button) for each pad button and stick direction. PS2X_KEYMAP, or
++    // setKeyBindings, in the form "cross=X;circle=C,BACKSPACE;r1=LEFT_ALT,MOUSE_LEFT;lup=W;...":
++    // the inputs named for an input replace its defaults, the others keep theirs.
++    constexpr int kMouseCode = 1000;
++    enum BindingInput
++    {
++        kBindUp, kBindDown, kBindLeft, kBindRight, kBindCross, kBindCircle, kBindSquare, kBindTriangle,
++        kBindL1, kBindR1, kBindL2, kBindR2, kBindL3, kBindR3, kBindStart, kBindSelect,
++        kBindLUp, kBindLDown, kBindLLeft, kBindLRight, kBindRUp, kBindRDown, kBindRLeft, kBindRRight,
++        kBindCount
++    };
++    struct BindingName
++    {
++        const char *name;
++        uint16_t mask; // the pad button (0: a stick direction)
++    };
++    constexpr BindingName kBindingNames[kBindCount] = {
++        {"up", PAD_UP},       {"down", PAD_DOWN},     {"left", PAD_LEFT},       {"right", PAD_RIGHT},
++        {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE},   {"triangle", PAD_TRIANGLE},
++        {"l1", PAD_L1},       {"r1", PAD_R1},         {"l2", PAD_L2},           {"r2", PAD_R2},
++        {"l3", PAD_L3},       {"r3", PAD_R3},         {"start", PAD_START},     {"select", PAD_SELECT},
++        {"lup", 0},           {"ldown", 0},           {"lleft", 0},             {"lright", 0},
++        {"rup", 0},           {"rdown", 0},           {"rleft", 0},             {"rright", 0}};
++
++    // The Transformers layout (patch 0009's): L1 jumps and is the movement Mini-Con, Triangle
++    // transforms, R1 fires, R2 and L2 are Mini-Con abilities, R3 the aiming view, Start pauses.
++    const char *const kDefaultKeymap =
++        "up=UP;down=DOWN;left=LEFT;right=RIGHT;cross=X;circle=C,BACKSPACE;square=R,KP_0;"
++        "triangle=T,V,F,KP_1;l1=SPACE,Q,MOUSE_MIDDLE;r1=LEFT_ALT,MOUSE_LEFT;l2=Z,LEFT_SHIFT;"
++        "r2=E,LEFT_CONTROL,RIGHT_SHIFT;l3=G;r3=B,MOUSE_RIGHT;start=ENTER,ESCAPE,P;select=TAB;"
++        "lup=W;ldown=S;lleft=A;lright=D;rup=I;rdown=K;rleft=J;rright=L";
++
++    struct KeyName
++    {
++        const char *name;
++        int code;
++    };
++    const KeyName kKeyNames[] = {
++        {"SPACE", KEY_SPACE}, {"ENTER", KEY_ENTER}, {"ESCAPE", KEY_ESCAPE}, {"TAB", KEY_TAB},
++        {"BACKSPACE", KEY_BACKSPACE}, {"INSERT", KEY_INSERT}, {"DELETE", KEY_DELETE}, {"HOME", KEY_HOME},
++        {"END", KEY_END}, {"PAGE_UP", KEY_PAGE_UP}, {"PAGE_DOWN", KEY_PAGE_DOWN},
++        {"UP", KEY_UP}, {"DOWN", KEY_DOWN}, {"LEFT", KEY_LEFT}, {"RIGHT", KEY_RIGHT},
++        {"LEFT_SHIFT", KEY_LEFT_SHIFT}, {"RIGHT_SHIFT", KEY_RIGHT_SHIFT}, {"LEFT_CONTROL", KEY_LEFT_CONTROL},
++        {"RIGHT_CONTROL", KEY_RIGHT_CONTROL}, {"LEFT_ALT", KEY_LEFT_ALT}, {"RIGHT_ALT", KEY_RIGHT_ALT},
++        {"CAPS_LOCK", KEY_CAPS_LOCK}, {"GRAVE", KEY_GRAVE}, {"MINUS", KEY_MINUS}, {"EQUAL", KEY_EQUAL},
++        {"LEFT_BRACKET", KEY_LEFT_BRACKET}, {"RIGHT_BRACKET", KEY_RIGHT_BRACKET}, {"BACKSLASH", KEY_BACKSLASH},
++        {"SEMICOLON", KEY_SEMICOLON}, {"APOSTROPHE", KEY_APOSTROPHE}, {"COMMA", KEY_COMMA}, {"PERIOD", KEY_PERIOD},
++        {"SLASH", KEY_SLASH}, {"KP_0", KEY_KP_0}, {"KP_1", KEY_KP_1}, {"KP_2", KEY_KP_2}, {"KP_3", KEY_KP_3},
++        {"KP_4", KEY_KP_4}, {"KP_5", KEY_KP_5}, {"KP_6", KEY_KP_6}, {"KP_7", KEY_KP_7}, {"KP_8", KEY_KP_8},
++        {"KP_9", KEY_KP_9}, {"KP_ENTER", KEY_KP_ENTER}, {"KP_ADD", KEY_KP_ADD}, {"KP_SUBTRACT", KEY_KP_SUBTRACT},
++        {"MOUSE_LEFT", kMouseCode + MOUSE_BUTTON_LEFT}, {"MOUSE_RIGHT", kMouseCode + MOUSE_BUTTON_RIGHT},
++        {"MOUSE_MIDDLE", kMouseCode + MOUSE_BUTTON_MIDDLE}, {"MOUSE_SIDE", kMouseCode + MOUSE_BUTTON_SIDE},
++        {"MOUSE_EXTRA", kMouseCode + MOUSE_BUTTON_EXTRA}};
++
++    std::string keyNameOf(int code)
++    {
++        if ((code >= KEY_A && code <= KEY_Z) || (code >= KEY_ZERO && code <= KEY_NINE))
++            return std::string(1, static_cast<char>(code));
++        if (code >= KEY_F1 && code <= KEY_F12)
++            return "F" + std::to_string(code - KEY_F1 + 1);
++        for (const KeyName &k : kKeyNames)
++            if (k.code == code)
++                return k.name;
++        return std::to_string(code);
++    }
++
++    int keyCodeOf(std::string name)
++    {
++        for (char &c : name)
++            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++        if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9')))
++            return name[0];
++        if (name.size() >= 2 && name[0] == 'F' && std::isdigit(static_cast<unsigned char>(name[1])))
++        {
++            const int n = std::atoi(name.c_str() + 1);
++            if (n >= 1 && n <= 12)
++                return KEY_F1 + n - 1;
++        }
++        for (const KeyName &k : kKeyNames)
++            if (name == k.name)
++                return k.code;
++        if (!name.empty() && std::isdigit(static_cast<unsigned char>(name[0])))
++            return std::atoi(name.c_str());
++        return -1;
++    }
++
++    std::mutex g_bindingsMutex;
++    std::vector<int> g_bindings[kBindCount];
++    bool g_bindingsLoaded = false;
++
++    // A layout string into `into` (only the inputs it names).
++    void parseKeymap(const std::string &spec, std::vector<int> (&into)[kBindCount])
++    {
++        size_t at = 0;
++        while (at < spec.size())
++        {
++            size_t end = spec.find(';', at);
++            if (end == std::string::npos)
++                end = spec.size();
++            const std::string item = spec.substr(at, end - at);
++            at = end + 1;
++            const size_t eq = item.find('=');
++            if (eq == std::string::npos)
++                continue;
++            const std::string input = item.substr(0, eq);
++            int index = -1;
++            for (int i = 0; i < kBindCount; ++i)
++                if (input == kBindingNames[i].name)
++                    index = i;
++            if (index < 0)
++                continue;
++            std::vector<int> codes;
++            const std::string list = item.substr(eq + 1);
++            size_t p = 0;
++            while (p <= list.size())
++            {
++                size_t comma = list.find(',', p);
++                if (comma == std::string::npos)
++                    comma = list.size();
++                const int code = keyCodeOf(list.substr(p, comma - p));
++                if (code >= 0)
++                    codes.push_back(code);
++                p = comma + 1;
++            }
++            into[index] = codes;
++        }
++    }
++
++    // (with g_bindingsMutex held)
++    void loadBindingsLocked()
++    {
++        if (g_bindingsLoaded)
++            return;
++        g_bindingsLoaded = true;
++        parseKeymap(kDefaultKeymap, g_bindings);
++        if (const char *env = std::getenv("PS2X_KEYMAP"); env && *env)
++            parseKeymap(env, g_bindings);
++    }
++
++    std::string formatKeymap(const std::vector<int> (&from)[kBindCount])
++    {
++        std::string out;
++        for (int i = 0; i < kBindCount; ++i)
++        {
++            if (!out.empty())
++                out += ';';
++            out += kBindingNames[i].name;
++            out += '=';
++            for (size_t c = 0; c < from[i].size(); ++c)
++                out += (c ? "," : "") + keyNameOf(from[i][c]);
++        }
++        return out;
++    }
++
++    bool bindingDown(int code, bool mouseLive)
++    {
++        if (code >= kMouseCode)
++            return mouseLive && IsMouseButtonDown(code - kMouseCode);
++        return IsKeyDown(code);
++    }
++}
++
+ namespace ps2_host_input
+ {
++
++    void setKeyBindings(const std::string &layout)
++    {
++        std::lock_guard<std::mutex> lock(g_bindingsMutex);
++        g_bindingsLoaded = true;
++        for (auto &b : g_bindings)
++            b.clear();
++        parseKeymap(kDefaultKeymap, g_bindings);
++        parseKeymap(layout, g_bindings);
++    }
++
++    std::string keyBindings()
++    {
++        std::lock_guard<std::mutex> lock(g_bindingsMutex);
++        loadBindingsLocked();
++        return formatKeymap(g_bindings);
++    }
++
++    std::string defaultKeyBindings()
++    {
++        std::vector<int> defaults[kBindCount];
++        parseKeymap(kDefaultKeymap, defaults);
++        return formatKeymap(defaults);
++    }
++
++    std::string keyName(int code) { return keyNameOf(code); }
++    int keyCode(const std::string &name) { return keyCodeOf(name); }
++    int mouseButtonCode(int button) { return kMouseCode + button; }
+     void setWindowTitle(const char *title)
+     {
+         g_windowTitle = title ? title : "";
+@@ -483,38 +678,48 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+     }
+ 
+-    // Keyboard, on top of the gamepad. The layout for Transformers (its buttons: L1 jumps and is
+-    // the movement Mini-Con, Triangle transforms, R1 fires, R2 and L2 are Mini-Con abilities, R3
+-    // the aiming view, Start pauses): WASD move, Space jump, T transform, Q / E / Z the L1 / R2 /
+-    // L2 Mini-Cons, Esc or P pause; X and the arrows for the menus (Cross), Enter Start.
+-    if (live)
+-    {
+-        press(IsKeyDown(KEY_UP), PAD_UP);
+-        press(IsKeyDown(KEY_DOWN), PAD_DOWN);
+-        press(IsKeyDown(KEY_LEFT), PAD_LEFT);
+-        press(IsKeyDown(KEY_RIGHT), PAD_RIGHT);
+-        press(IsKeyDown(KEY_X), PAD_CROSS);
+-        press(IsKeyDown(KEY_C) || IsKeyDown(KEY_BACKSPACE), PAD_CIRCLE);
+-        press(IsKeyDown(KEY_R) || IsKeyDown(KEY_KP_0), PAD_SQUARE);
+-        press(IsKeyDown(KEY_T) || IsKeyDown(KEY_V) || IsKeyDown(KEY_F) || IsKeyDown(KEY_KP_1), PAD_TRIANGLE);
+-        press(IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_Q), PAD_L1);
+-        press(IsKeyDown(KEY_LEFT_ALT), PAD_R1);
+-        press(IsKeyDown(KEY_Z) || IsKeyDown(KEY_LEFT_SHIFT), PAD_L2);
+-        press(IsKeyDown(KEY_E) || IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_SHIFT), PAD_R2);
+-        press(IsKeyDown(KEY_G), PAD_L3);
+-        press(IsKeyDown(KEY_B), PAD_R3);
+-        press(IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_ESCAPE) || IsKeyDown(KEY_P), PAD_START);
+-        press(IsKeyDown(KEY_TAB), PAD_SELECT);
+-
+-        const float keyLx = keyAxis(KEY_A, KEY_D);
+-        const float keyLy = keyAxis(KEY_W, KEY_S);
++    // Keyboard and mouse buttons, on top of the gamepad: the layout (kDefaultKeymap, PS2X_KEYMAP,
++    // ps2_host_input::setKeyBindings). Keys while the window takes input, mouse buttons once the
++    // mouse belongs to the game.
++    const bool mouseButtons = g_mouseCaptured.load(std::memory_order_relaxed) && g_mouseButtonsLive.load(std::memory_order_relaxed);
++    if (live || mouseButtons)
++    {
++        constexpr size_t kMost = 8u;
++        int codes[kBindCount][kMost];
++        size_t counts[kBindCount];
++        {
++            std::lock_guard<std::mutex> lock(g_bindingsMutex);
++            loadBindingsLocked();
++            for (int i = 0; i < kBindCount; ++i)
++            {
++                counts[i] = std::min(g_bindings[i].size(), kMost);
++                for (size_t c = 0; c < counts[i]; ++c)
++                    codes[i][c] = g_bindings[i][c];
++            }
++        }
++        const auto down = [&](int input)
++        {
++            for (size_t c = 0; c < counts[input]; ++c)
++            {
++                const int code = codes[input][c];
++                if (code >= kMouseCode ? (mouseButtons && IsMouseButtonDown(code - kMouseCode)) : (live && IsKeyDown(code)))
++                    return true;
++            }
++            return false;
++        };
++        for (int i = 0; i < kBindLUp; ++i)
++            press(down(i), kBindingNames[i].mask);
++        const auto axis = [&](int negative, int positive)
++        { return (down(positive) ? 1.0f : 0.0f) - (down(negative) ? 1.0f : 0.0f); };
++        const float keyLx = axis(kBindLLeft, kBindLRight);
++        const float keyLy = axis(kBindLUp, kBindLDown);
+         if (keyLx != 0.0f || keyLy != 0.0f)
+         {
+             lx = keyLx;
+             ly = keyLy;
+         }
+-        const float keyRx = keyAxis(KEY_J, KEY_L);
+-        const float keyRy = keyAxis(KEY_I, KEY_K);
++        const float keyRx = axis(kBindRLeft, kBindRRight);
++        const float keyRy = axis(kBindRUp, kBindRDown);
+         if (keyRx != 0.0f || keyRy != 0.0f)
+         {
+             rx = keyRx;
+@@ -522,15 +727,9 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         }
+     }
+ 
+-    // Mouse, once it belongs to the game.
++    // The mouse's motion, once it belongs to the game.
+     if (g_mouseCaptured.load(std::memory_order_relaxed))
+     {
+-        if (g_mouseButtonsLive.load(std::memory_order_relaxed))
+-        {
+-            press(IsMouseButtonDown(MOUSE_BUTTON_LEFT), PAD_R1);   // fire
+-            press(IsMouseButtonDown(MOUSE_BUTTON_RIGHT), PAD_R3);  // the aiming view (the game toggles it)
+-            press(IsMouseButtonDown(MOUSE_BUTTON_MIDDLE), PAD_L1); // jump
+-        }
+         const float mouseX = g_mouseStickX.load(std::memory_order_relaxed);
+         const float mouseY = g_mouseStickY.load(std::memory_order_relaxed);
+         if (mouseX != 0.0f || mouseY != 0.0f)

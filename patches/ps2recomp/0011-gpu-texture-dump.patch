@@ -1,0 +1,113 @@
+Subject: [PATCH] gpu: dump textures under their texture pack names
+
+PS2X_TEXTURE_DUMP=<folder>: every texture the game uploads is written once, as decoded (RGBA,
+alpha 128 opaque as the GS has it), named <hash>-<CLUT hash>-<bits>.png like the pack's .dds
+files, so a pack can be made from them (upscaled, then converted to .dds).
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 9e45fca..478fdbc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -29,6 +29,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <functional>
+ #include <initializer_list>
+ #include <memory>
+@@ -921,6 +922,11 @@ struct GSGpuRenderer::Impl
+     gs_texture_pack::Pack pack;
+     bool packOpen = false;
+     bool packLog = false; // PS2X_TEXTURE_PACK_LOG: every texture's name, found or not
++    // PS2X_TEXTURE_DUMP=<folder>: every texture the game uploads, once, as <its pack name>.png there
++    // (RGBA as the GS has it: alpha 128 is opaque), to make a texture pack from.
++    std::string textureDump;
++    std::unordered_map<std::string, bool> textureDumped;
++    std::string pendingDumpName; // (set for decodedTexture: write what it decodes)
+     struct PackHash
+     {
+         uint64_t epoch = 0u; // writeClock when hashed
+@@ -1690,10 +1696,17 @@ bool GSGpuRenderer::Impl::init()
+             folder = "replacements";
+         packOpen = pack.open(folder) || (!std::getenv("PS2X_TEXTURE_PACK") && pack.open("textures/replacements"));
+         packLog = envFlag("PS2X_TEXTURE_PACK_LOG", false);
++        if (const char *dump = std::getenv("PS2X_TEXTURE_DUMP"); dump && *dump)
++        {
++            textureDump = dump;
++            std::error_code error;
++            std::filesystem::create_directories(textureDump, error);
++            std::fprintf(stderr, "[gpu] dumping textures to %s\n", textureDump.c_str());
++        }
+         if (const char *env = std::getenv("PS2X_GPU_PACK_MEMO"); env && *env)
+             replacementMemoMode = std::atoi(env);
+         textureCache = nativeEnabled && envFlag("PS2X_GPU_TEXTURE_CACHE", true); // (on by default since 2026-10-08)
+-        replacements = packOpen || textureCache;
++        replacements = packOpen || textureCache || !textureDump.empty(); // (the dump looks at every texture too)
+         if (packOpen)
+             std::fprintf(stderr, "[gpu] texture pack: %zu replacement textures\n", pack.size());
+         if (textureCache)
+@@ -2951,7 +2964,7 @@ uint32_t GSGpuRenderer::Impl::replacementSlot(const GSTex0Reg &tex0, const GSTex
+ uint32_t GSGpuRenderer::Impl::replacementSlotUncached(const GSTex0Reg &tex0, const GSTexaReg &texa, uint8_t wrapU, uint8_t wrapV, bool linear,
+                                                       bool decode)
+ {
+-    if (tex0.tw > 10u || tex0.th > 10u || (!packOpen && !decode))
++    if (tex0.tw > 10u || tex0.th > 10u || (!packOpen && !decode && textureDump.empty()))
+         return 0u;
+     const Kind kind = kindOf(tex0.psm);
+     if (kind == kNoKind)
+@@ -3012,6 +3025,23 @@ uint32_t GSGpuRenderer::Impl::replacementSlotUncached(const GSTex0Reg &tex0, con
+                          static_cast<unsigned long long>(cached.hash), static_cast<unsigned long long>(clutHash), bits, tex0.tbp0,
+                          tex0.tbw, tex0.psm, tw, th, texture ? "replaced" : "-");
+     }
++    if (!texture && !textureDump.empty())
++    {
++        char name[96];
++        if (clutHash != 0u)
++            std::snprintf(name, sizeof(name), "%llx-%llx-%08x", static_cast<unsigned long long>(cached.hash),
++                          static_cast<unsigned long long>(clutHash), bits);
++        else
++            std::snprintf(name, sizeof(name), "%llx-%08x", static_cast<unsigned long long>(cached.hash), bits);
++        if (textureDumped.emplace(name, true).second)
++        {
++            pendingDumpName = name;
++            const GLuint dumped = decodedTexture(tex0, texa, cached.hash);
++            pendingDumpName.clear();
++            if (!decode && dumped)
++                return 0u; // (dumped only: drawn from local memory as before)
++        }
++    }
+     if (!texture)
+     {
+         // (the cache's, when the native path draws it)
+@@ -3111,6 +3141,12 @@ GLuint GSGpuRenderer::Impl::decodedTexture(const GSTex0Reg &tex0, const GSTexaRe
+     else if (psm != GS_PSM_CT32)
+         key ^= (static_cast<uint64_t>(texa.ta0) | (static_cast<uint64_t>(texa.ta1) << 8u) | (texa.aem ? 0x10000ull : 0u)) * 0xC2B2AE3D27D4EB4Full;
+     auto found = decodedTextures.find(key);
++    if (found != decodedTextures.end() && !pendingDumpName.empty())
++    {
++        glDeleteTextures(1, &found->second.texture); // (decoded again below, for the dump)
++        decodedTextures.erase(found);
++        found = decodedTextures.end();
++    }
+     if (found != decodedTextures.end())
+     {
+         found->second.lastUse = flushSerial;
+@@ -3183,6 +3219,17 @@ GLuint GSGpuRenderer::Impl::decodedTexture(const GSTex0Reg &tex0, const GSTexaRe
+             row[x] = c;
+         }
+     }
++    if (!pendingDumpName.empty())
++    {
++        Image image{};
++        image.data = decodeScratch.data();
++        image.width = static_cast<int>(tw);
++        image.height = static_cast<int>(th);
++        image.mipmaps = 1;
++        image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++        const std::string path = textureDump + "/" + pendingDumpName + ".png";
++        ExportImage(image, path.c_str());
++    }
+     // (the least used go first once there are too many - not one the batch being made has)
+     if (decodedTextures.size() >= kDecodedMost)
+     {

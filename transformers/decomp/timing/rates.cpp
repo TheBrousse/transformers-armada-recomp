@@ -1,0 +1,125 @@
+// Frame timing: the rates the game aims at.
+
+#include "timing.h"
+
+#include "port.h"
+
+namespace tf::timing
+{
+    namespace
+    {
+        // The standard the rates are for: a PAL console in its 60 Hz mode counts as NTSC.
+        // (Inline in each of the three functions below in the original.)
+        int32_t RateStandard()
+        {
+            int32_t standard = tvStandard;
+            if (pal60 != 0 && standard == 1)
+                standard = 0;
+            return standard;
+        }
+
+        // PC: a rate of the console's (59.94) at the PC port's level rate R: 59.94 x R / 60, a
+        // frame and a VBlank every 1/R s. As it is at 60, and outside such a level (rate 0).
+        f32 AtRate(f32 consoleRate, int rate)
+        {
+            if (rate == 0 || rate == 60)
+                return consoleRate;
+            return consoleRate * f32(static_cast<float>(rate) / 60.0f);
+        }
+
+        // The return address of the period's call in a car's reset (0x31F6D0).
+        constexpr uint32_t kCarResetReturn = 0x0031F7E0u;
+    }
+
+    f32 LevelFrameRate(int rate)
+    {
+        return AtRate(frameRates[RateStandard()], rate);
+    }
+
+    f32 LevelFramePeriod(int rate)
+    {
+        return f32(1.0f) / LevelFrameRate(rate);
+    }
+
+    f32 ConsoleFramePeriod()
+    {
+        f32 rate = frameRates[RateStandard()];
+        rate = rate / 2.0f;
+        return f32(1.0f) / rate;
+    }
+
+    // 0x32E840: the TV's field rate.
+    f32 TvFieldRate()
+    {
+        // PC: in a level at the PC port's rate, a field (a VBlank) every 1/R s - every 1/(2R) s
+        // with in-between pictures.
+        return AtRate(tvFieldRates[RateStandard()], port::vblankRate());
+    }
+
+    // 0x32E8B0: the frame rate the game aims at - the TV's field rate, or half of it.
+    f32 TargetFrameRate()
+    {
+        f32 rate = frameRates[RateStandard()];
+        if (halfRate != 0)
+            rate = rate / 2.0f;
+        // PC: in a level at the PC port's rate, R frames a second - of one field, or of two with
+        // in-between pictures (whose half rate is on).
+        if (port::levelRate() != 0)
+            return LevelFrameRate(port::levelRate());
+        return rate;
+    }
+
+    // 0x32E910: the seconds a frame at that rate.
+    f32 FramePeriod()
+    {
+        // PC: a car's reset keeps the period of 30 in a level at the PC port's rate. Its wheels
+        // and tyres take the step from it (+0x34), and the cars step every 30th of a second
+        // at every rate (overrides.cpp, "The cars").
+        if (port::levelRate() != 0 && decomp::guest().gpr(31) == kCarResetReturn)
+            return ConsoleFramePeriod();
+        f32 rate = frameRates[RateStandard()];
+        if (halfRate != 0)
+            rate = rate / 2.0f;
+        if (port::levelRate() != 0)
+            return LevelFramePeriod(port::levelRate()); // (PC: as TargetFrameRate)
+        return f32(1.0f) / rate;
+    }
+
+    // 0x32E8A0: frames of two TV fields or of one. The game asks for two when it makes its
+    // modes: the shipped game runs at 30.
+    void SetHalfRate(uint8_t on)
+    {
+        // PC: remembered for when the level ends; a level at the PC port's rate keeps one
+        // field a frame, or two with in-between pictures.
+        port::noteGameHalfRate(on);
+        halfRate = port::levelRate() != 0 ? uint8_t(port::inBetweenPictures() ? 1 : 0) : on;
+    }
+
+    // 0x202FF0: the governor's target rates; the main loop sets [0] when it starts.
+    void SetTargetRate(int32_t index, f32 rate)
+    {
+        targetRates[index] = rate;
+    }
+
+    // 0x106710: whether the game holds itself at 30 (from boot until a level has been set
+    // up, and while one loads).
+    int32_t HoldsAtThirty()
+    {
+        return holdAtThirty;
+    }
+
+    // 0x202FE0 (j 0x106710): the same, asked by the governor.
+    int32_t GovernorHoldsAtThirty()
+    {
+        // PC: a level at the PC port's rate is not held at 30.
+        return port::levelRate() != 0 ? 0 : static_cast<int32_t>(holdAtThirty);
+    }
+
+    DECOMP_FUNCTION(0x32E840, TvFieldRate, "timing");
+    DECOMP_FUNCTION(0x32E8B0, TargetFrameRate, "timing");
+    DECOMP_FUNCTION(0x32E910, FramePeriod, "timing");
+    DECOMP_FUNCTION(0x32E8A0, SetHalfRate, "timing");
+    DECOMP_FUNCTION(0x202FF0, SetTargetRate, "timing");
+    DECOMP_FUNCTION(0x106710, HoldsAtThirty, "timing");
+    DECOMP_FUNCTION(0x202FE0, GovernorHoldsAtThirty, "timing");
+}

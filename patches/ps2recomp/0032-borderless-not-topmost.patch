@@ -1,0 +1,30 @@
+Subject: [PATCH] Borderless full screen: not always on top
+
+raylib's ToggleBorderlessWindowed also sets GLFW_FLOATING (topmost): Alt+Tab brought no other
+window in front of the game. The flag is cleared after it; a window the screen's size still
+covers the taskbar while it is the one in front.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5d24a5c..c23e107 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -66,6 +66,11 @@ static void setFullScreen(bool on)
+ {
+     if (on != IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+         ToggleBorderlessWindowed();
++    // raylib's borderless window is also made always-on-top (GLFW_FLOATING): Alt+Tab then brought
++    // no other window in front of it. A window the screen's size still covers the taskbar while it
++    // is the one in front.
++    if (on && IsWindowState(FLAG_WINDOW_TOPMOST))
++        ClearWindowState(FLAG_WINDOW_TOPMOST);
+     static const char *exactEnv = std::getenv("PS2X_FULLSCREEN_EXACT");
+     const bool exact = (exactEnv && *exactEnv) ? *exactEnv != '0' : ps2_host_present::active();
+     if (on && !exact)
+-- 
+2.54.0.windows.1
+

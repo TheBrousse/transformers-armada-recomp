@@ -1,0 +1,118 @@
+Subject: [PATCH] EE scheduler: the event queue's lock only when something was posted
+
+processPendingEvents runs twice a dispatch and took m_eventMutex twice each time, to swap the
+events out and to work out m_checkpointPending - an uncontended pair still, and worse whenever
+another thread posted at the same time. A flag set by postEvent (under the lock, before it asks
+for the checkpoint) now lets it skip the lock when nothing was posted, and the checkpoint test
+runs without it: a post that lands between the test and the store is seen by a second look at
+the flag and asks for the checkpoint again. Events are handled in the same order as before (one
+posted just after the flag was taken waits for the next call, as one posted just after the swap
+always did).
+
+PS2X_EE_FASTPATHS=<bits> (all set by default) is an A/B switch in one build: bit 1 this path,
+bit 2 the DMA completions' (0046); 0 takes the locks every time as before.
+---
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 4610938..a9265c4 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -588,6 +588,10 @@ private:
+     std::condition_variable m_eventCv;
+     std::vector<EeEvent> m_events;
+     std::vector<EeEvent> m_eventsTaken; // storage processPendingEvents takes the events into (kept, not freed)
++    // Set (under m_eventMutex) whenever m_events is added to: processPendingEvents, which runs twice
++    // a dispatch, takes the lock only when it is set (it mostly is not - an uncontended lock pair
++    // a call still cost ~4% of the EE thread at 240 frames a second).
++    std::atomic<bool> m_eventsPosted{false};
+     std::vector<ScheduledEvent> m_deadlines;
+     std::deque<GuestInvocation> m_pendingInvocations;
+     uint64_t m_eventSequence = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index d6f2bd9..5bc0003 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -230,6 +230,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_events.clear();
++        m_eventsPosted.store(false, std::memory_order_seq_cst);
+         m_deadlines.clear();
+         m_pendingInvocations.clear();
+         updateNextDeadline();
+@@ -464,6 +465,19 @@ void EeScheduler::requestStop()
+     m_eventCv.notify_all();
+ }
+ 
++// The EE thread's lock-free fast paths, for an A/B in one build: PS2X_EE_FASTPATHS=<bits> keeps the
++// ones set (all by default; 0 takes the locks every time as before). Bit 1: the event queue
++// (processPendingEvents, here); bit 2: the DMA completions (PS2Memory::consumeCompletedDmacCauses).
++bool ps2EeFastPaths(unsigned bit) noexcept
++{
++    static const unsigned bits = []()
++    {
++        const char *env = std::getenv("PS2X_EE_FASTPATHS");
++        return env && *env ? static_cast<unsigned>(std::strtoul(env, nullptr, 0)) : ~0u;
++    }();
++    return (bits & bit) != 0u;
++}
++
+ void EeScheduler::postEvent(EeEvent event)
+ {
+     if (event.type == EeEventType::Stop)
+@@ -475,7 +489,8 @@ void EeScheduler::postEvent(EeEvent event)
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_events.push_back(event);
+-        m_checkpointPending.store(true, std::memory_order_release);
++        m_eventsPosted.store(true, std::memory_order_seq_cst);
++        m_checkpointPending.store(true, std::memory_order_seq_cst);
+     }
+     m_eventCv.notify_one();
+ }
+@@ -1885,6 +1900,10 @@ void EeScheduler::processPendingEvents()
+     // m_eventsTaken moved out and uses storage of its own)
+     std::vector<EeEvent> pending = std::move(m_eventsTaken);
+     pending.clear();
++    // (m_eventsPosted: the lock only when something was posted; a post that comes after the flag
++    // was taken is left for the next call, as one after the swap always was)
++    static const bool fast = ps2EeFastPaths(1u);
++    if (m_eventsPosted.exchange(false, std::memory_order_seq_cst) || !fast)
+     {
+         std::lock_guard lock(m_eventMutex);
+         pending.swap(m_events);
+@@ -1896,6 +1915,7 @@ void EeScheduler::processPendingEvents()
+     pending.clear();
+     m_eventsTaken = std::move(pending);
+ 
++    if (!fast)
+     {
+         std::lock_guard lock(m_eventMutex);
+         const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+@@ -1903,6 +1923,19 @@ void EeScheduler::processPendingEvents()
+         const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
+         m_checkpointPending.store(pendingWork, std::memory_order_release);
+     }
++    else
++    {
++        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
++        const bool pendingWork = m_eventsPosted.load(std::memory_order_seq_cst) || cycleEventDue ||
++                                 m_stopRequested.load(std::memory_order_acquire);
++        m_checkpointPending.store(pendingWork, std::memory_order_seq_cst);
++        // Without the lock a post can come between the test and the store, which would clear the
++        // checkpoint it asked for: a post sets m_eventsPosted before m_checkpointPending, so one
++        // whose request the store overwrote is seen here and asked for again.
++        if (!pendingWork && m_eventsPosted.load(std::memory_order_seq_cst))
++            m_checkpointPending.store(true, std::memory_order_seq_cst);
++    }
+     applyPendingPreemption();
+ }
+ 
+@@ -2808,6 +2841,7 @@ void EeScheduler::loadState(ps2x::StateReader &in)
+             event.value = in.u64();
+             m_events.push_back(event);
+         }
++        m_eventsPosted.store(!m_events.empty(), std::memory_order_seq_cst);
+ 
+         const auto now = hostNow();
+         m_deadlines.clear();

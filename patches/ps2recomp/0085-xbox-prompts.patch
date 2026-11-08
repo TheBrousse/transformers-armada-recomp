@@ -1,0 +1,89 @@
+Subject: [PATCH] Runtime: the host gamepad's prompt style (from PR #11 by TPepperoni666)
+
+ps2_host_input::lastPadStyle: PlayStation for the native Sony pad and GLFW pads named Sony / PlayStation /
+DualSense / DualShock, Xbox for the others (Xbox pads, handhelds, Steam Input's virtual pads); PlayStation
+until a gamepad is seen. Written where the last device is (a gamepad in use), read by the native renderer's
+prompt choice. keyboardPrompts(): the follow-the-device setting, for the same choice.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_input.h b/ps2xRuntime/include/runtime/ps2_host_input.h
+index 825c737..1f028a1 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_input.h
++++ b/ps2xRuntime/include/runtime/ps2_host_input.h
+@@ -1,6 +1,7 @@
+ #ifndef PS2_HOST_INPUT_H
+ #define PS2_HOST_INPUT_H
+ 
++#include <initializer_list>
+ #include <string>
+ 
+ // Keyboard and mouse as a pad (see ps2_pad.cpp for the key map).
+@@ -76,9 +77,29 @@ namespace ps2_host_input
+         Gamepad
+     };
+     Device lastDevice();
++    enum class PadStyle { PlayStation, Xbox };
++    // Unknown and Steam Input virtual pads use Xbox labels. Native Sony bypasses this test.
++    inline PadStyle padStyleForName(const char *name)
++    {
++        std::string n = name ? name : "";
++        for (char &c : n)
++            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++        // Explicit Xbox and virtual/handheld identities win over ambiguous wireless names.
++        for (const char *xbox : {"xbox", "xinput", "x-box", "360 controller", "series x", "steam deck",
++                                 "steam virtual", "steam controller", "legion", "rog ally", "msi claw", "ayaneo", "one xplayer", "onexplayer"})
++            if (n.find(xbox) != std::string::npos) return PadStyle::Xbox;
++        // Sony's bare GLFW name is ambiguous only when it appears inside a longer name.
++        if (n == "wireless controller") return PadStyle::PlayStation;
++        for (const char *sony : {"sony", "playstation", "dualsense", "dualshock", "ps4", "ps5"})
++            if (n.find(sony) != std::string::npos) return PadStyle::PlayStation;
++        return PadStyle::Xbox;
++    }
++    // The style of the gamepad used last; PlayStation before any gamepad is seen. Any thread.
++    PadStyle lastPadStyle();
+     // The texture pack's replacements in its keyboard/ folder (the button prompts as keys) are
+     // used while this is on and the keyboard is the last device (on by default).
+     void setKeyboardPrompts(bool on);
++    bool keyboardPrompts(); // (the setting: prompts follow the device)
+     bool keyboardPromptsShown();
+ 
+     // The gamepad's own L2 and R2 at the last pad read, 0..1 (analog where the pad's triggers are,
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 00720d0..59e2b9e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -172,6 +172,8 @@ namespace
+     // The device the player used last (ps2_host_input::lastDevice): -1 before any input, else a
+     // ps2_host_input::Device. Written by the pad backend, read by the texture pack.
+     std::atomic<int> g_lastDevice{-1};
++    // The style of the gamepad used last (lastPadStyle): PlayStation until a gamepad is seen, the game's own look.
++    std::atomic<ps2_host_input::PadStyle> g_padStyle{ps2_host_input::PadStyle::PlayStation};
+     std::atomic<bool> g_gamepadConnected{false};
+     std::atomic<bool> g_keyboardPrompts{true};
+     std::atomic<float> g_gamepadL2{0.0f}, g_gamepadR2{0.0f}; // (ps2_host_input::gamepadTriggers)
+@@ -473,6 +475,8 @@ namespace ps2_host_input
+         g_gameInputBlocked.store(blocked, std::memory_order_relaxed);
+     }
+ 
++    PadStyle lastPadStyle() { return g_padStyle.load(std::memory_order_relaxed); }
++
+     Device lastDevice()
+     {
+         const int d = g_lastDevice.load(std::memory_order_relaxed);
+@@ -482,6 +486,7 @@ namespace ps2_host_input
+     }
+ 
+     void setKeyboardPrompts(bool on) { g_keyboardPrompts.store(on, std::memory_order_relaxed); }
++    bool keyboardPrompts() { return g_keyboardPrompts.load(std::memory_order_relaxed); }
+ 
+     bool gamepadTriggers(float &l2, float &r2)
+     {
+@@ -850,6 +855,9 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ 
+     // The last device used: a key this read wins over a gamepad held from before only when the
+     // gamepad is idle (both at once: the gamepad, which the player is more likely holding).
++    if (gamepadConnected && (gamepadUsed || g_lastDevice.load(std::memory_order_relaxed) < 0))
++        g_padStyle.store(sonyPad ? ps2_host_input::PadStyle::PlayStation :
++                        ps2_host_input::padStyleForName(GetGamepadName(gamepad)), std::memory_order_relaxed);
+     g_gamepadConnected.store(gamepadConnected, std::memory_order_relaxed);
+     if (gamepadUsed)
+         g_lastDevice.store(static_cast<int>(ps2_host_input::Device::Gamepad), std::memory_order_relaxed);

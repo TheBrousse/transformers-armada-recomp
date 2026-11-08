@@ -1,0 +1,1436 @@
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+index 1bdf0f6..fa7e628 100644
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -54,6 +54,17 @@ namespace ps2recomp
+         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
+         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
+         void setEmitInstructionComments(bool emitInstructionComments);
++        // RecompilerConfig::registerCache, indirectCallResumeOnly, minimalPcStores and fastCodegenOnly.
++        void setFastCodegen(bool registerCache, bool indirectCallResumeOnly, bool minimalPcStores,
++                            std::unordered_set<uint32_t> onlyFunctions);
++        [[nodiscard]] bool fastCodegenFor(uint32_t functionStart) const
++        {
++            return m_fastCodegenOnly.empty() || m_fastCodegenOnly.contains(functionStart);
++        }
++        [[nodiscard]] bool minimalPcStoresFor(uint32_t functionStart) const
++        {
++            return m_minimalPcStores && fastCodegenFor(functionStart);
++        }
+         void setReporter(RecompilerReporter *reporter);
+ 
+         AnalysisResult collectInternalBranchTargets(const Function &function,
+@@ -69,6 +80,10 @@ namespace ps2recomp
+         const std::vector<Section>& m_sections;
+         BootstrapInfo m_bootstrapInfo;
+         bool m_emitInstructionComments = true;
++        bool m_registerCache = false;
++        bool m_indirectCallResumeOnly = false;
++        bool m_minimalPcStores = false;
++        std::unordered_set<uint32_t> m_fastCodegenOnly;
+         RecompilerReporter *m_reporter = nullptr;
+         std::string m_currentFunctionName;
+ 
+diff --git a/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h b/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
+index d932e5e..60deace 100644
+--- a/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
++++ b/ps2xRecomp/include/ps2recomp/control_flow_analyzer.h
+@@ -25,9 +25,13 @@ namespace ps2recomp
+     class ControlFlowAnalyzer
+     {
+     public:
++        // indirectCallResumeOnly: a jalr whose target is not known only needs the resume point
++        // after it (+8), like jal. Its target is a function, found at run time like any other;
++        // only a jr with no jump table can land anywhere in the function.
+         ControlFlowAnalyzer(const std::vector<Section> &sections,
+                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
+-                            RecompilerReporter *reporter);
++                            RecompilerReporter *reporter,
++                            bool indirectCallResumeOnly = false);
+ 
+         ControlFlowAnalysisResult analyze(const Function &function,
+                                           const std::vector<Instruction> &instructions,
+@@ -37,6 +41,7 @@ namespace ps2recomp
+         const std::vector<Section> &m_sections;
+         const std::unordered_map<uint32_t, std::vector<uint32_t>> &m_configJumpTableTargetsByAddress;
+         RecompilerReporter *m_reporter = nullptr;
++        bool m_indirectCallResumeOnly = false;
+     };
+ }
+ 
+diff --git a/ps2xRecomp/include/ps2recomp/register_cache.h b/ps2xRecomp/include/ps2recomp/register_cache.h
+new file mode 100644
+index 0000000..f422467
+--- /dev/null
++++ b/ps2xRecomp/include/ps2recomp/register_cache.h
+@@ -0,0 +1,27 @@
++#ifndef PS2RECOMP_REGISTER_CACHE_H
++#define PS2RECOMP_REGISTER_CACHE_H
++
++#include <string>
++#include <string_view>
++
++namespace ps2recomp
++{
++    // The register cache (ps2_register_cache.h in the runtime): a generated function keeps the low
++    // 64 bits of each general register it names in a C++ local instead of going through the
++    // context at every instruction, so the C++ compiler can keep them in host registers. The
++    // locals go back to the context before anything else can look at it (a call, a syscall, a
++    // return) and are loaded again after a call comes back.
++    //
++    // `functionText` is FunctionEmitter's output for one function and is rewritten in place.
++    // False when it is left as it is: nothing to cache (`whyNot` empty), or something the rewrite
++    // does not know (`whyNot` says what).
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot);
++
++    // Whether an instruction's C++ (one or more lines) can look at ctx->pc or the delay slot's
++    // state: it hands the context to the runtime or another function, raises an exception,
++    // returns or jumps. Register, FPU and memory macros do not (a load or store that faults sets
++    // COP0 from the pc, but the guest code goes on as it was).
++    bool translationObservesPc(std::string_view code);
++}
++
++#endif // PS2RECOMP_REGISTER_CACHE_H
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+index 9bd687d..3959fc6 100644
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -184,6 +184,16 @@ namespace ps2recomp
+         bool patchSyscalls = false;
+         bool patchCop0 = true;
+         bool patchCache = true;
++        // Faster generated code: the guest's general registers in C++ locals (register_cache.h),
++        // and an indirect call (jalr) whose target is not known re-entered only after the call
++        // instead of at every instruction. `fastCodegenOnly` limits both to these functions
++        // (start addresses; empty: all), to try them on a few.
++        bool registerCache = false;
++        bool indirectCallResumeOnly = false;
++        // ctx->pc (and the delay slot's state) stored only before what can read it, not before
++        // every instruction: the runtime calls, the transfers (which store their own targets).
++        bool minimalPcStores = false;
++        std::vector<std::string> fastCodegenOnly;
+         std::vector<std::string> skipFunctions;
+         std::unordered_map<uint32_t, std::string> patches;
+         std::vector<std::string> stubImplementations;
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+index 68b0984..01106fc 100644
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -156,6 +156,15 @@ namespace ps2recomp
+         m_emitInstructionComments = emitInstructionComments;
+     }
+ 
++    void CodeGenerator::setFastCodegen(bool registerCache, bool indirectCallResumeOnly, bool minimalPcStores,
++                                       std::unordered_set<uint32_t> onlyFunctions)
++    {
++        m_registerCache = registerCache;
++        m_indirectCallResumeOnly = indirectCallResumeOnly;
++        m_minimalPcStores = minimalPcStores;
++        m_fastCodegenOnly = std::move(onlyFunctions);
++    }
++
+     void CodeGenerator::setReporter(RecompilerReporter *reporter)
+     {
+         m_reporter = reporter;
+@@ -266,7 +275,8 @@ namespace ps2recomp
+     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
+         const Function &function, const std::vector<Instruction> &instructions, const std::vector<Function> *allFunctions)
+     {
+-        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter);
++        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter,
++                                     m_indirectCallResumeOnly && fastCodegenFor(function.start));
+         return analyzer.analyze(function, instructions, allFunctions);
+     }
+ 
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+index 97dc2dd..ee55b65 100644
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -64,6 +64,14 @@ namespace ps2recomp
+             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
+             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
+             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
++            config.registerCache = toml::find_or<bool>(general, "register_cache", config.registerCache);
++            config.indirectCallResumeOnly =
++                toml::find_or<bool>(general, "indirect_call_resume_only", config.indirectCallResumeOnly);
++            config.minimalPcStores = toml::find_or<bool>(general, "minimal_pc_stores", config.minimalPcStores);
++            if (general.contains("fast_codegen_only") && general.at("fast_codegen_only").is_array())
++            {
++                config.fastCodegenOnly = toml::find<std::vector<std::string>>(general, "fast_codegen_only");
++            }
+ 
+             if (general.contains("stubs") && general.at("stubs").is_array())
+             {
+@@ -298,6 +306,10 @@ namespace ps2recomp
+         general["skip"] = config.skipFunctions;
+         general["stubs"] = config.stubImplementations;
+         general["entry_points"] = config.entryPointHints;
++        general["register_cache"] = config.registerCache;
++        general["indirect_call_resume_only"] = config.indirectCallResumeOnly;
++        general["minimal_pc_stores"] = config.minimalPcStores;
++        general["fast_codegen_only"] = config.fastCodegenOnly;
+         data["general"] = general;
+ 
+         if (!config.mmioByInstructionAddress.empty())
+diff --git a/ps2xRecomp/src/lib/control_flow_analyzer.cpp b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+index ed7578d..6ca9be0 100644
+--- a/ps2xRecomp/src/lib/control_flow_analyzer.cpp
++++ b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
+@@ -12,10 +12,12 @@ namespace ps2recomp
+     ControlFlowAnalyzer::ControlFlowAnalyzer(
+         const std::vector<Section> &sections,
+         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
+-        RecompilerReporter *reporter)
++        RecompilerReporter *reporter,
++        bool indirectCallResumeOnly)
+         : m_sections(sections),
+           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
+-          m_reporter(reporter)
++          m_reporter(reporter),
++          m_indirectCallResumeOnly(indirectCallResumeOnly)
+     {
+     }
+ 
+@@ -393,7 +395,7 @@ namespace ps2recomp
+                         }
+                     }
+                 }
+-                if (!foundTable)
++                if (!foundTable && !(m_indirectCallResumeOnly && jrInst->function == SPECIAL_JALR))
+                 {
+                     needsIndirectFallback = true;
+                 }
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..291d312 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2recomp/control_flow_utils.h"
+ #include "ps2recomp/instructions.h"
+ #include "ps2recomp/r5900_decoder.h"
++#include "ps2recomp/register_cache.h"
+ #include "ps2_runtime_calls.h"
+ 
+ #include <algorithm>
+@@ -131,11 +132,16 @@ namespace ps2recomp
+             return;
+         }
+ 
+-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+-
+         const std::string code = delaySlotCode();
++        // (the delay slot's state only for an instruction that can look at it)
++        const bool state = !m_gen.minimalPcStoresFor(m_function.start) || translationObservesPc(code);
++        if (state)
++        {
++            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
++            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
++            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
++        }
++
+         std::istringstream lines(code);
+         std::string line;
+         while (std::getline(lines, line))
+@@ -146,7 +152,10 @@ namespace ps2recomp
+             }
+         }
+ 
+-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
++        if (state)
++        {
++            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
++        }
+     }
+ 
+     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
+@@ -438,10 +447,12 @@ namespace ps2recomp
+         case OPCODE_COP2:
+             if (m_branchInst.rs == COP2_BC)
+             {
++                // The COP2 condition is VU1 busy (VPU_STAT's VBS1), which the EE polls before it
++                // uses VU1's memory or starts it.
+                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
+                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
+-                           ? "!(ctx->vu0_status & 0x1)"
+-                           : "(ctx->vu0_status & 0x1)";
++                           ? "!runtime->vu1Busy(ctx)"
++                           : "runtime->vu1Busy(ctx)";
+             }
+             break;
+         default:
+@@ -547,14 +558,28 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitFinalFallthrough()
+     {
+-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", fallthroughPc());
++        // (nothing reads it inside the function: every transfer stores its own target, and the
++        // code after stores the pc again before anything that looks at it; past the function's
++        // end it is where the dispatcher goes on)
++        if (!m_gen.minimalPcStoresFor(m_function.start) || fallthroughPc() >= m_function.end)
++        {
++            m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", fallthroughPc());
++        }
+     }
+ 
+     std::string ControlFlowEmitter::emit()
+     {
+         (void)m_function;
+         emitResumeFromDelaySlotEntry();
+-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
++        const bool knownBranch = m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL ||
++                                 (m_branchInst.opcode == OPCODE_SPECIAL &&
++                                  (m_branchInst.function == SPECIAL_JR || m_branchInst.function == SPECIAL_JALR)) ||
++                                 m_branchInst.isBranch;
++        // (a known branch stores its target or the delay slot's pc itself)
++        if (!m_gen.minimalPcStoresFor(m_function.start) || !knownBranch)
++        {
++            m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
++        }
+ 
+         if (m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL)
+         {
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 944cee7..34bcf67 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -53,12 +53,11 @@ namespace ps2recomp
+             case COP1_S_MUL:
+                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_DIV:
+-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+-                                   ft, fd, fs, fd, fs, ft);
++                // Dividing by zero gives +/-FLT_MAX (sign of fs ^ ft) and sets D/SD, as on the R5900.
++                return fmt::format("ctx->f[{}] = FPU_DIV_S(ctx, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // SQRT.S fd, ft: the R5900 encodes the operand in the ft field (fs is zero).
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx, ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -76,7 +75,8 @@ namespace ps2recomp
+             case COP1_S_CVT_W:
+                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_RSQRT:
+-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
++                // RSQRT.S fd, fs, ft: fd = fs / sqrt(|ft|). A zero ft gives +/-FLT_MAX (sign of fs ^ ft).
++                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:
+@@ -92,9 +92,9 @@ namespace ps2recomp
+             case COP1_S_MSUBA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
+             case COP1_S_MAX:
+-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
++                return fmt::format("ctx->f[{}] = FPU_MAX_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_MIN:
+-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
++                return fmt::format("ctx->f[{}] = FPU_MIN_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_C_F:
+                 return fmt::format("ctx->fcr31 &= ~0x800000;");
+             case COP1_S_C_UN:
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+index 3192e90..0506d2c 100644
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -4,6 +4,7 @@
+ #include "ps2recomp/instructions.h"
+ #include "ps2recomp/r5900_decoder.h"
+ #include "ps2recomp/recompiler_reporter.h"
++#include "ps2recomp/register_cache.h"
+ #include "ps2recomp/types.h"
+ 
+ #include <algorithm>
+@@ -200,10 +201,14 @@ namespace ps2recomp
+                         continue;
+                     }
+ 
+-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+-                       << std::dec;
+                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
+-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
++                    const std::string translation = cg.translateInstruction(inst, memoryHint);
++                    if (!cg.minimalPcStoresFor(function.start) || translationObservesPc(translation))
++                    {
++                        ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
++                           << std::dec;
++                    }
++                    ss << "    " << translation;
+                     if (inst.isMmio)
+                     {
+                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
+@@ -234,6 +239,15 @@ namespace ps2recomp
+         }
+ 
+         ss << "}\n";
+-        return ss.str();
++        std::string text = ss.str();
++        if (cg.m_registerCache && cg.fastCodegenFor(function.start))
++        {
++            std::string whyNot;
++            if (!applyRegisterCache(text, whyNot) && !whyNot.empty() && cg.m_reporter)
++            {
++                cg.m_reporter->warning("register-cache", function.name + " left as it is: " + whyNot);
++            }
++        }
++        return text;
+     }
+ }
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index bb35a7a..a5d26e6 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1023,6 +1023,15 @@ namespace ps2recomp
+             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+             m_codeGenerator->setEmitInstructionComments(true);
++            {
++                std::unordered_set<uint32_t> fastOnly;
++                for (const std::string &address : m_config.fastCodegenOnly)
++                {
++                    fastOnly.insert(static_cast<uint32_t>(std::stoul(address, nullptr, 0)));
++                }
++                m_codeGenerator->setFastCodegen(m_config.registerCache, m_config.indirectCallResumeOnly,
++                                                m_config.minimalPcStores, std::move(fastOnly));
++            }
+ 
+             fs::create_directories(m_config.outputPath);
+ 
+diff --git a/ps2xRecomp/src/lib/register_cache.cpp b/ps2xRecomp/src/lib/register_cache.cpp
+new file mode 100644
+index 0000000..16ec0ba
+--- /dev/null
++++ b/ps2xRecomp/src/lib/register_cache.cpp
+@@ -0,0 +1,715 @@
++#include "ps2recomp/register_cache.h"
++
++#include <algorithm>
++#include <bitset>
++#include <cctype>
++#include <string_view>
++#include <vector>
++
++// The FPU's registers the same way: ctx->f[n] becomes the local rf_<n>.
++//
++// Writes go through to the context at once (RC_SET_*, and RC_FST after a line that writes an
++// FPU register), so the context is always current and nothing has to be written back before a
++// call or a return; reads come from the locals. After anything that may change the context's
++// registers - a call, a syscall, a stub - the locals are loaded again (the C++ compiler drops
++// the loads of the ones not read before they are written).
++//
++// The rewrite works on FunctionEmitter's text, whose shapes it knows (ControlFlowEmitter): a call
++// is `if (!runtime->dispatchGuestBranch(rdram, ctx, ...)) {` + `return;` + `}`, a tail jump
++// `name(rdram, ctx, runtime); return;`, a syscall or stub one statement on its line. A function
++// with anything it cannot place is left as it was.
++
++namespace ps2recomp
++{
++    namespace
++    {
++        bool isIdentChar(char c)
++        {
++            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
++        }
++
++        std::string_view trim(std::string_view s)
++        {
++            size_t start = 0;
++            while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r'))
++                ++start;
++            size_t end = s.size();
++            while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r'))
++                --end;
++            return s.substr(start, end - start);
++        }
++
++        std::string_view indentOf(std::string_view line)
++        {
++            size_t n = 0;
++            while (n < line.size() && (line[n] == ' ' || line[n] == '\t'))
++                ++n;
++            return line.substr(0, n);
++        }
++
++        // 1 for the line's code, 0 inside comments and string or character literals.
++        void markCode(std::string_view line, std::vector<char> &code)
++        {
++            code.assign(line.size(), 1);
++            size_t i = 0;
++            while (i < line.size())
++            {
++                const char c = line[i];
++                if (c == '/' && i + 1 < line.size() && line[i + 1] == '/')
++                {
++                    std::fill(code.begin() + static_cast<std::ptrdiff_t>(i), code.end(), 0);
++                    return;
++                }
++                if (c == '"' || c == '\'')
++                {
++                    const size_t start = i++;
++                    while (i < line.size() && line[i] != c)
++                        i += line[i] == '\\' ? 2 : 1;
++                    i = std::min(i + 1, line.size());
++                    std::fill(code.begin() + static_cast<std::ptrdiff_t>(start),
++                              code.begin() + static_cast<std::ptrdiff_t>(i), 0);
++                    continue;
++                }
++                ++i;
++            }
++        }
++
++        struct GprMacro
++        {
++            std::string_view name;
++            std::string_view cached;
++            bool write;
++        };
++
++        // ps2_runtime_macros.h's accessors (getRegU32: ps2_runtime.h) and their cached forms
++        // (ps2_register_cache.h).
++        constexpr GprMacro kGprMacros[] = {
++            {"GPR_U32", "RC_U32", false},
++            {"GPR_S32", "RC_S32", false},
++            {"GPR_U64", "RC_U64", false},
++            {"GPR_S64", "RC_S64", false},
++            {"GPR_VEC", "RC_VEC", false},
++            {"getRegU32", "RC_U32", false},
++            {"SET_GPR_U32", "RC_SET_U32", true},
++            {"SET_GPR_S32", "RC_SET_S32", true},
++            {"SET_GPR_ZE32", "RC_SET_ZE32", true},
++            {"SET_GPR_U64", "RC_SET_U64", true},
++            {"SET_GPR_S64", "RC_SET_S64", true},
++            {"SET_GPR_VEC", "RC_SET_VEC", true},
++        };
++
++        // Calls given the context that never touch its general registers: the accessors left on
++        // register 0 (a constant, a dropped write), the FPU's control word and accumulator,
++        // memory (the I/O behind it queues interrupts and DMA handlers instead of running them,
++        // and a bad address only sets COP0 and the pc), the write trace (a no-op), the LL bit.
++        constexpr std::string_view kContextSafeCalls[] = {
++            "GPR_U32",
++            "GPR_S32",
++            "GPR_U64",
++            "GPR_S64",
++            "GPR_VEC",
++            "getRegU32",
++            "SET_GPR_U32",
++            "SET_GPR_S32",
++            "SET_GPR_ZE32",
++            "SET_GPR_U64",
++            "SET_GPR_S64",
++            "SET_GPR_VEC",
++            "FPU_SET_ACC",
++            "FPU_DIV_S",
++            "FPU_SQRT_S",
++            "FPU_RSQRT_S",
++            "ps2TraceGuestWrite",
++            "runtime->Load8",
++            "runtime->Load16",
++            "runtime->Load32",
++            "runtime->Load64",
++            "runtime->Load128",
++            "runtime->Store8",
++            "runtime->Store16",
++            "runtime->Store32",
++            "runtime->Store64",
++            "runtime->Store128",
++            "runtime->SignalException",
++            "runtime->clearLLBit",
++        };
++
++        struct Registers
++        {
++            std::bitset<32> used;     // general registers named
++            std::bitset<32> written;
++            std::bitset<32> fpUsed;   // FPU registers
++            std::bitset<32> fpWritten;
++        };
++
++        // Whether the text after an lvalue at `at` assigns to it (=, op=, ++, --).
++        bool assignsAfter(std::string_view line, size_t at)
++        {
++            while (at < line.size() && line[at] == ' ')
++                ++at;
++            const std::string_view rest = line.substr(at);
++            if (rest.starts_with("++") || rest.starts_with("--") || rest.starts_with("<<=") || rest.starts_with(">>="))
++                return true;
++            if (rest.starts_with("=") && !rest.starts_with("=="))
++                return true;
++            return rest.size() >= 2 && rest[1] == '=' && std::string_view("+-*/%&|^").find(rest[0]) != std::string_view::npos;
++        }
++
++        // GPR_*(ctx, n) and SET_GPR_*(ctx, n, value) become RC_*(n) and RC_SET_*(n, value).
++        // Register 0 keeps the macros (their constant 0, and a write dropped unevaluated).
++        // ctx->f[n] becomes rf_<n> (written when assigned or its address taken).
++        bool rewriteLine(std::string_view line, const std::vector<char> &code, std::string &out,
++                         Registers &regs, std::bitset<32> &fpWrites, std::string &whyNot)
++        {
++            fpWrites.reset();
++            out.clear();
++            size_t i = 0;
++            while (i < line.size())
++            {
++                if (!code[i] || !isIdentChar(line[i]))
++                {
++                    out.push_back(line[i++]);
++                    continue;
++                }
++                size_t end = i;
++                while (end < line.size() && isIdentChar(line[end]))
++                    ++end;
++                const std::string_view word = line.substr(i, end - i);
++                const GprMacro *macro = nullptr;
++                for (const GprMacro &candidate : kGprMacros)
++                {
++                    if (candidate.name == word)
++                    {
++                        macro = &candidate;
++                        break;
++                    }
++                }
++                if (!macro && word == "ctx" && line.substr(end, 4) == "->f[")
++                {
++                    size_t p = end + 4;
++                    const size_t digits = p;
++                    while (p < line.size() && p - digits < 2 && std::isdigit(static_cast<unsigned char>(line[p])))
++                        ++p;
++                    if (p > digits && p < line.size() && line[p] == ']')
++                    {
++                        const int reg = std::stoi(std::string(line.substr(digits, p - digits)));
++                        ++p;
++                        if (reg < 32)
++                        {
++                            size_t before = out.size();
++                            while (before > 0 && out[before - 1] == ' ')
++                                --before;
++                            const bool addressTaken = before > 0 && out[before - 1] == '&' &&
++                                                      (before < 2 || out[before - 2] != '&');
++                            regs.fpUsed.set(static_cast<size_t>(reg));
++                            if (addressTaken || assignsAfter(line, p))
++                            {
++                                regs.fpWritten.set(static_cast<size_t>(reg));
++                                fpWrites.set(static_cast<size_t>(reg));
++                            }
++                            out.append("rf_").append(std::to_string(reg));
++                            i = p;
++                            continue;
++                        }
++                    }
++                }
++                if (!macro)
++                {
++                    out.append(word);
++                    i = end;
++                    continue;
++                }
++
++                size_t p = end;
++                auto expect = [&](std::string_view token)
++                {
++                    while (p < line.size() && line[p] == ' ')
++                        ++p;
++                    if (line.substr(p, token.size()) != token)
++                        return false;
++                    p += token.size();
++                    return true;
++                };
++                int reg = -1;
++                if (expect("(") && expect("ctx") && expect(","))
++                {
++                    while (p < line.size() && line[p] == ' ')
++                        ++p;
++                    const size_t digits = p;
++                    while (p < line.size() && p - digits < 2 && std::isdigit(static_cast<unsigned char>(line[p])))
++                        ++p;
++                    if (p > digits)
++                        reg = std::stoi(std::string(line.substr(digits, p - digits)));
++                }
++                if (reg < 0 || reg > 31 || !expect(macro->write ? "," : ")"))
++                {
++                    whyNot = "unexpected " + std::string(word) + ": " + std::string(trim(line));
++                    return false;
++                }
++                if (reg == 0)
++                {
++                    out.append(line.substr(i, p - i));
++                }
++                else
++                {
++                    out.append(macro->cached);
++                    out.push_back('(');
++                    out.append(std::to_string(reg));
++                    out.append(macro->write ? "," : ")"); // (the value keeps its space)
++                    regs.used.set(static_cast<size_t>(reg));
++                    if (macro->write)
++                        regs.written.set(static_cast<size_t>(reg));
++                }
++                i = p;
++            }
++            return true;
++        }
++
++        // std::memcpy(&A, &B, sizeof(C)) moving bits into or out of an FPU register (mtc1, mfc1,
++        // cvt.w.s, cvt.s.w) becomes a std::bit_cast, so that no register's address is taken.
++        std::string bitCastFpMoves(std::string_view line)
++        {
++            static constexpr std::string_view kOpen = "std::memcpy(&";
++            auto isFp = [](std::string_view v) { return v.starts_with("ctx->f[") && v.ends_with("]"); };
++            auto isName = [](std::string_view v)
++            { return !v.empty() && std::all_of(v.begin(), v.end(), [](char c) { return isIdentChar(c); }); };
++            std::string out;
++            size_t at = 0;
++            for (;;)
++            {
++                const size_t p = line.find(kOpen, at);
++                if (p == std::string_view::npos)
++                    break;
++                const size_t a = p + kOpen.size();
++                const size_t aEnd = line.find(", &", a);
++                const size_t bEnd = aEnd == std::string_view::npos ? aEnd : line.find(", sizeof(", aEnd + 3);
++                const size_t cEnd = bEnd == std::string_view::npos ? bEnd : line.find("));", bEnd + 9);
++                if (cEnd == std::string_view::npos)
++                    break;
++                const std::string_view to = line.substr(a, aEnd - a);
++                const std::string_view from = line.substr(aEnd + 3, bEnd - aEnd - 3);
++                const std::string_view size = line.substr(bEnd + 9, cEnd - bEnd - 9);
++                std::string cast;
++                if (isFp(to) && isName(from) && size == from)
++                    cast = std::string(to) + " = std::bit_cast<float>(" + std::string(from) + ");";
++                else if (isFp(from) && isName(to) && size == to)
++                    cast = std::string(to) + " = std::bit_cast<decltype(" + std::string(to) + ")>(" + std::string(from) + ");";
++                out.append(line.substr(at, (cast.empty() ? cEnd + 3 : p) - at));
++                out.append(cast);
++                at = cEnd + 3;
++            }
++            out.append(line.substr(at));
++            return out;
++        }
++
++        // The function or macro a context argument at `argument` is passed to.
++        std::string_view calleeOf(std::string_view line, const std::vector<char> &code, size_t argument)
++        {
++            int depth = 0;
++            for (size_t i = argument; i-- > 0;)
++            {
++                if (!code[i])
++                    continue;
++                if (line[i] == ')')
++                {
++                    ++depth;
++                }
++                else if (line[i] == '(')
++                {
++                    if (depth > 0)
++                    {
++                        --depth;
++                        continue;
++                    }
++                    size_t end = i;
++                    while (end > 0 && line[end - 1] == ' ')
++                        --end;
++                    size_t start = end;
++                    while (start > 0)
++                    {
++                        const char c = line[start - 1];
++                        if (isIdentChar(c) || c == ':' || c == '.')
++                            --start;
++                        else if (c == '>' && start >= 2 && line[start - 2] == '-')
++                            start -= 2;
++                        else
++                            break;
++                    }
++                    return line.substr(start, end - start);
++                }
++            }
++            return {};
++        }
++
++        struct LineFacts
++        {
++            bool cached = false;   // RC_* (the locals)
++            bool hasReturn = false;
++            bool hasGoto = false;
++            bool dispatch = false; // runtime->dispatchGuestBranch given the context
++            bool call = false;     // another call given the context
++            std::string_view callee;
++            int braces = 0;        // '{' less '}'
++            std::string whyNot;
++        };
++
++        LineFacts analyzeLine(std::string_view line, const std::vector<char> &code)
++        {
++            LineFacts facts;
++            size_t i = 0;
++            while (i < line.size())
++            {
++                const char c = line[i];
++                if (!code[i] || !isIdentChar(c))
++                {
++                    if (code[i] && c == '{')
++                        ++facts.braces;
++                    else if (code[i] && c == '}')
++                        --facts.braces;
++                    ++i;
++                    continue;
++                }
++                size_t end = i;
++                while (end < line.size() && isIdentChar(line[end]))
++                    ++end;
++                const std::string_view word = line.substr(i, end - i);
++                if (word.starts_with("RC_") || word.starts_with("rf_"))
++                {
++                    facts.cached = true;
++                }
++                else if (word == "return")
++                {
++                    facts.hasReturn = true;
++                }
++                else if (word == "goto")
++                {
++                    facts.hasGoto = true;
++                }
++                else if (word == "ctx")
++                {
++                    if (line.substr(end, 2) == "->")
++                    {
++                        size_t fieldEnd = end + 2;
++                        while (fieldEnd < line.size() && isIdentChar(line[fieldEnd]))
++                            ++fieldEnd;
++                        const std::string_view field = line.substr(end + 2, fieldEnd - end - 2);
++                        if (field == "r")
++                            facts.whyNot = "the context's registers used directly";
++                        else if (field == "f")
++                            facts.whyNot = "an FPU register with a computed number";
++                    }
++                    else
++                    {
++                        const std::string_view callee = calleeOf(line, code, i);
++                        if (callee == "runtime->dispatchGuestBranch")
++                        {
++                            facts.dispatch = true;
++                        }
++                        else if (std::find(std::begin(kContextSafeCalls), std::end(kContextSafeCalls), callee) !=
++                                 std::end(kContextSafeCalls))
++                        {
++                        }
++                        else if (callee.empty() || callee == "if" || callee == "while" || callee == "for" ||
++                                 callee == "switch" || callee == "return" || callee == "sizeof")
++                        {
++                            facts.whyNot = "the context used as a value";
++                        }
++                        else
++                        {
++                            facts.call = true;
++                            facts.callee = callee;
++                        }
++                    }
++                }
++                i = end;
++            }
++            return facts;
++        }
++    }
++
++    bool translationObservesPc(std::string_view text)
++    {
++        static constexpr std::string_view kQuietCalls[] = {
++            "GPR_U32", "GPR_S32", "GPR_U64", "GPR_S64", "GPR_VEC", "getRegU32",
++            "SET_GPR_U32", "SET_GPR_S32", "SET_GPR_ZE32", "SET_GPR_U64", "SET_GPR_S64", "SET_GPR_VEC",
++            "FPU_SET_ACC", "FPU_DIV_S", "FPU_SQRT_S", "FPU_RSQRT_S", "ps2TraceGuestWrite",
++        };
++        std::vector<char> code;
++        size_t at = 0;
++        while (at < text.size())
++        {
++            const size_t nl = text.find('\n', at);
++            const std::string_view line = text.substr(at, (nl == std::string_view::npos ? text.size() : nl) - at);
++            at = nl == std::string_view::npos ? text.size() : nl + 1;
++            markCode(line, code);
++            size_t i = 0;
++            while (i < line.size())
++            {
++                if (!code[i] || !isIdentChar(line[i]))
++                {
++                    ++i;
++                    continue;
++                }
++                size_t end = i;
++                while (end < line.size() && isIdentChar(line[end]))
++                    ++end;
++                const std::string_view word = line.substr(i, end - i);
++                if (word == "runtime" || word == "ps2_syscalls" || word == "ps2_stubs" || word == "throw" ||
++                    word == "return" || word == "goto")
++                    return true;
++                if (word == "ctx")
++                {
++                    if (line.substr(end, 2) == "->")
++                    {
++                        size_t fieldEnd = end + 2;
++                        while (fieldEnd < line.size() && isIdentChar(line[fieldEnd]))
++                            ++fieldEnd;
++                        const std::string_view field = line.substr(end + 2, fieldEnd - end - 2);
++                        if (field == "pc" || field == "in_delay_slot" || field == "branch_pc")
++                            return true;
++                    }
++                    else if (std::find(std::begin(kQuietCalls), std::end(kQuietCalls), calleeOf(line, code, i)) ==
++                             std::end(kQuietCalls))
++                    {
++                        return true;
++                    }
++                }
++                i = end;
++            }
++        }
++        return false;
++    }
++
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot)
++    {
++        whyNot.clear();
++        static constexpr std::string_view kSignatureEnd =
++            "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
++        const size_t signature = functionText.find(kSignatureEnd);
++        const size_t close = functionText.rfind("\n}");
++        if (signature == std::string::npos || close == std::string::npos || close < signature)
++        {
++            whyNot = "no function body";
++            return false;
++        }
++        const size_t bodyStart = signature + kSignatureEnd.size();
++
++        std::vector<std::string_view> lines;
++        {
++            const std::string_view body = std::string_view(functionText).substr(bodyStart, close + 1 - bodyStart);
++            size_t at = 0;
++            while (at < body.size())
++            {
++                const size_t nl = body.find('\n', at);
++                const size_t end = nl == std::string_view::npos ? body.size() : nl;
++                lines.push_back(body.substr(at, end - at));
++                at = end + 1;
++            }
++        }
++
++        // The registers named, and the text with the locals.
++        Registers regs;
++        std::vector<std::string> rewritten(lines.size());
++        std::vector<std::bitset<32>> fpWrites(lines.size());
++        std::vector<char> code;
++        for (size_t n = 0; n < lines.size(); ++n)
++        {
++            const std::string line = bitCastFpMoves(lines[n]);
++            markCode(line, code);
++            if (!rewriteLine(line, code, rewritten[n], regs, fpWrites[n], whyNot))
++                return false;
++        }
++        if (regs.used.none() && regs.fpUsed.none())
++            return false;
++
++        std::string declare;
++        std::string reload;
++        auto add = [](std::string &list, const char *macro, int reg)
++        {
++            if (!list.empty())
++                list.push_back(' ');
++            list.append(macro).append("(").append(std::to_string(reg)).append(");");
++        };
++        for (int reg = 1; reg < 32; ++reg)
++        {
++            if (regs.used.test(static_cast<size_t>(reg)))
++            {
++                add(declare, "RC_DECL", reg);
++                add(reload, "RC_LD", reg);
++            }
++        }
++        for (int reg = 0; reg < 32; ++reg)
++        {
++            if (regs.fpUsed.test(static_cast<size_t>(reg)))
++            {
++                add(declare, "RC_FDECL", reg);
++                add(reload, "RC_FLD", reg);
++            }
++        }
++
++        std::string out;
++        out.reserve(functionText.size() + functionText.size() / 4);
++        const size_t header = functionText.rfind("// Function: ", signature);
++        const size_t includeAt = header == std::string::npos ? 0 : header;
++        out.append(functionText, 0, includeAt);
++        out.append("#include \"ps2_register_cache.h\"\n");
++        out.append(functionText, includeAt, bodyStart - includeAt);
++        out.append("    ").append(declare).append("\n");
++
++        // Whether the locals hold the registers: false after a call or jump handed the context
++        // over, until the code after it or a label (only unreachable code reads them there).
++        bool valid = true;
++        enum class Expect
++        {
++            None,
++            Return, // after `if (!runtime->dispatchGuestBranch(...)) {`
++            Close,
++        } expect = Expect::None;
++        std::vector<bool> strictRegions; // the #if nesting: true for PS2X_STRICT_RETURN_DIAGNOSTICS
++
++        auto fail = [&](std::string_view why, std::string_view line)
++        {
++            whyNot = std::string(why) + ": " + std::string(trim(line));
++            return false;
++        };
++        auto putLine = [&](std::string_view indent, const std::string &text)
++        {
++            out.append(indent).append(text).push_back('\n');
++        };
++        // A line, then the FPU registers it wrote to the context.
++        auto putCode = [&](size_t n, std::string_view indent)
++        {
++            out.append(rewritten[n]).push_back('\n');
++            if (fpWrites[n].none())
++                return;
++            std::string stores;
++            for (int reg = 0; reg < 32; ++reg)
++            {
++                if (fpWrites[n].test(static_cast<size_t>(reg)))
++                    add(stores, "RC_FST", reg);
++            }
++            putLine(indent, stores);
++        };
++
++        for (size_t n = 0; n < rewritten.size(); ++n)
++        {
++            const std::string &line = rewritten[n];
++            const std::string_view t = trim(line);
++            const std::string_view indent = indentOf(line);
++
++            if (t.empty() || t.starts_with("//"))
++            {
++                out.append(line).push_back('\n');
++                continue;
++            }
++            if (t.front() == '#')
++            {
++                if (t.starts_with("#if"))
++                {
++                    const bool strict = t.find("PS2X_STRICT_RETURN_DIAGNOSTICS") != std::string_view::npos;
++                    if (strict)
++                    {
++                        // Both ways return: the dispatch, or ctx->pc and return.
++                        if (expect != Expect::None)
++                            return fail("a return inside a call's unwind", t);
++                        valid = false;
++                    }
++                    strictRegions.push_back(strict);
++                }
++                else if (t.starts_with("#endif"))
++                {
++                    if (strictRegions.empty())
++                        return fail("an #endif without #if", t);
++                    strictRegions.pop_back();
++                }
++                out.append(line).push_back('\n');
++                continue;
++            }
++            if (t.starts_with("label_") && t.back() == ':')
++            {
++                if (expect != Expect::None)
++                    return fail("a label inside a call's unwind", t);
++                valid = true;
++                out.append(line).push_back('\n');
++                continue;
++            }
++
++            markCode(line, code);
++            const LineFacts facts = analyzeLine(line, code);
++            if (!facts.whyNot.empty())
++                return fail(facts.whyNot, t);
++            if (fpWrites[n].any() && t.back() != ';' && t.back() != '}')
++                return fail("an FPU register written in an unknown statement", t);
++
++            if (expect == Expect::Return)
++            {
++                if (t != "return;")
++                    return fail("not a return after a call", t);
++                out.append(line).push_back('\n');
++                expect = Expect::Close;
++                continue;
++            }
++            if (expect == Expect::Close)
++            {
++                if (t != "}")
++                    return fail("not the end of a call", t);
++                out.append(line).push_back('\n');
++                putLine(indent, reload);
++                valid = true;
++                expect = Expect::None;
++                continue;
++            }
++
++            if (facts.dispatch)
++            {
++                if (facts.call)
++                    return fail("a call beside a branch", t);
++                if (t.starts_with("if (!runtime->dispatchGuestBranch(") && t.ends_with(")) {"))
++                {
++                    if (!valid)
++                        return fail("a call after a transfer", t);
++                    out.append(line).push_back('\n');
++                    valid = false;
++                    expect = Expect::Return;
++                    continue;
++                }
++                if (t.starts_with("(void)runtime->dispatchGuestBranch(") && t.ends_with(");") &&
++                    !strictRegions.empty() && strictRegions.back() && !valid)
++                {
++                    out.append(line).push_back('\n');
++                    continue;
++                }
++                return fail("an unknown branch", t);
++            }
++
++            if (facts.call)
++            {
++                if (!valid)
++                    return fail("a call after a transfer", t);
++                if (facts.cached)
++                    return fail("a call beside a register", t);
++                if (t == std::string(facts.callee) + "(rdram, ctx, runtime); return;")
++                {
++                    // A jump to another function: it has the context from here on.
++                    out.append(line).push_back('\n');
++                    valid = false;
++                    continue;
++                }
++                if (facts.hasReturn || facts.hasGoto || facts.braces != 0 || (t.back() != ';' && t.back() != '}'))
++                    return fail("an unknown call", t);
++                out.append(line).push_back('\n');
++                putLine(indent, reload);
++                continue;
++            }
++
++            if (!valid && (facts.cached || facts.hasGoto))
++                return fail("registers used after a transfer", t);
++            putCode(n, indent);
++        }
++        if (expect != Expect::None || !strictRegions.empty())
++            return fail("the function ends inside a call or #if", "");
++        out.append(functionText, close + 1, std::string::npos);
++        functionText = std::move(out);
++        return true;
++    }
++}
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..25a52b8 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,21 +75,28 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        // Q = fs / ft. Dividing by zero gives +/-FLT_MAX (sign of fs ^ ft), as on the VU.
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "ctx->vu0_q = ps2_vu_div(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_vu_sqrt(ft); }}", ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++
++        // Q = fs / sqrt(|ft|). A zero ft gives +/-FLT_MAX (sign of fs ^ ft), as on the VU.
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "ctx->vu0_q = ps2_vu_rsqrt(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+@@ -111,14 +118,34 @@ namespace ps2recomp
+                            inst.rt, inst.rt);
+     }
+ 
++    // Macro-mode VU0 memory accesses (VLQI, VSQI, VLQD, VSQD, VILWR, VISWR) address VU0 data
++    // memory, which the EE sees as 4 KB at 0x11004000; the VI register holds a qword index.
++    static std::string vu0DataAddress(uint8_t vi)
++    {
++        return fmt::format("(0x11004000u + (((uint32_t)ctx->vi[{}] << 4) & 0xFF0u))", vi & 0xF);
++    }
++
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        // VILWR.<f> vit, (vis): the low 16 bits of the selected field.
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        const uint32_t field = (dest_mask & 0x8) ? 0u : (dest_mask & 0x4) ? 1u : (dest_mask & 0x2) ? 2u : 3u;
++        if ((inst.rt & 0xF) == 0)
++            return "// VILWR to VI0 ignored";
++        return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(READ32({} + {}u));", inst.rt & 0xF, vu0DataAddress(inst.rd), field * 4u);
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        // VISWR.<f> vit, (vis): vit, zero-extended, into each selected field.
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        std::string out = fmt::format("{{ const uint32_t addr = {}; const uint32_t value = ctx->vi[{}];", vu0DataAddress(inst.rd), inst.rt & 0xF);
++        for (uint32_t field = 0; field < 4u; ++field)
++        {
++            if (dest_mask & (0x8 >> field))
++                out += fmt::format(" WRITE32(addr + {}u, value);", field * 4u);
++        }
++        return out + " }";
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+@@ -164,17 +191,12 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
+     {
+-        // VCALLMSR calls a VU0 microprogram at address stored in integer register
+-        uint8_t vis_reg_idx = inst.rd; // Source integer register (vis)
+-
+-        return fmt::format(
+-            "{{ "
+-            "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
+-            "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
+-            "    ctx->vu0_pc = target_byte_addr; "
+-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+-            "}}",
+-            vis_reg_idx);
++        // VCALLMSR starts the microprogram at CMSAR0 (an instruction index), which CTC2 to
++        // control register 27 sets; the vis operand always names that register.
++        (void)inst;
++        return "{ const uint32_t target_byte_addr = (ctx->vu0_cmsar0 & 0x1FFu) << 3; "
++               "ctx->vu0_pc = target_byte_addr; "
++               "runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); }";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+@@ -246,7 +268,7 @@ namespace ps2recomp
+ 
+         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
+ 
+-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
++        return fmt::format("{{ __m128 res = PS2_VMIN(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs, vft, vft, shuffle_pattern,
+@@ -265,7 +287,7 @@ namespace ps2recomp
+ 
+         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
+ 
+-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
++        return fmt::format("{{ __m128 res = PS2_VMAX(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs, vft, vft, shuffle_pattern,
+@@ -326,7 +348,7 @@ namespace ps2recomp
+         uint8_t vfs = inst.rd;
+         uint8_t vft = inst.rt;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
++        return fmt::format("{{ __m128 res = PS2_VMAX(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs, vft,
+@@ -340,7 +362,7 @@ namespace ps2recomp
+         uint8_t vfd = inst.sa;
+         uint8_t vfs = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
++        return fmt::format("{{ __m128 res = PS2_VMAX(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs,
+@@ -354,7 +376,7 @@ namespace ps2recomp
+         uint8_t vfd = inst.sa;
+         uint8_t vfs = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
++        return fmt::format("{{ __m128 res = PS2_VMIN(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs,
+@@ -459,7 +481,7 @@ namespace ps2recomp
+         uint8_t vfs = inst.rd;
+         uint8_t vft = inst.rt;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
++        return fmt::format("{{ __m128 res = PS2_VMIN(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs, vft,
+@@ -753,10 +775,7 @@ namespace ps2recomp
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
+ 
+-        return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
+-                           "src = _mm_mul_ps(src, _mm_set1_ps({})); "
+-                           "__m128i res_i = _mm_cvttps_epi32(src); "
+-                           "__m128 res = _mm_castsi128_ps(res_i); "
++        return fmt::format("{{ __m128 res = ps2_vftoi(ctx->vu0_vf[{}], {}); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                            vfs, codegen::formatFloatLiteral(scale),
+@@ -767,66 +786,49 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt,
+-                           vis, vis);
++        // VLQI.<dest> vft, (vis++)
++        const uint8_t vis = inst.rd & 0xF;
++        std::string out = "{ ";
++        if (inst.rt != 0)
++            out += fmt::format("ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(READ128({})), {}); ",
++                               inst.rt, inst.rt, vu0DataAddress(vis), codegen::vuMaskExpr(inst.vectorInfo.vectorField));
++        if (vis != 0)
++            out += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1); ", vis, vis);
++        return out + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++        // VSQI.<dest> vfs, (vit++): the data register is fs (rd), the address register it (rt).
++        const uint8_t vit = inst.rt & 0xF;
++        return fmt::format("{{ const uint32_t addr = {}; "
++                           "WRITE128(addr, _mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(READ128(addr)), ctx->vu0_vf[{}], {}))); "
++                           "{} }}",
++                           vu0DataAddress(vit), inst.rd, codegen::vuMaskExpr(inst.vectorInfo.vectorField),
++                           vit != 0 ? fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1);", vit, vit) : std::string());
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vis, vis,
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
++        // VLQD.<dest> vft, (--vis)
++        const uint8_t vis = inst.rd & 0xF;
++        std::string out = "{ ";
++        if (vis != 0)
++            out += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1); ", vis, vis);
++        if (inst.rt != 0)
++            out += fmt::format("ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(READ128({})), {}); ",
++                               inst.rt, inst.rt, vu0DataAddress(vis), codegen::vuMaskExpr(inst.vectorInfo.vectorField));
++        return out + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++        // VSQD.<dest> vfs, (--vit): the data register is fs (rd), the address register it (rt).
++        const uint8_t vit = inst.rt & 0xF;
++        return fmt::format("{{ {} const uint32_t addr = {}; "
++                           "WRITE128(addr, _mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(READ128(addr)), ctx->vu0_vf[{}], {}))); }}",
++                           vit != 0 ? fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1);", vit, vit) : std::string(),
++                           vu0DataAddress(vit), inst.rd, codegen::vuMaskExpr(inst.vectorInfo.vectorField));
+     }
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..197aec5 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -97,7 +97,10 @@ namespace ps2recomp
+             case VU0_CR_FBRST:
+                 return fmt::format("ctx->vu0_fbrst = GPR_U32(ctx, {}) & 0x00000C0Cu;", rt);
+             case VU0_CR_CMSAR1:
+-                return fmt::format("ctx->vu0_cmsar1 = GPR_U32(ctx, {});", rt);
++                // Writing CMSAR1 starts VU1 at that instruction (VU1 micro memory: 2048 of them).
++                return fmt::format("{{ ctx->vu0_cmsar1 = GPR_U32(ctx, {}) & 0xFFFFu; "
++                                   "runtime->vu1StartMicroProgram(rdram, ctx, (ctx->vu0_cmsar1 & 0x7FFu) << 3); }}",
++                                   rt);
+             default:
+                 return fmt::format("// Unimplemented CTC2 VU control register: {}", rd);
+             }
+@@ -263,22 +266,19 @@ namespace ps2recomp
+                 }
+                 case VU0_S2_VCLIPw:
+                 {
+-                    uint8_t field = inst.function & 0x3;
+-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
+-
++                    // Judges fs.xyz against |ft.w|: bit 0 = +x (x > +|w|), bit 1 = -x (x < -|w|),
++                    // then y and z; the previous three judgments shift up by 6 bits.
+                     return fmt::format(
+-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
+-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
+-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
+-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
+-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
+-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
+-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
+-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
+-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
++                        "{{ __m128 fs = ps2_vclamp(ctx->vu0_vf[{}]); "
++                        "__m128 w = ps2_vclamp(_mm_and_ps(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(3,3,3,3)), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)))); "
++                        "__m128 neg_w = _mm_xor_ps(w, _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000))); "
++                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(_mm_cmpgt_ps(fs, w)); "
++                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(_mm_cmplt_ps(fs, neg_w)); "
++                        "uint32_t flags = ((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1) | "
++                        "((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2) | "
++                        "((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3); "
++                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFF; }}",
++                        inst.rd, inst.rt, inst.rt);
+                 }
+                 case VU0_S2_VNOP:
+                     return fmt::format("// NOP operation, no action needed for VU0");

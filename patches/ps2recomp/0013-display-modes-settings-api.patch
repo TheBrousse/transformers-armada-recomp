@@ -1,0 +1,155 @@
+Subject: [PATCH] display modes, and the settings for a game menu of its own
+
+PS2X_FULLSCREEN gains exclusive full screen (2) beside a window (0) and borderless (1); F11
+switches between a window and the full screen last used. ps2_settings::setPanelKeyEnabled(false)
+keeps F5 from opening the panel for a game whose own menu shows the settings, and restartNow /
+restarting / restartMessage give it the panel's "Restart now".
+
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_settings.h b/ps2xRuntime/include/runtime/ps2_settings.h
+index 00794c6..de917ec 100644
+--- a/ps2xRuntime/include/runtime/ps2_settings.h
++++ b/ps2xRuntime/include/runtime/ps2_settings.h
+@@ -70,6 +70,15 @@ namespace ps2_settings
+     // The panel, from the window loop (ps2_runtime.cpp).
+     bool panelOpen();
+     void togglePanel();
++    // A game with a menu of its own over these settings (ps2_settings_internal.h's rows): false
++    // keeps F5 from opening the panel. True by default.
++    void setPanelKeyEnabled(bool enabled);
++    bool panelKeyEnabled();
++    // "Restart now" from such a menu: the state saved, then the game started again with the choices
++    // waiting for a restart (updatePanel carries it out, open or not). The message: why it failed.
++    void restartNow(PS2Runtime &runtime);
++    bool restarting();
++    std::string restartMessage();
+     // After the window's input was polled: the panel's keys, mouse and gamepad, and a restart in
+     // progress. The game gets no input while it is open.
+     void updatePanel(PS2Runtime &runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fac2abd..faa73fd 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -74,6 +74,35 @@ static void setFullScreen(bool on)
+         SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor) + 1);
+     }
+ }
++
++// PS2X_FULLSCREEN: 0 a window, 1 borderless full screen (above), 2 exclusive full screen (the
++// screen given to the game at its own resolution, as games of the time had it; the window is
++// restored as it was when it leaves). F11 switches between a window and the full screen last used.
++static int g_displayMode = 0;
++static int g_lastFullMode = 1;
++
++static void setDisplayMode(int mode)
++{
++    mode = std::clamp(mode, 0, 2);
++    if (IsWindowFullscreen() && mode != 2)
++        ToggleFullscreen();
++    if (mode == 2)
++    {
++        if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++            ToggleBorderlessWindowed();
++        if (!IsWindowFullscreen())
++        {
++            const int monitor = GetCurrentMonitor();
++            SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
++            ToggleFullscreen();
++        }
++    }
++    else
++        setFullScreen(mode == 1);
++    g_displayMode = mode;
++    if (mode != 0)
++        g_lastFullMode = mode;
++}
+ #if defined(PLATFORM_VITA)
+ static constexpr int HOST_WINDOW_WIDTH = 960;
+ static constexpr int HOST_WINDOW_HEIGHT = 544;
+@@ -1015,7 +1044,7 @@ bool PS2Runtime::initialize(const char *title)
+             }
+         }
+         if (const char *full = std::getenv("PS2X_FULLSCREEN"); full && *full && *full != '0')
+-            setFullScreen(true);
++            setDisplayMode(*full == '2' ? 2 : 1);
+         ps2_host_display::setWindow(GetWindowHandle()); // (its screen's vertical blanks: the refresh)
+         {
+             const Vector2 position = GetWindowPosition();
+@@ -2803,16 +2832,17 @@ void PS2Runtime::run()
+         s.section = "Display";
+         s.label = "Display mode";
+         s.order = 10;
+-        s.help = "Borderless full screen on the window's screen, or a window (F11 switches too).";
+-        s.choices = {{"0", "Window"}, {"1", "Full screen"}};
++        s.help = "A window, borderless full screen (switches with other windows at once), or exclusive full "
++                 "screen (the screen is the game's alone). F11 switches between a window and the full screen.";
++        s.choices = {{"0", "Window"}, {"1", "Borderless full screen"}, {"2", "Exclusive full screen"}};
+         s.defaultValue = "0";
+         s.apply = [](const std::string &value)
+         {
+-            setFullScreen(value != "0");
++            setDisplayMode(value == "2" ? 2 : (value != "0" ? 1 : 0));
+             return true;
+         };
+         s.current = []()
+-        { return std::string(IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? "1" : "0"); };
++        { return std::to_string(g_displayMode); };
+         ps2_settings::add(s);
+     }
+     {
+@@ -2961,11 +2991,11 @@ void PS2Runtime::run()
+             ps2_gpu::toggleView();
+         if (IsKeyPressed(KEY_F11))
+         {
+-            setFullScreen(!IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE));
+-            ps2_settings::noteChanged("PS2X_FULLSCREEN", IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? "1" : "0");
++            setDisplayMode(g_displayMode != 0 ? 0 : g_lastFullMode);
++            ps2_settings::noteChanged("PS2X_FULLSCREEN", std::to_string(g_displayMode));
+         }
+         // The settings panel: F5 (ps2_settings.h). Save states: F6 saves, F9 loads (ps2_savestate.h).
+-        if (IsKeyPressed(KEY_F5))
++        if (IsKeyPressed(KEY_F5) && ps2_settings::panelKeyEnabled())
+             ps2_settings::togglePanel();
+         ps2_settings::updatePanel(*this);
+         if (IsKeyPressed(KEY_F6))
+diff --git a/ps2xRuntime/src/lib/ps2_settings_panel.cpp b/ps2xRuntime/src/lib/ps2_settings_panel.cpp
+index babb84f..320df7c 100644
+--- a/ps2xRuntime/src/lib/ps2_settings_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_settings_panel.cpp
+@@ -412,6 +412,36 @@ bool ps2_settings::panelOpen()
+     return g_panel.open;
+ }
+ 
++namespace
++{
++    bool g_panelKeyEnabled = true;
++}
++
++void ps2_settings::setPanelKeyEnabled(bool enabled)
++{
++    g_panelKeyEnabled = enabled;
++}
++
++bool ps2_settings::panelKeyEnabled()
++{
++    return g_panelKeyEnabled;
++}
++
++void ps2_settings::restartNow(PS2Runtime &runtime)
++{
++    beginRestart(g_panel, runtime);
++}
++
++bool ps2_settings::restarting()
++{
++    return g_panel.restart == Restart::Saving;
++}
++
++std::string ps2_settings::restartMessage()
++{
++    return g_panel.restart == Restart::Failed ? g_panel.message : std::string();
++}
++
+ void ps2_settings::togglePanel()
+ {
+     Panel &p = g_panel;

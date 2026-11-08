@@ -1,0 +1,162 @@
+Subject: [PATCH] EE thread (FPS round 2): the dispatcher's call targets from a small per-thread table
+
+The dispatcher (PS2Runtime::dispatchGuestBranch) is ~10% of the game thread in a level: millions
+of guest calls a second, each reading its target from the 10 MB function table (one cache line
+per function, mostly outside the CPU's nearer caches).
+
+- callTarget: the target of a call or a continued call from a direct-mapped table of this
+  thread's recent ones (8,192 entries, 128 KB), filled from the function table on a miss and
+  emptied when any function is replaced (replaceFunction steps g_hotGeneration). The fast path
+  inline in the dispatcher, the rare ways (miss, emptying) out of line. PS2X_DISPATCH_CACHE=0:
+  the function table every call, as before (an A/B in one build).
+- The dispatch history ring: a store and a masked increment (was a modulo and a branch).
+
+The same functions are entered in the same order with the same EE clock (a scripted cold boot into
+Amazon: the game state identical on every frame). On a GTX 1080 / Ryzen 5 5600 test PC, Amazon, the
+user's settings at 1080 lines, 120 held, in one build by turns: cache on 78.1-79.1 fps, off
+76.8-78.2 (three pairs, +1.1% on average).
+---
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -187,11 +187,24 @@ namespace
+     // address worked out once a call instead of at every use (a thread-local's look-up each time
+     // was ~3% of the game's thread).
+     constexpr uint32_t kDispatchLevels = 256u;
++    // (FPS round 2) A call target found in the 10 MB function table (one cache line for every
++    // function, far apart: mostly out of the CPU's nearer caches) kept in a small table of this
++    // thread's recent ones (callTarget). Emptied when any function is replaced (g_hotGeneration).
++    struct HotTarget
++    {
++        uint32_t pc;
++        PS2Runtime::RecompiledFunction fn;
++    };
++    constexpr uint32_t kHotTargets = 8192u; // (128 KB)
++    std::atomic<uint32_t> g_hotGeneration{1u};
+     struct DispatchThread
+     {
+         DispatchHistory history;
+         uint32_t level = 0u;
+         bool resumedByDispatcher[kDispatchLevels] = {};
++        uint32_t hotGeneration = 0u;
++        HotTarget *hot = nullptr; // (made on first use and kept: a thread-local without a destructor
++                                  // costs nothing at each use, one with it a check)
+     };
+     thread_local DispatchThread g_dispatchThread;
+ 
+@@ -252,12 +265,11 @@ namespace
+ 
+     void pushDispatchPc(DispatchHistory &h, uint32_t pc)
+     {
++        // (FPS round 2) A store and an increment - the ring's size is a power of two; `wrapped`
++        // is set only on the turn over (a store and a modulo with a branch every call before).
+         h.pcs[h.next] = pc;
+-        h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
+-        if (h.next == 0u)
+-        {
+-            h.wrapped = true;
+-        }
++        h.next = (h.next + 1u) & static_cast<uint32_t>(h.pcs.size() - 1u);
++        h.wrapped |= h.next == 0u;
+     }
+ 
+     std::string formatDispatchHistory()
+@@ -1509,6 +1521,53 @@ namespace
+             return &g_addedFunctions[(address - PS2Runtime::kAddedCodeBegin) / 4u];
+         return nullptr;
+     }
++
++    // PS2X_DISPATCH_CACHE=0: the dispatcher reads the function table every call, as before (an A/B).
++    const bool g_hotTargetsOn = []()
++    {
++        const char *env = std::getenv("PS2X_DISPATCH_CACHE");
++        return !env || *env != '0';
++    }();
++
++    // (The call-target cache's rare ways, kept out of the dispatcher's own code.)
++    PS2_NOINLINE void resetHotTargets(DispatchThread &thread, uint32_t generation)
++    {
++        if (!thread.hot)
++            thread.hot = new HotTarget[kHotTargets];
++        std::memset(thread.hot, 0, sizeof(HotTarget) * kHotTargets);
++        thread.hotGeneration = generation;
++    }
++
++    PS2_NOINLINE PS2Runtime::RecompiledFunction hotTargetMiss(HotTarget &h, uint32_t pc)
++    {
++        const PS2Runtime::RecompiledFunction *entry = functionEntry(pc);
++        const PS2Runtime::RecompiledFunction fn = entry ? *entry : nullptr;
++        if (fn)
++        {
++            h.pc = pc;
++            h.fn = fn;
++        }
++        return fn;
++    }
++
++    // The function a call or a continued call enters (nullptr: none): from the thread's small
++    // table when it was seen there since the last replacement, else from the function table.
++    // (An empty slot is {0, nullptr}: address 0 has no function either.)
++    PS2_FORCEINLINE PS2Runtime::RecompiledFunction callTarget(DispatchThread &thread, uint32_t pc)
++    {
++        if (!g_hotTargetsOn) [[unlikely]]
++        {
++            const PS2Runtime::RecompiledFunction *entry = functionEntry(pc);
++            return entry ? *entry : nullptr;
++        }
++        const uint32_t generation = g_hotGeneration.load(std::memory_order_acquire);
++        if (thread.hotGeneration != generation) [[unlikely]]
++            resetHotTargets(thread, generation);
++        HotTarget &h = thread.hot[(pc >> 2) & (kHotTargets - 1u)];
++        if (h.pc == pc)
++            return h.fn;
++        return hotTargetMiss(h, pc);
++    }
+ }
+ 
+ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+@@ -1524,6 +1583,7 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+     }
+ 
+     *entry = func;
++    g_hotGeneration.fetch_add(1u, std::memory_order_acq_rel); // (every thread's call-target cache emptied)
+     return true;
+ }
+ 
+@@ -1790,8 +1850,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    const RecompiledFunction *targetEntry = functionEntry(targetPc);
+-    const RecompiledFunction targetFn = targetEntry ? *targetEntry : nullptr;
++    DispatchThread &thread = g_dispatchThread;
++    const RecompiledFunction targetFn = callTarget(thread, targetPc);
+     if (!targetFn)
+     {
+         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+@@ -1814,7 +1874,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    DispatchThread &thread = g_dispatchThread;
+     pushDispatchPc(thread.history, targetPc); // (as lookupFunction records it)
+     const uint32_t entryPc = ctx->pc;
+     // (FPS) The call's level among the dispatcher's calls on this thread, kept for the way back
+@@ -1866,14 +1925,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         {
+             if (m_eeScheduler->unwindingForCheckpoint())
+                 return false;
+-            const RecompiledFunction *entry = functionEntry(ctx->pc);
+-            if (!entry || !*entry)
++            const RecompiledFunction fn = callTarget(thread, ctx->pc);
++            if (!fn)
+                 return false; // (the dispatcher reports it, as before)
+             if (m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+                 return false; // (the dispatcher's own checkpoint before entering it)
+             const uint32_t continuePc = ctx->pc;
+             pushDispatchPc(thread.history, continuePc);
+-            (*entry)(rdram, ctx, this);
++            fn(rdram, ctx, this);
+             if (isStopRequested() || ctx->pc == 0u || ctx->pc == continuePc)
+                 return false; // (the dispatcher's business: a thread's end, a loop that yielded at its start)
+         }

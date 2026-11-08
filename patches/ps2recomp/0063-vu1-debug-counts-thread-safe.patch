@@ -1,0 +1,44 @@
+Subject: [PATCH] VU1 debug aids: routine counts and batch captures safe from two threads (TODO 163)
+
+The native renderer runs the particle programs on this engine (ps2vu1fast::run, nr_particles.cpp)
+from its own thread while VIF1's thread runs the game's batches. PS2X_VU1_ROUTINES' totals (a
+static map, unlocked) were then changed by both threads at once: the heap corrupted, the process
+ended 0xC0000374 (Cybertron at 16500 and Mid-Atlantic, both with PS2X_VU1_ROUTINES=1; never
+without it). The counts now take a lock; PS2X_VU1_CAPTURE's packet list is the running thread's
+own (thread_local) and its count and file numbers are taken under a lock of their own.
+---
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+@@ -618,8 +618,10 @@
+         e.kickBytesLog = SIZE_MAX;
+     }
+ 
+-    // The packets of the batch PS2X_VU1_CAPTURE is saving (run()), or null.
+-    std::vector<uint8_t> *g_batchPackets = nullptr;
++    // The packets of the batch PS2X_VU1_CAPTURE is saving (run()), or null - the running thread's own: the native
++    // renderer runs the particle programs on this engine from its thread while VIF1's thread runs the game's batches
++    // (TODO 163).
++    thread_local std::vector<uint8_t> *g_batchPackets = nullptr;
+ 
+     // The qword at byte `offset` of the packet as the transfer read it.
+     void kickQword(const Engine &e, uint32_t offset, uint8_t out[16])
+@@ -2784,6 +2786,10 @@
+ 
+     void countRoutines(const RoutineKey &key, uint32_t vertices, uint64_t pairs, uint64_t bytes)
+     {
++        // (Two threads count: VIF1's, the game's batches, and the native renderer's, its particle programs. Unlocked,
++        // the map was changed by both at once and the heap corrupted - 0xC0000374 in PS2X_VU1_ROUTINES runs, TODO 163.)
++        static std::mutex mutex;
++        std::lock_guard<std::mutex> lock(mutex);
+         static std::map<RoutineKey, RoutineTotals> totals;
+         static auto since = std::chrono::steady_clock::now();
+         RoutineTotals &entry = totals[key];
+@@ -3217,6 +3223,8 @@
+         if (capturing)
+         {
+             g_batchPackets = nullptr;
++            static std::mutex captureMutex; // (both threads may save one: the count and the file numbers)
++            std::lock_guard<std::mutex> lock(captureMutex);
+             --batchCapture().left;
+             writeBatch(e, state, batchCapture().routines, capturedPc, capturedItop, capturedTop, capturedBefore, data,
+                        dataSize, code, capturedPackets);

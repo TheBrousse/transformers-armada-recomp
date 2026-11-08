@@ -1,0 +1,35 @@
+#pragma once
+// Photo mode (photo_mode.cpp): F8 in a level freezes the game, hides the HUD and frees the camera.
+//
+//   mouse / arrow keys  look          W A S D  move (W/S along the view)
+//   Space / E  up       Q / Ctrl  down        Shift  faster, Alt  slower
+//   mouse wheel or + / -  field of view      H  the HUD back on / off
+//   R  back to the game's own view            F8 or Esc  leave
+//
+// Also the mod menu's Display tab ("Photo mode") and TF_PHOTO_MODE=1 (on as soon as a level runs,
+// for tests).
+
+#include <cstdint>
+
+class PS2Runtime;
+
+namespace photo_mode
+{
+    // From applyTransformers.
+    void install(PS2Runtime &runtime);
+    // Once a rendered frame on the window thread (mod_menu::draw): the keys and the mouse, and the
+    // hint drawn over the picture.
+    void windowFrame();
+    // Once a game frame (overrides.cpp, after game_config::frame): the game's speed, the HUD and the
+    // pad, while photo mode is on.
+    void frame(uint8_t *rdram, bool inLevel);
+    bool active();
+    // For the overlays (distance_meter's text): where the crosshair model was put this moment (world),
+    // and a world point in the window's pixels as the game's camera shows it (pictureAspect: the
+    // picture's shape in the window, ps2_host_display::displayAspect). False when there is none.
+    // The game's crosshair model kept out of the picture (small_crosshair draws its own).
+    void setHideCrosshair(bool hide);
+    bool crosshair(float point[3]);
+    bool project(const float point[3], float windowW, float windowH, float pictureAspect, float &x, float &y);
+    void toggle();
+}

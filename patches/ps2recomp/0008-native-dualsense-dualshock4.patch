@@ -1,0 +1,1611 @@
+Subject: [PATCH] input: native DualSense / DualShock 4 (HID), with the game's vibration
+
+Ported from our earlier recomp (patches 0015, 0234, 0242: ps2_sony_pad.h, ps2_sony_pad.cpp,
+ps2_sony_pad_host.cpp; GPL-3.0 like PS2Recomp). DualSense, DualSense Edge and DualShock 4 over
+USB or Bluetooth are read over Windows HID on a thread of their own (no Steam Input or
+DS4Windows): every button, both sticks, the analog triggers; the light bar takes a colour; the
+game's libpad actuators (scePadSetActAlign / scePadSetActDirect, no-ops before) drive the
+motors. Without a Sony pad the GLFW gamepads read as before.
+
+Adapted to this runtime: the pad read keeps its own button map (the Sony pad fills the same
+list as a GLFW gamepad, keyboard and mouse on top); settings are environment variables
+(PS2X_GAMEPAD_BACKEND auto|glfw|sony, PS2X_SONYPAD_RUMBLE 0..100, PS2X_SONYPAD_LIGHTBAR
+RRGGBB|off, PS2X_SONYPAD_TRACE=1), not our earlier recomp's [gamepad] section.
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index eb04edb..16a2479 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -411,6 +411,8 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
++    src/lib/ps2_sony_pad.cpp
++    src/lib/ps2_sony_pad_host.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+@@ -555,7 +557,7 @@ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+ if(WIN32)
+     # The screen's refresh: the window's screen's vertical blanks (DXGI), or the desktop
+     # compositor's (ps2_host_display.cpp).
+-    target_link_libraries(ps2_runtime PRIVATE dwmapi dxgi d3d11)
++    target_link_libraries(ps2_runtime PRIVATE dwmapi dxgi d3d11 hid setupapi) # (hid, setupapi: ps2_sony_pad_host.cpp)
+ endif()
+ if(DEFINED raylib_SOURCE_DIR)
+     # The GPU renderer (gs_gpu.cpp) uses raylib's GL loader and its GLFW.
+diff --git a/ps2xRuntime/include/runtime/ps2_sony_pad.h b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+new file mode 100644
+index 0000000..e5b704b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_sony_pad.h
+@@ -0,0 +1,202 @@
++#pragma once
++
++// Native Sony controllers (DualSense, DualSense Edge, DualShock 4) over HID, without Steam Input or DS4Windows: their
++// input reports become the PS2 pad's, and the game's own vibration (libpad actuators, libvib) drives their motors.
++// The protocol is ported from our earlier launcher's SonyPad.cs (USB input report 0x01, Bluetooth 0x31 / 0x11 after the
++// feature-report switch, output reports 0x02 / 0x31 (DualSense) and 0x05 / 0x11 (DualShock 4), the Bluetooth CRC32).
++//
++// Two halves. The protocol half (parse, build, map; ps2_sony_pad.cpp) is pure and tested with recorded byte arrays. The
++// device half (ps2_sony_pad_host.cpp) is Windows HID on a thread of its own: the game thread only copies the latest
++// report and posts motor values, it never waits on a device. Other platforms have no device half (GLFW only).
++//
++// Settings (environment variables, kept in settings.ini by the settings panel, F5: the Controller tab):
++// PS2X_GAMEPAD_BACKEND = auto (native when a Sony pad is connected, else GLFW), glfw (never open the pad: Steam
++// Input / DS4Windows users) or sony (native only: GLFW gamepads are ignored); PS2X_SONYPAD_RUMBLE = 0..100 (percent
++// of the game's vibration); PS2X_SONYPAD_LIGHTBAR = RRGGBB or off. Read at start.
++// (Ported from our earlier recomp, where they are [gamepad] backend / rumble / lightbar in its settings.ini.)
++// PS2X_SONYPAD_TRACE=1 logs detection, raw reports and writes ("[sonypad] ..."), for a first test on new hardware.
++// Unattended runs (PS2X_WINDOW_HIDDEN, a pad script) never open the pad: no light bar or rumble on the user's desk.
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace ps2x::sonypad
++{
++    enum class Model : uint8_t
++    {
++        DualSense,
++        DualShock4,
++    };
++
++    enum class Link : uint8_t
++    {
++        Usb,
++        Bluetooth,
++    };
++
++    constexpr uint16_t kSonyVendorId = 0x054Cu;
++    // A DualShock 4 / DualSense collection over Bluetooth declares input reports of at least this size (USB: 64).
++    constexpr size_t kBluetoothInputLength = 78u;
++    constexpr size_t kBluetoothOutputLength = 78u;
++
++    // DualSense 0x0CE6, DualSense Edge 0x0DF2; DualShock 4 0x05C4 (first), 0x09CC (second), 0x0BA0 (wireless adapter).
++    std::optional<Model> modelFromIds(uint16_t vendorId, uint16_t productId);
++    const char *modelName(Model model);
++    const char *linkName(Link link);
++
++    // A Sony pad's buttons (1 = pressed).
++    enum Button : uint32_t
++    {
++        kSquare = 1u << 0,
++        kCross = 1u << 1,
++        kCircle = 1u << 2,
++        kTriangle = 1u << 3,
++        kL1 = 1u << 4,
++        kR1 = 1u << 5,
++        kL2 = 1u << 6,
++        kR2 = 1u << 7,
++        kCreate = 1u << 8, // DualShock 4: Share
++        kOptions = 1u << 9,
++        kL3 = 1u << 10,
++        kR3 = 1u << 11,
++        kPs = 1u << 12,
++        kTouchpad = 1u << 13,
++        kMute = 1u << 14, // DualSense only
++        kUp = 1u << 15,
++        kDown = 1u << 16,
++        kLeft = 1u << 17,
++        kRight = 1u << 18,
++    };
++
++    struct InputState
++    {
++        uint32_t buttons = 0u;
++        uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u; // 0 = left / up, as the PS2's sticks
++        uint8_t l2 = 0u, r2 = 0u;                               // analog triggers, 0 = released
++        int battery = -1;                                       // percent; -1 unknown (the Bluetooth basic report)
++        bool charging = false;
++        bool fullReport = false; // false: the basic report a Bluetooth pad sends until it is switched (no battery)
++    };
++
++    enum class ParseResult
++    {
++        Input,     // out holds the pad's state
++        Ignored,   // another report (feature echo, audio, ...): not input, not an error
++        TooShort,  // fewer bytes than the layout needs
++        BadCrc,    // a Bluetooth full report whose CRC32 does not match (a damaged report)
++    };
++    const char *parseResultName(ParseResult result);
++
++    // One input report as ReadFile returns it (report id first). checkCrc: verify the Bluetooth full reports' CRC32.
++    ParseResult parseInputReport(Model model, Link link, const uint8_t *report, size_t length, InputState &out,
++                                 bool checkCrc = true);
++
++    // Bluetooth CRC32 (the zlib one) over a seed byte (0xA1 input, 0xA2 output, 0xA3 feature) and data.
++    uint32_t bluetoothCrc(uint8_t seed, const uint8_t *data, size_t length);
++    // A Bluetooth report's last four bytes hold the CRC32 of the rest, little endian.
++    bool checkBluetoothCrc(uint8_t seed, const uint8_t *report, size_t length);
++    constexpr uint8_t kCrcSeedInput = 0xA1u;
++    constexpr uint8_t kCrcSeedOutput = 0xA2u;
++
++    // What an output report asks the pad to do.
++    struct OutputState
++    {
++        uint8_t weakMotor = 0u;   // right, high frequency (the PS2's small motor)
++        uint8_t strongMotor = 0u; // left, low frequency (the PS2's large motor)
++        bool lightbar = true;     // false: leave the LEDs to the pad's firmware
++        uint8_t red = 0u, green = 0u, blue = 0u;
++        uint8_t playerLeds = 0x04u; // DualSense player indicator: the centre LED = player 1
++        bool lightbarSetup = false; // DualSense: fade out the firmware's start-up glow so the colour shows
++        bool releaseLeds = false;   // DualSense: hand the LEDs back to the firmware (the game is closing)
++    };
++
++    // The output report for a pad. outputLength: the collection's OutputReportByteLength (USB only; a Bluetooth report
++    // is always kBluetoothOutputLength bytes, CRC32 included).
++    std::vector<uint8_t> buildOutputReport(Model model, Link link, const OutputState &state, size_t outputLength);
++
++    // The feature report whose read switches a Bluetooth pad from its basic to its full input report.
++    uint8_t fullReportFeatureId(Model model);
++
++    // ---- The game's vibration ----
++
++    // As the guest wrote it: the small motor is on/off (only bit 0 counts, as on a DualShock 2), the large one 0..255.
++    struct Motors
++    {
++        bool small = false;
++        uint8_t large = 0u;
++        bool operator==(const Motors &other) const { return small == other.small && large == other.large; }
++        bool operator!=(const Motors &other) const { return !(*this == other); }
++    };
++
++    // libpad: scePadSetActAlign's 6 bytes say which actuator each scePadSetActDirect byte drives (0 = small motor,
++    // 1 = large motor, 0xFF = none). A pad starts with nothing aligned.
++    Motors decodeActDirect(const uint8_t align[6], const uint8_t data[6]);
++    // libvib: sceVibSetActParam's profile bits name the actuators (bit 0 small: 1 bit, bit 1 large: 8 bits) and data
++    // packs their values in that order from bit 0 up (e.g. DBZ BT3: (large << 1) | small in two bytes).
++    Motors decodeVibParam(const uint8_t *profile, size_t profileBytes, const uint8_t *data, size_t dataBytes);
++    // The pad's motors for the guest's: small on = the weak motor at full strength (a DualShock 2's small motor has one
++    // speed), large = the strong motor; both scaled by percent (0..100, the player's [gamepad] rumble).
++    void applyMotors(const Motors &motors, int percent, OutputState &out);
++
++    // The latest vibration per PS2 port, set by the libpad / libvib HLE (Kernel/Stubs/Pad.cpp); cheap, never blocks.
++    void setGuestMotors(int port, const Motors &motors);
++    Motors guestMotors(int port);
++    // Increases with every change of any port's motors (the device thread writes on a change).
++    uint64_t guestMotorsGeneration();
++
++    // ---- The PS2 pad report ----
++
++    // data[1] of the pad backend's 32-byte report when data[8..19] carry real pressures (DualShock 2 pressure mode).
++    constexpr uint8_t kPadDataPressureMode = 0x79u;
++
++    // A raylib GamepadButton held on a Sony pad (the settings file's [gamepad] names), and its pressure 0..255 (the
++    // triggers are analog, every other button is fully pressed or not).
++    bool gamepadButtonDown(const InputState &state, int raylibButton);
++    uint8_t gamepadButtonPressure(const InputState &state, int raylibButton);
++    // ---- The device ----
++
++    enum class Backend : uint8_t
++    {
++        Auto, // native when a Sony pad is connected, else GLFW
++        Glfw, // never open the pad
++        Sony, // native only; GLFW gamepads are ignored (the keyboard still works)
++    };
++    const char *backendName(Backend backend);
++    std::optional<Backend> parseBackend(const std::string &text);
++
++    // The host pad backend's question each read (ps2_pad.cpp): the connected Sony pad's input, starting the device
++    // thread the first time the game's window is open (never for backend = glfw, a hidden window, before the window
++    // exists (tests) or without a device half). false: no Sony pad, GLFW reads the gamepads.
++    bool readHostPad(InputState &out);
++    // Tests: readHostPad answers this state (nullptr: the device again), so the whole path to the guest is testable
++    // without a controller.
++    void injectPadForTests(const InputState *state);
++    // Whether GLFW gamepads may drive the pad (false with backend = sony).
++    bool glfwGamepadsAllowed();
++    // Motors off, the LEDs back to the firmware, the thread stopped (the runtime's exit; safe without a start).
++    void shutdown();
++
++    // The device half (ps2_sony_pad_host.cpp).
++    namespace host
++    {
++        struct Config
++        {
++            int rumblePercent = 100;
++            bool lightbar = true;
++            uint8_t red = 0xDCu, green = 0x16u, blue = 0x16u;
++            bool trace = false;
++        };
++        // Whether this build can open HID devices (Windows).
++        bool available();
++        // Starts the device thread once (later calls do nothing).
++        void start(const Config &config);
++        // The connected pad's latest input; false while none is connected (or it stopped reporting).
++        bool latest(InputState &out);
++        // A guest motor change: write it now rather than at the next keep-alive.
++        void wake();
++        void stop();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index dc53e95..83c3f43 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_sony_pad.h"
+ #include "Common.h"
+ #include "Pad.h"
+ #include "SaveState.h"
+@@ -687,17 +688,44 @@ namespace ps2_stubs
+         setReturnS32(ctx, 0);
+     }
+ 
++    // The actuator alignment per port (scePadSetActAlign), 0xFF = none.
++    std::mutex g_actMutex;
++    uint8_t g_actAlign[2][6] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
++
++    // a2 = 6 bytes: the actuator each scePadSetActDirect byte drives (0 small motor, 1 large motor, 0xFF none).
++    // A port starts with nothing aligned (as a DualShock 2). The motors reach a native Sony pad (ps2_sony_pad.h).
+     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        const int port = static_cast<int>(getRegU32(ctx, 4));
++        const uint8_t *align = getMemPtr(rdram, getRegU32(ctx, 6));
++        if (port < 0 || port >= 2 || !align)
++        {
++            setReturnS32(ctx, 0);
++            return;
++        }
++        std::lock_guard<std::mutex> lock(g_actMutex);
++        std::memcpy(g_actAlign[port], align, 6);
+         setReturnS32(ctx, 1);
+     }
+ 
++    // a2 = 6 bytes of actuator values, read through the port's alignment.
+     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        const int port = static_cast<int>(getRegU32(ctx, 4));
++        const uint8_t *data = getMemPtr(rdram, getRegU32(ctx, 6));
++        if (port < 0 || port >= 2 || !data)
++        {
++            setReturnS32(ctx, 0);
++            return;
++        }
++        ps2x::sonypad::Motors motors;
++        {
++            std::lock_guard<std::mutex> lock(g_actMutex);
++            motors = ps2x::sonypad::decodeActDirect(g_actAlign[port], data);
++        }
++        ps2x::sonypad::setGuestMotors(port, motors);
+         setReturnS32(ctx, 1);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index fbd8f36..a1e7281 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_pad.h"
++#include "runtime/ps2_sony_pad.h"
+ #include "runtime/ps2_host_input.h"
+ #include "ps2_host_backend.h"
+ #include <algorithm>
+@@ -422,7 +423,42 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     }();
+     const bool live = (unfocusedInput || IsWindowFocused()) && !g_gameInputBlocked.load(std::memory_order_relaxed);
+ 
+-    const int gamepad = live ? firstGamepad() : -1;
++    // A DualSense / DualShock 4 read natively (ps2_sony_pad.h) drives the pad in place of the GLFW gamepads.
++    ps2x::sonypad::InputState sony;
++    const bool sonyPad = live && ps2x::sonypad::readHostPad(sony);
++    if (sonyPad)
++    {
++        using namespace ps2x::sonypad;
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_UP), PAD_UP);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_DOWN), PAD_DOWN);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_LEFT), PAD_LEFT);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_FACE_RIGHT), PAD_RIGHT);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_DOWN), PAD_CROSS);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT), PAD_CIRCLE);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_LEFT), PAD_SQUARE);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_FACE_UP), PAD_TRIANGLE);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_1), PAD_L1);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_1), PAD_R1);
++        // The analog triggers count as pressed past a sixth of their travel.
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_TRIGGER_2) || sony.l2 > 0x2Au, PAD_L2);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_TRIGGER_2) || sony.r2 > 0x2Au, PAD_R2);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_RIGHT), PAD_START);    // Options
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_MIDDLE_LEFT), PAD_SELECT);    // Create / Share
++        press((sony.buttons & kTouchpad) != 0u, PAD_SELECT);                       // the touchpad click too
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_LEFT_THUMB), PAD_L3);
++        press(gamepadButtonDown(sony, GAMEPAD_BUTTON_RIGHT_THUMB), PAD_R3);
++        const auto axis = [](uint8_t value)
++        {
++            const float v = (static_cast<float>(value) - 128.0f) / 127.0f;
++            return std::fabs(v) < 0.08f ? 0.0f : std::clamp(v, -1.0f, 1.0f); // (the GLFW path's raw axes have no dead zone either; this only stops drift)
++        };
++        lx = axis(sony.lx);
++        ly = axis(sony.ly);
++        rx = axis(sony.rx);
++        ry = axis(sony.ry);
++    }
++
++    const int gamepad = live && !sonyPad && ps2x::sonypad::glfwGamepadsAllowed() ? firstGamepad() : -1;
+     if (gamepad >= 0)
+     {
+         press(IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP), PAD_UP);
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad.cpp b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+new file mode 100644
+index 0000000..3f37188
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_sony_pad.cpp
+@@ -0,0 +1,579 @@
++// Native Sony controllers (ps2_sony_pad.h), the protocol half: report layouts and the Bluetooth CRC32 (ported from
++// our earlier launcher's SonyPad.cs, cross-checked with Linux hid-playstation and SDL's hidapi drivers), the guest's vibration
++// (libpad / libvib actuator data) and the PS2 pad report. Pure functions plus the small glue the pad backend calls.
++#include "runtime/ps2_sony_pad.h"
++#include "raylib.h" // its GamepadButton codes, IsWindowReady
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <mutex>
++
++namespace ps2x::sonypad
++{
++    namespace
++    {
++        constexpr uint8_t kUsbInputReport = 0x01u;
++        constexpr uint8_t kBluetoothBasicReport = 0x01u;
++        constexpr uint8_t kDualSenseBluetoothReport = 0x31u;
++        constexpr uint8_t kDualShock4BluetoothReport = 0x11u;
++
++        // The button bytes are the same on both pads (only their offset differs): b0 = d-pad hat (low nibble) and the
++        // face buttons, b1 = shoulders, Create/Share, Options, sticks, b2 = PS, touchpad, mute (DualSense full report).
++        uint32_t decodeButtons(uint8_t b0, uint8_t b1, uint8_t b2, bool hasMute)
++        {
++            uint32_t buttons = 0u;
++            switch (b0 & 0x0Fu)
++            {
++            case 0: buttons |= kUp; break;
++            case 1: buttons |= kUp | kRight; break;
++            case 2: buttons |= kRight; break;
++            case 3: buttons |= kDown | kRight; break;
++            case 4: buttons |= kDown; break;
++            case 5: buttons |= kDown | kLeft; break;
++            case 6: buttons |= kLeft; break;
++            case 7: buttons |= kUp | kLeft; break;
++            default: break; // 8 = released
++            }
++            if (b0 & 0x10u) buttons |= kSquare;
++            if (b0 & 0x20u) buttons |= kCross;
++            if (b0 & 0x40u) buttons |= kCircle;
++            if (b0 & 0x80u) buttons |= kTriangle;
++            if (b1 & 0x01u) buttons |= kL1;
++            if (b1 & 0x02u) buttons |= kR1;
++            if (b1 & 0x04u) buttons |= kL2;
++            if (b1 & 0x08u) buttons |= kR2;
++            if (b1 & 0x10u) buttons |= kCreate;
++            if (b1 & 0x20u) buttons |= kOptions;
++            if (b1 & 0x40u) buttons |= kL3;
++            if (b1 & 0x80u) buttons |= kR3;
++            if (b2 & 0x01u) buttons |= kPs;
++            if (b2 & 0x02u) buttons |= kTouchpad;
++            if (hasMute && (b2 & 0x04u)) buttons |= kMute; // elsewhere these bits are a report counter
++            return buttons;
++        }
++
++        std::array<uint32_t, 256> makeCrcTable()
++        {
++            std::array<uint32_t, 256> table{};
++            for (uint32_t i = 0; i < 256u; ++i)
++            {
++                uint32_t c = i;
++                for (int bit = 0; bit < 8; ++bit)
++                    c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : (c >> 1);
++                table[i] = c;
++            }
++            return table;
++        }
++
++        const std::array<uint32_t, 256> &crcTable()
++        {
++            static const std::array<uint32_t, 256> table = makeCrcTable();
++            return table;
++        }
++
++        uint32_t crcUpdate(uint32_t crc, uint8_t byte)
++        {
++            return crcTable()[(crc ^ byte) & 0xFFu] ^ (crc >> 8);
++        }
++
++        constexpr int kGuestPorts = 2;
++        std::atomic<uint32_t> g_guestMotors[kGuestPorts]{}; // bit 8 = small, bits 0-7 = large
++        std::atomic<uint64_t> g_guestMotorsGeneration{0};
++
++        uint32_t packMotors(const Motors &m) { return (m.small ? 0x100u : 0u) | m.large; }
++        Motors unpackMotors(uint32_t v) { return Motors{(v & 0x100u) != 0u, static_cast<uint8_t>(v & 0xFFu)}; }
++
++        std::string lower(std::string text)
++        {
++            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++            const size_t first = text.find_first_not_of(" \t");
++            const size_t last = text.find_last_not_of(" \t");
++            return first == std::string::npos ? std::string() : text.substr(first, last - first + 1);
++        }
++
++        bool environmentOn(const char *name)
++        {
++            const char *value = std::getenv(name);
++            return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
++        }
++    }
++
++    std::optional<Model> modelFromIds(uint16_t vendorId, uint16_t productId)
++    {
++        if (vendorId != kSonyVendorId)
++            return std::nullopt;
++        switch (productId)
++        {
++        case 0x0CE6u: // DualSense
++        case 0x0DF2u: // DualSense Edge
++            return Model::DualSense;
++        case 0x05C4u: // DualShock 4 (first model)
++        case 0x09CCu: // DualShock 4 (second model)
++        case 0x0BA0u: // DualShock 4 USB wireless adapter
++            return Model::DualShock4;
++        default:
++            return std::nullopt;
++        }
++    }
++
++    const char *modelName(Model model) { return model == Model::DualSense ? "DualSense" : "DualShock 4"; }
++    const char *linkName(Link link) { return link == Link::Usb ? "USB" : "Bluetooth"; }
++
++    const char *parseResultName(ParseResult result)
++    {
++        switch (result)
++        {
++        case ParseResult::Input: return "input";
++        case ParseResult::Ignored: return "ignored";
++        case ParseResult::TooShort: return "too-short";
++        case ParseResult::BadCrc: return "bad-crc";
++        }
++        return "?";
++    }
++
++    uint32_t bluetoothCrc(uint8_t seed, const uint8_t *data, size_t length)
++    {
++        uint32_t crc = crcUpdate(0xFFFFFFFFu, seed);
++        for (size_t i = 0; i < length; ++i)
++            crc = crcUpdate(crc, data[i]);
++        return ~crc;
++    }
++
++    bool checkBluetoothCrc(uint8_t seed, const uint8_t *report, size_t length)
++    {
++        if (!report || length < 5u)
++            return false;
++        const size_t n = length - 4u;
++        const uint32_t stored = static_cast<uint32_t>(report[n]) | (static_cast<uint32_t>(report[n + 1]) << 8) |
++                                (static_cast<uint32_t>(report[n + 2]) << 16) | (static_cast<uint32_t>(report[n + 3]) << 24);
++        return stored == bluetoothCrc(seed, report, n);
++    }
++
++    ParseResult parseInputReport(Model model, Link link, const uint8_t *report, size_t length, InputState &out, bool checkCrc)
++    {
++        if (!report || length == 0u)
++            return ParseResult::TooShort;
++        const uint8_t id = report[0];
++        size_t o = 0u;        // first data byte (left stick X)
++        size_t need = 0u;     // bytes the layout reads
++        bool full = false;    // full report (battery, motion) rather than the Bluetooth basic one
++        bool dualSenseLayout = false;
++        if (link == Link::Usb)
++        {
++            if (id != kUsbInputReport)
++                return ParseResult::Ignored;
++            o = 1u;
++            full = true;
++            dualSenseLayout = model == Model::DualSense;
++            need = o + (dualSenseLayout ? 53u : 30u); // the status byte: DualSense +52, DualShock 4 +29
++        }
++        else if (id == kBluetoothBasicReport)
++        {
++            // Until the feature read switches it, a Bluetooth pad sends this short report: the USB DualShock 4 layout's
++            // first nine bytes for both pads (sticks, three button bytes, triggers).
++            o = 1u;
++            need = o + 9u;
++        }
++        else if (model == Model::DualSense && id == kDualSenseBluetoothReport)
++        {
++            o = 2u; // report id, then a sequence/tag byte
++            full = true;
++            dualSenseLayout = true;
++            need = kBluetoothInputLength;
++        }
++        else if (model == Model::DualShock4 && id == kDualShock4BluetoothReport)
++        {
++            o = 3u; // report id, then two protocol bytes
++            full = true;
++            need = kBluetoothInputLength;
++        }
++        else
++            return ParseResult::Ignored;
++
++        if (length < need)
++            return ParseResult::TooShort;
++        // A Bluetooth full report carries a CRC32 over its first 74 bytes (ReadFile may hand back more: the collection's
++        // longest report; the CRC still sits at 74).
++        if (full && link == Link::Bluetooth && checkCrc && !checkBluetoothCrc(kCrcSeedInput, report, kBluetoothInputLength))
++            return ParseResult::BadCrc;
++
++        InputState state;
++        state.lx = report[o + 0];
++        state.ly = report[o + 1];
++        state.rx = report[o + 2];
++        state.ry = report[o + 3];
++        state.fullReport = full;
++        if (dualSenseLayout)
++        {
++            // DualSense: triggers at +4/+5, a sequence byte, then the buttons at +7.
++            state.l2 = report[o + 4];
++            state.r2 = report[o + 5];
++            state.buttons = decodeButtons(report[o + 7], report[o + 8], report[o + 9], true);
++            const uint8_t status = report[o + 52];
++            const int level = status & 0x0F;
++            const int charge = (status >> 4) & 0x0F; // 0 discharging, 1 charging, 2 full, others an error
++            state.battery = charge == 2 ? 100 : (charge <= 1 ? std::min(level * 10 + 5, 100) : -1);
++            state.charging = charge == 1;
++        }
++        else
++        {
++            // DualShock 4 (and both pads' Bluetooth basic report): buttons at +4, triggers at +7/+8.
++            state.buttons = decodeButtons(report[o + 4], report[o + 5], report[o + 6], false);
++            state.l2 = report[o + 7];
++            state.r2 = report[o + 8];
++            if (full)
++            {
++                // Status at +29 (hid-playstation): capacity in the low nibble, bit 4 = cable. On the cable 0-9 is
++                // charging, 10 charging at full, 11 full.
++                const uint8_t status = report[o + 29];
++                const int level = status & 0x0F;
++                if (status & 0x10u)
++                {
++                    state.battery = level < 10 ? level * 10 + 5 : (level <= 11 ? 100 : -1);
++                    state.charging = level <= 10;
++                }
++                else
++                    state.battery = level < 10 ? level * 10 + 5 : 100;
++            }
++        }
++        out = state;
++        return ParseResult::Input;
++    }
++
++    std::vector<uint8_t> buildOutputReport(Model model, Link link, const OutputState &state, size_t outputLength)
++    {
++        const bool bluetooth = link == Link::Bluetooth;
++        std::vector<uint8_t> buf;
++        if (model == Model::DualSense)
++        {
++            // USB report 0x02 (the collection's 48 bytes); Bluetooth 0x31, a 0x02 "state follows" byte, CRC32 (seed
++            // 0xA2). The common block (hid-playstation's dualsense_output_report_common) starts after them.
++            buf.assign(bluetooth ? kBluetoothOutputLength : std::max<size_t>(outputLength, 48u), 0u);
++            size_t c = 1u;
++            if (bluetooth)
++            {
++                buf[0] = 0x31u;
++                buf[1] = 0x02u;
++                c = 2u;
++            }
++            else
++                buf[0] = 0x02u;
++            buf[c + 0] = 0x03u; // valid_flag0: compatible vibration + haptics select (classic rumble on the actuators)
++            buf[c + 2] = state.weakMotor;   // right
++            buf[c + 3] = state.strongMotor; // left
++            if (state.lightbar || state.releaseLeds)
++            {
++                buf[c + 1] = 0x04u | 0x10u; // valid_flag1: light bar + player indicator
++                if (state.releaseLeds)
++                    buf[c + 1] |= 0x08u; // release the LEDs: the firmware's own glow comes back (our earlier launcher's exit)
++                buf[c + 43] = state.playerLeds;
++                buf[c + 44] = state.releaseLeds ? 0u : state.red;
++                buf[c + 45] = state.releaseLeds ? 0u : state.green;
++                buf[c + 46] = state.releaseLeds ? 0u : state.blue;
++            }
++            if (state.lightbarSetup && state.lightbar)
++            {
++                buf[c + 38] = 0x02u; // valid_flag2: light-bar setup control
++                buf[c + 41] = 0x02u; // light out: fade the start-up glow so the colour shows
++            }
++        }
++        else
++        {
++            // USB report 0x05 (32 bytes); Bluetooth 0x11 with DS4Windows' 0xC0 0xA0 prefix and the CRC32. The flags
++            // byte: 0x01 rumble, 0x02 light bar, 0x04 flash (SDL's choice: our earlier launcher's 0xF7 also claims the audio
++            // volume bits, which would mute a headset on the pad with the zero volumes that follow).
++            buf.assign(bluetooth ? kBluetoothOutputLength : std::max<size_t>(outputLength, 32u), 0u);
++            size_t base = 1u;
++            if (bluetooth)
++            {
++                buf[0] = 0x11u;
++                buf[1] = 0xC0u;
++                buf[2] = 0xA0u;
++                base = 3u;
++            }
++            else
++                buf[0] = 0x05u;
++            buf[base + 0] = state.lightbar ? 0x07u : 0x01u;
++            buf[base + 3] = state.weakMotor;   // right
++            buf[base + 4] = state.strongMotor; // left
++            if (state.lightbar)
++            {
++                buf[base + 5] = state.red;
++                buf[base + 6] = state.green;
++                buf[base + 7] = state.blue;
++            }
++        }
++        if (bluetooth)
++        {
++            const size_t n = buf.size() - 4u;
++            const uint32_t crc = bluetoothCrc(kCrcSeedOutput, buf.data(), n);
++            buf[n + 0] = static_cast<uint8_t>(crc);
++            buf[n + 1] = static_cast<uint8_t>(crc >> 8);
++            buf[n + 2] = static_cast<uint8_t>(crc >> 16);
++            buf[n + 3] = static_cast<uint8_t>(crc >> 24);
++        }
++        return buf;
++    }
++
++    uint8_t fullReportFeatureId(Model model) { return model == Model::DualSense ? 0x05u : 0x02u; }
++
++    Motors decodeActDirect(const uint8_t align[6], const uint8_t data[6])
++    {
++        Motors motors;
++        if (!align || !data)
++            return motors;
++        for (int i = 0; i < 6; ++i)
++        {
++            if (align[i] == 0u)
++                motors.small = motors.small || (data[i] & 0x01u) != 0u; // the small motor reads bit 0 only
++            else if (align[i] == 1u)
++                motors.large = data[i];
++        }
++        return motors;
++    }
++
++    Motors decodeVibParam(const uint8_t *profile, size_t profileBytes, const uint8_t *data, size_t dataBytes)
++    {
++        Motors motors;
++        if (!profile || !data)
++            return motors;
++        size_t bit = 0u;
++        auto take = [&](int count) {
++            uint32_t value = 0u;
++            for (int i = 0; i < count; ++i, ++bit)
++            {
++                const size_t byte = bit / 8u;
++                if (byte < dataBytes && ((data[byte] >> (bit % 8u)) & 1u))
++                    value |= 1u << i;
++            }
++            return value;
++        };
++        for (size_t p = 0; p < profileBytes; ++p)
++        {
++            for (int b = 0; b < 8; ++b)
++            {
++                if (!((profile[p] >> b) & 1u))
++                    continue;
++                const size_t actuator = p * 8u + static_cast<size_t>(b);
++                if (actuator == 0u)
++                    motors.small = take(1) != 0u;
++                else if (actuator == 1u)
++                    motors.large = static_cast<uint8_t>(take(8));
++                else
++                    return motors; // a DualShock 2 has these two; an unknown actuator's width is unknown
++            }
++        }
++        return motors;
++    }
++
++    void applyMotors(const Motors &motors, int percent, OutputState &out)
++    {
++        const int scale = std::clamp(percent, 0, 100);
++        out.weakMotor = static_cast<uint8_t>((motors.small ? 255 : 0) * scale / 100);
++        out.strongMotor = static_cast<uint8_t>(motors.large * scale / 100);
++    }
++
++    void setGuestMotors(int port, const Motors &motors)
++    {
++        if (port < 0 || port >= kGuestPorts)
++            return;
++        const uint32_t packed = packMotors(motors);
++        if (g_guestMotors[port].exchange(packed, std::memory_order_acq_rel) == packed)
++            return;
++        g_guestMotorsGeneration.fetch_add(1u, std::memory_order_acq_rel);
++        host::wake();
++    }
++
++    Motors guestMotors(int port)
++    {
++        if (port < 0 || port >= kGuestPorts)
++            return Motors{};
++        return unpackMotors(g_guestMotors[port].load(std::memory_order_acquire));
++    }
++
++    uint64_t guestMotorsGeneration() { return g_guestMotorsGeneration.load(std::memory_order_acquire); }
++
++    bool gamepadButtonDown(const InputState &state, int raylibButton)
++    {
++        uint32_t mask = 0u;
++        switch (raylibButton)
++        {
++        case GAMEPAD_BUTTON_LEFT_FACE_UP: mask = kUp; break;
++        case GAMEPAD_BUTTON_LEFT_FACE_RIGHT: mask = kRight; break;
++        case GAMEPAD_BUTTON_LEFT_FACE_DOWN: mask = kDown; break;
++        case GAMEPAD_BUTTON_LEFT_FACE_LEFT: mask = kLeft; break;
++        case GAMEPAD_BUTTON_RIGHT_FACE_UP: mask = kTriangle; break;
++        case GAMEPAD_BUTTON_RIGHT_FACE_RIGHT: mask = kCircle; break;
++        case GAMEPAD_BUTTON_RIGHT_FACE_DOWN: mask = kCross; break;
++        case GAMEPAD_BUTTON_RIGHT_FACE_LEFT: mask = kSquare; break;
++        case GAMEPAD_BUTTON_LEFT_TRIGGER_1: mask = kL1; break;
++        case GAMEPAD_BUTTON_LEFT_TRIGGER_2: mask = kL2; break;
++        case GAMEPAD_BUTTON_RIGHT_TRIGGER_1: mask = kR1; break;
++        case GAMEPAD_BUTTON_RIGHT_TRIGGER_2: mask = kR2; break;
++        case GAMEPAD_BUTTON_MIDDLE_LEFT: mask = kCreate; break;
++        case GAMEPAD_BUTTON_MIDDLE: mask = kPs; break;
++        case GAMEPAD_BUTTON_MIDDLE_RIGHT: mask = kOptions; break;
++        case GAMEPAD_BUTTON_LEFT_THUMB: mask = kL3; break;
++        case GAMEPAD_BUTTON_RIGHT_THUMB: mask = kR3; break;
++        default: return false;
++        }
++        return (state.buttons & mask) != 0u;
++    }
++
++    uint8_t gamepadButtonPressure(const InputState &state, int raylibButton)
++    {
++        if (!gamepadButtonDown(state, raylibButton))
++            return 0u;
++        // The digital L2/R2 bits fire a little into the pull; the pressure then follows the trigger.
++        if (raylibButton == GAMEPAD_BUTTON_LEFT_TRIGGER_2)
++            return std::max<uint8_t>(state.l2, 1u);
++        if (raylibButton == GAMEPAD_BUTTON_RIGHT_TRIGGER_2)
++            return std::max<uint8_t>(state.r2, 1u);
++        return 0xFFu;
++    }
++
++    const char *backendName(Backend backend)
++    {
++        switch (backend)
++        {
++        case Backend::Auto: return "auto";
++        case Backend::Glfw: return "glfw";
++        case Backend::Sony: return "sony";
++        }
++        return "auto";
++    }
++
++    std::optional<Backend> parseBackend(const std::string &text)
++    {
++        const std::string value = lower(text);
++        if (value == "auto")
++            return Backend::Auto;
++        if (value == "glfw")
++            return Backend::Glfw;
++        if (value == "sony")
++            return Backend::Sony;
++        return std::nullopt;
++    }
++
++    namespace
++    {
++        std::once_flag g_startOnce;
++        std::atomic<bool> g_started{false};
++        std::mutex g_injectedMutex;
++        std::optional<InputState> g_injected; // tests: a pad without a device
++
++        // The settings (ps2_sony_pad.h), read once.
++        struct Settings
++        {
++            Backend backend = Backend::Auto;
++            int rumble = 100;
++            bool lightbar = true;
++            uint8_t red = 0xDCu, green = 0x16u, blue = 0x16u;
++        };
++
++        const Settings &currentSettings()
++        {
++            static const Settings s = []()
++            {
++                Settings out;
++                if (const char *env = std::getenv("PS2X_GAMEPAD_BACKEND"))
++                    if (const auto backend = parseBackend(env))
++                        out.backend = *backend;
++                if (const char *env = std::getenv("PS2X_SONYPAD_RUMBLE"); env && *env)
++                    out.rumble = std::clamp(std::atoi(env), 0, 100);
++                if (const char *env = std::getenv("PS2X_SONYPAD_LIGHTBAR"); env && *env)
++                {
++                    const std::string value = lower(env);
++                    unsigned rgb = 0u;
++                    if (value == "off")
++                        out.lightbar = false;
++                    else if (value.size() == 6 && std::sscanf(value.c_str(), "%6x", &rgb) == 1)
++                    {
++                        out.red = static_cast<uint8_t>(rgb >> 16);
++                        out.green = static_cast<uint8_t>(rgb >> 8);
++                        out.blue = static_cast<uint8_t>(rgb);
++                    }
++                }
++                return out;
++            }();
++            return s;
++        }
++
++        void startOnce()
++        {
++            const Settings &settings = currentSettings();
++            const bool trace = environmentOn("PS2X_SONYPAD_TRACE");
++            if (settings.backend == Backend::Glfw)
++            {
++                std::cerr << "[sonypad] native DualSense / DualShock 4 support off (PS2X_GAMEPAD_BACKEND=glfw)" << std::endl;
++                return;
++            }
++            // A hidden window is an unattended run: never take the user's controller (light bar, rumble).
++            if (environmentOn("PS2X_WINDOW_HIDDEN"))
++            {
++                if (trace)
++                    std::cerr << "[sonypad] off: the window is hidden (PS2X_WINDOW_HIDDEN)" << std::endl;
++                return;
++            }
++            if (!host::available())
++            {
++                if (trace || settings.backend == Backend::Sony)
++                    std::cerr << "[sonypad] no native controller support on this platform: GLFW gamepads only" << std::endl;
++                return;
++            }
++            host::Config config;
++            config.rumblePercent = settings.rumble;
++            config.lightbar = settings.lightbar;
++            config.red = settings.red;
++            config.green = settings.green;
++            config.blue = settings.blue;
++            config.trace = trace;
++            host::start(config);
++            g_started.store(true, std::memory_order_release);
++        }
++    }
++
++    bool readHostPad(InputState &out)
++    {
++        {
++            std::lock_guard<std::mutex> lock(g_injectedMutex);
++            if (g_injected)
++            {
++                out = *g_injected;
++                return true;
++            }
++        }
++        // Only a game with its window open takes the controller (never a test, never before the window exists).
++        if (!g_started.load(std::memory_order_acquire) && !IsWindowReady())
++            return false;
++        std::call_once(g_startOnce, startOnce);
++        return g_started.load(std::memory_order_acquire) && host::latest(out);
++    }
++
++    void injectPadForTests(const InputState *state)
++    {
++        std::lock_guard<std::mutex> lock(g_injectedMutex);
++        if (state)
++            g_injected = *state;
++        else
++            g_injected.reset();
++    }
++
++    bool glfwGamepadsAllowed()
++    {
++        return currentSettings().backend != Backend::Sony;
++    }
++
++    void shutdown()
++    {
++        if (g_started.load(std::memory_order_acquire))
++            host::stop();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+new file mode 100644
+index 0000000..735d0ed
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_sony_pad_host.cpp
+@@ -0,0 +1,666 @@
++// Native Sony controllers (ps2_sony_pad.h), the device half: Windows HID (SetupAPI + hid.dll) on a thread of its own.
++// It finds a DualSense / DualShock 4 (USB first, then Bluetooth), switches a Bluetooth pad to its full report, reads
++// input reports with overlapped I/O, and writes the light bar and the game's vibration on the same handle. The game
++// thread only copies the latest report and posts motor values. A pad that disconnects or goes silent is dropped (the
++// pad backend falls back to GLFW) and looked for again every two seconds. Other platforms: no device half.
++#include "runtime/ps2_sony_pad.h"
++
++#if defined(_WIN32)
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h> // this file never includes raylib, whose names clash with it
++#include <setupapi.h>
++#include <hidsdi.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cwctype>
++#include <iostream>
++#include <map>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace ps2x::sonypad::host
++{
++    namespace
++    {
++        constexpr DWORD kScanIntervalMs = 2000;    // no pad: look again this often
++        constexpr DWORD kWaitSliceMs = 50;          // the session loop's longest wait
++        constexpr int64_t kStaleMs = 1500;          // no report for this long: the pad no longer drives the game
++        constexpr int64_t kDeadMs = 5000;           // ... and for this long: close it and look again
++        constexpr int64_t kFirstReportMs = 3000;    // a freshly opened interface that never reports is skipped
++        constexpr int64_t kSilentHoldMs = 10000;    // ... for this long
++        constexpr int64_t kRumbleKeepAliveMs = 100; // motors on: write again this often (our earlier launcher: 80 ms)
++        constexpr int64_t kIdleKeepAliveMs = 2000;  // motors off: re-assert the light bar this often
++        constexpr DWORD kWriteTimeoutMs = 250;
++        constexpr int kTraceReports = 12;           // raw reports traced in full after a connect
++        constexpr int kTraceChanges = 200;          // parsed state changes traced per connection
++        constexpr int kCrcFailuresBeforeBypass = 32;
++        constexpr size_t kMaxReportBytes = 4096;
++
++        int64_t nowMs()
++        {
++            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        }
++
++        void logLine(const std::string &line)
++        {
++            std::cerr << line << std::endl;
++        }
++
++        std::string hex(const uint8_t *data, size_t length, size_t max = 80)
++        {
++            std::string out;
++            char byte[4];
++            for (size_t i = 0; i < length && i < max; ++i)
++            {
++                std::snprintf(byte, sizeof(byte), "%02x", data[i]);
++                if (i)
++                    out += ' ';
++                out += byte;
++            }
++            if (length > max)
++                out += " ...";
++            return out;
++        }
++
++        std::string narrow(const std::wstring &text)
++        {
++            std::string out;
++            for (wchar_t c : text)
++                out += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
++            return out;
++        }
++
++        std::string describeState(const InputState &s)
++        {
++            char line[200];
++            std::snprintf(line, sizeof(line), "buttons=%05x lx=%u ly=%u rx=%u ry=%u l2=%u r2=%u battery=%d%s%s",
++                          static_cast<unsigned>(s.buttons), s.lx, s.ly, s.rx, s.ry, s.l2, s.r2, s.battery,
++                          s.charging ? " charging" : "", s.fullReport ? "" : " (basic report)");
++            return line;
++        }
++
++        struct Device
++        {
++            std::wstring path;
++            Model model = Model::DualSense;
++            uint16_t productId = 0;
++            Link link = Link::Usb;
++            uint16_t inputLength = 0, outputLength = 0, featureLength = 0;
++            uint16_t usagePage = 0, usage = 0;
++        };
++
++        std::string describeDevice(const Device &d)
++        {
++            char line[200];
++            std::snprintf(line, sizeof(line), "%s (054c:%04x) over %s: input %u, output %u, feature %u bytes, usage %04x:%04x",
++                          modelName(d.model), d.productId, linkName(d.link), d.inputLength, d.outputLength, d.featureLength,
++                          d.usagePage, d.usage);
++            return line;
++        }
++
++        // Every present HID interface with Sony's vendor id and a known product id. Opens each candidate without access
++        // (attributes and capabilities only), so it never disturbs a pad someone else is reading.
++        std::vector<Device> enumerateSonyPads(size_t &interfaces)
++        {
++            std::vector<Device> devices;
++            interfaces = 0u;
++            GUID hidGuid;
++            HidD_GetHidGuid(&hidGuid);
++            HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++            if (set == INVALID_HANDLE_VALUE)
++                return devices;
++            SP_DEVICE_INTERFACE_DATA iface{};
++            iface.cbSize = sizeof(iface);
++            for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, nullptr, &hidGuid, i, &iface); ++i)
++            {
++                ++interfaces;
++                DWORD needed = 0;
++                SetupDiGetDeviceInterfaceDetailW(set, &iface, nullptr, 0, &needed, nullptr);
++                if (needed < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) || needed > 64u * 1024u)
++                    continue;
++                std::vector<uint8_t> storage(needed + sizeof(wchar_t), 0u);
++                auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(storage.data());
++                detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
++                if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, needed, nullptr, nullptr))
++                    continue;
++                const std::wstring path(detail->DevicePath);
++                std::wstring lowered = path;
++                std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
++                // Sony's vendor id is in the path (USB "vid_054c", Bluetooth "vid&0002054c"): skip the others unopened.
++                if (lowered.find(L"054c") == std::wstring::npos)
++                    continue;
++                HANDLE h = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
++                if (h == INVALID_HANDLE_VALUE)
++                    continue;
++                HIDD_ATTRIBUTES attributes{};
++                attributes.Size = sizeof(attributes);
++                std::optional<Model> model;
++                if (HidD_GetAttributes(h, &attributes))
++                    model = modelFromIds(attributes.VendorID, attributes.ProductID);
++                Device device;
++                if (model)
++                {
++                    PHIDP_PREPARSED_DATA preparsed = nullptr;
++                    if (HidD_GetPreparsedData(h, &preparsed) && preparsed)
++                    {
++                        HIDP_CAPS caps{};
++                        if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS)
++                        {
++                            device.inputLength = caps.InputReportByteLength;
++                            device.outputLength = caps.OutputReportByteLength;
++                            device.featureLength = caps.FeatureReportByteLength;
++                            device.usagePage = caps.UsagePage;
++                            device.usage = caps.Usage;
++                        }
++                        HidD_FreePreparsedData(preparsed);
++                    }
++                }
++                CloseHandle(h);
++                if (!model || device.inputLength == 0u)
++                    continue;
++                device.path = path;
++                device.model = *model;
++                device.productId = attributes.ProductID;
++                // A Bluetooth collection declares the 78-byte full report (or longer); USB ones 64 (our earlier launcher's test).
++                device.link = device.inputLength >= kBluetoothInputLength ? Link::Bluetooth : Link::Usb;
++                devices.push_back(std::move(device));
++            }
++            SetupDiDestroyDeviceInfoList(set);
++            // Wired first: lower latency, and a pad charging on a cable while paired shows up on both.
++            std::stable_sort(devices.begin(), devices.end(), [](const Device &a, const Device &b) {
++                return a.link == Link::Usb && b.link == Link::Bluetooth;
++            });
++            return devices;
++        }
++
++        // Switches a Bluetooth pad from its basic to its full report: reading the calibration feature report does it
++        // (DualSense 0x05, DualShock 4 0x02). A handle of its own, synchronous (hid.dll's calls want one).
++        bool readFullReportFeature(const Device &device, DWORD &error)
++        {
++            error = 0;
++            HANDLE h = CreateFileW(device.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                                   OPEN_EXISTING, 0, nullptr);
++            if (h == INVALID_HANDLE_VALUE)
++            {
++                error = GetLastError();
++                return false;
++            }
++            std::vector<uint8_t> feature(std::clamp<size_t>(device.featureLength, 64u, kMaxReportBytes), 0u);
++            feature[0] = fullReportFeatureId(device.model);
++            const bool ok = HidD_GetFeature(h, feature.data(), static_cast<ULONG>(feature.size())) != FALSE;
++            if (!ok)
++                error = GetLastError();
++            CloseHandle(h);
++            return ok;
++        }
++
++        class Host
++        {
++        public:
++            void start(const Config &config)
++            {
++                std::lock_guard<std::mutex> lock(m_lifecycle);
++                if (m_started)
++                    return;
++                m_started = true;
++                m_config = config;
++                m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++                m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++                m_doneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++                if (!m_stopEvent || !m_wakeEvent || !m_doneEvent)
++                {
++                    logLine("[sonypad] cannot create the thread's events: native controller support off");
++                    return;
++                }
++                char colour[8] = "off";
++                if (m_config.lightbar)
++                    std::snprintf(colour, sizeof(colour), "%02X%02X%02X", m_config.red, m_config.green, m_config.blue);
++                logLine("[sonypad] looking for a DualSense / DualShock 4 (rumble " + std::to_string(m_config.rumblePercent) +
++                        "%, light bar " + colour + (m_config.trace ? ", trace on" : "") + ")");
++                m_thread = std::thread([this]() { run(); });
++            }
++
++            bool latest(InputState &out)
++            {
++                std::lock_guard<std::mutex> lock(m_stateMutex);
++                if (!m_live)
++                    return false;
++                out = m_state;
++                return true;
++            }
++
++            void wake()
++            {
++                if (m_wakeEvent)
++                    SetEvent(m_wakeEvent);
++            }
++
++            void stop()
++            {
++                std::lock_guard<std::mutex> lock(m_lifecycle);
++                if (!m_started || !m_thread.joinable())
++                    return;
++                SetEvent(m_stopEvent);
++                // The thread ends within a wait slice plus the closing write; a device stuck in the driver must not
++                // hold the game's exit, so after a second it is left behind (the process is ending).
++                if (WaitForSingleObject(m_doneEvent, 1000) == WAIT_OBJECT_0)
++                    m_thread.join();
++                else
++                {
++                    logLine("[sonypad] the controller thread did not stop within a second: leaving it");
++                    m_thread.detach();
++                }
++            }
++
++        private:
++            bool stopping() const { return WaitForSingleObject(m_stopEvent, 0) == WAIT_OBJECT_0; }
++
++            void publish(const InputState &state)
++            {
++                std::lock_guard<std::mutex> lock(m_stateMutex);
++                m_state = state;
++                m_live = true;
++            }
++
++            void setLive(bool live)
++            {
++                std::lock_guard<std::mutex> lock(m_stateMutex);
++                m_live = live;
++            }
++
++            void nameThread()
++            {
++                using SetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PCWSTR);
++                if (HMODULE kernel = GetModuleHandleW(L"kernel32.dll"))
++                    if (auto fn = reinterpret_cast<SetThreadDescriptionFn>(reinterpret_cast<void *>(GetProcAddress(kernel, "SetThreadDescription"))))
++                        fn(GetCurrentThread(), L"SonyPadHid");
++            }
++
++            void run()
++            {
++                nameThread();
++                size_t lastPadCount = static_cast<size_t>(-1);
++                while (!stopping())
++                {
++                    size_t interfaces = 0u;
++                    std::vector<Device> devices = enumerateSonyPads(interfaces);
++                    if (m_config.trace && devices.size() != lastPadCount)
++                    {
++                        logLine("[sonypad] scan: " + std::to_string(interfaces) + " HID interface(s), " +
++                                std::to_string(devices.size()) + " Sony pad interface(s)");
++                        for (const Device &d : devices)
++                            logLine("[sonypad]   " + describeDevice(d) + " path=" + narrow(d.path));
++                    }
++                    lastPadCount = devices.size();
++                    const int64_t now = nowMs();
++                    const Device *chosen = nullptr;
++                    for (const Device &d : devices)
++                    {
++                        auto silent = m_silentUntil.find(d.path);
++                        if (silent != m_silentUntil.end() && silent->second > now)
++                            continue;
++                        chosen = &d;
++                        break;
++                    }
++                    if (chosen)
++                    {
++                        const Device device = *chosen;
++                        if (!session(device))
++                            m_silentUntil[device.path] = nowMs() + kSilentHoldMs;
++                        lastPadCount = static_cast<size_t>(-1); // report the next scan
++                        if (stopping())
++                            break;
++                    }
++                    WaitForSingleObject(m_stopEvent, chosen ? 500 : kScanIntervalMs);
++                }
++                setLive(false);
++                SetEvent(m_doneEvent);
++            }
++
++            // Writes one output report. Windows' rule for the length varies with the driver: our earlier launcher's exact report
++            // size works for the DualSense; hidapi pads to the collection's longest output report. The exact size is
++            // tried first, the padded one when that is refused, and whichever works is kept.
++            bool write(HANDLE h, const Device &device, std::vector<uint8_t> report, DWORD &error)
++            {
++                error = 0;
++                for (int attempt = 0; attempt < 2; ++attempt)
++                {
++                    std::vector<uint8_t> buffer = report;
++                    if (m_padWrites && buffer.size() < device.outputLength)
++                        buffer.resize(device.outputLength, 0u);
++                    OVERLAPPED overlapped{};
++                    overlapped.hEvent = m_writeEvent;
++                    ResetEvent(m_writeEvent);
++                    DWORD written = 0;
++                    BOOL ok = WriteFile(h, buffer.data(), static_cast<DWORD>(buffer.size()), &written, &overlapped);
++                    if (!ok && GetLastError() == ERROR_IO_PENDING)
++                    {
++                        if (WaitForSingleObject(m_writeEvent, kWriteTimeoutMs) != WAIT_OBJECT_0)
++                        {
++                            CancelIoEx(h, &overlapped);
++                            GetOverlappedResult(h, &overlapped, &written, TRUE);
++                            error = WAIT_TIMEOUT;
++                            return false;
++                        }
++                        ok = GetOverlappedResult(h, &overlapped, &written, FALSE);
++                    }
++                    if (ok)
++                        return true;
++                    error = GetLastError();
++                    const bool lengthRefused = error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_USER_BUFFER ||
++                                               error == ERROR_INSUFFICIENT_BUFFER;
++                    if (!lengthRefused || attempt == 1 || device.outputLength <= report.size())
++                        return false;
++                    m_padWrites = !m_padWrites;
++                    if (m_config.trace)
++                        logLine(std::string("[sonypad] write refused (error ") + std::to_string(error) + "): trying " +
++                                (m_padWrites ? "the collection's padded length" : "the exact report length"));
++                }
++                return false;
++            }
++
++            OutputState outputState(bool setup, bool release) const
++            {
++                OutputState out;
++                out.lightbar = m_config.lightbar;
++                out.red = m_config.red;
++                out.green = m_config.green;
++                out.blue = m_config.blue;
++                out.lightbarSetup = setup;
++                out.releaseLeds = release && m_config.lightbar;
++                if (setup)
++                    out.red = out.green = out.blue = 0u; // our earlier launcher's takeover: dark, the colour follows in the next write
++                if (!release)
++                    applyMotors(guestMotors(0), m_config.rumblePercent, out);
++                return out;
++            }
++
++            // One connection: true when the pad delivered input (false: it never reported, try another interface).
++            bool session(const Device &device)
++            {
++                bool canWrite = true;
++                HANDLE h = CreateFileW(device.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                       nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
++                if (h == INVALID_HANDLE_VALUE)
++                {
++                    canWrite = false;
++                    h = CreateFileW(device.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
++                                    FILE_FLAG_OVERLAPPED, nullptr);
++                }
++                if (h == INVALID_HANDLE_VALUE)
++                {
++                    logLine("[sonypad] cannot open the " + std::string(modelName(device.model)) + " (error " +
++                            std::to_string(GetLastError()) + "): another program may hold it");
++                    return false;
++                }
++                HidD_SetNumInputBuffers(h, 4); // a late read sees the newest reports, not a backlog
++                if (device.link == Link::Bluetooth)
++                {
++                    DWORD error = 0;
++                    const bool ok = readFullReportFeature(device, error);
++                    if (m_config.trace)
++                        logLine(std::string("[sonypad] full-report switch (feature 0x") +
++                                (device.model == Model::DualSense ? "05" : "02") + "): " +
++                                (ok ? "ok" : "failed, error " + std::to_string(error)));
++                }
++                HANDLE readEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++                m_writeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++                m_padWrites = false;
++                std::vector<uint8_t> buffer(std::clamp<size_t>(device.inputLength, 64u, kMaxReportBytes), 0u);
++                OVERLAPPED overlapped{};
++                overlapped.hEvent = readEvent;
++                bool pending = false;
++                bool reported = false;
++                bool announced = false;
++                bool crcCheck = true;
++                int crcFailuresInRow = 0;
++                int tracedReports = 0, tracedChanges = 0;
++                uint64_t reports = 0, badCrc = 0, ignored = 0, tooShort = 0, writes = 0, writeFailures = 0;
++                InputState last;
++                const int64_t opened = nowMs();
++                int64_t lastReport = opened, lastWrite = 0, lastSummary = opened;
++                uint64_t writtenGeneration = guestMotorsGeneration() - 1u; // forces the first state write
++                bool writesOn = canWrite;
++                bool setupPending = canWrite && m_config.lightbar && device.model == Model::DualSense;
++                std::string endReason = "stopping";
++
++                if (!canWrite)
++                    logLine("[sonypad] the " + std::string(modelName(device.model)) +
++                            " opened read-only: input works, rumble and light bar do not");
++
++                auto handleReport = [&](DWORD length) {
++                    lastReport = nowMs();
++                    InputState state;
++                    const ParseResult result = parseInputReport(device.model, device.link, buffer.data(), length, state, crcCheck);
++                    if (m_config.trace && tracedReports < kTraceReports)
++                    {
++                        ++tracedReports;
++                        logLine("[sonypad] report " + std::to_string(length) + " bytes: " + hex(buffer.data(), length) + " -> " +
++                                parseResultName(result) + (result == ParseResult::Input ? " " + describeState(state) : std::string()));
++                    }
++                    switch (result)
++                    {
++                    case ParseResult::Input:
++                        crcFailuresInRow = 0;
++                        ++reports;
++                        reported = true;
++                        if (!announced)
++                        {
++                            announced = true;
++                            logLine("[sonypad] " + std::string(modelName(device.model)) + " connected over " +
++                                    linkName(device.link) + ": it drives the PS2 pad natively" +
++                                    (writesOn ? " (rumble and light bar too)" : ""));
++                        }
++                        if (m_config.trace && tracedChanges < kTraceChanges &&
++                            (state.buttons != last.buttons || std::abs(state.lx - last.lx) > 24 || std::abs(state.ly - last.ly) > 24 ||
++                             std::abs(state.rx - last.rx) > 24 || std::abs(state.ry - last.ry) > 24 || std::abs(state.l2 - last.l2) > 24 ||
++                             std::abs(state.r2 - last.r2) > 24))
++                        {
++                            ++tracedChanges;
++                            logLine("[sonypad] input " + describeState(state));
++                            last = state;
++                        }
++                        publish(state);
++                        break;
++                    case ParseResult::BadCrc:
++                        ++badCrc;
++                        if (++crcFailuresInRow >= kCrcFailuresBeforeBypass && crcCheck)
++                        {
++                            crcCheck = false;
++                            logLine("[sonypad] " + std::to_string(kCrcFailuresBeforeBypass) +
++                                    " Bluetooth reports in a row fail the CRC32 check: reading them without it");
++                        }
++                        break;
++                    case ParseResult::TooShort:
++                        ++tooShort;
++                        break;
++                    case ParseResult::Ignored:
++                        ++ignored;
++                        break;
++                    }
++                };
++
++                while (!stopping())
++                {
++                    if (!pending)
++                    {
++                        ResetEvent(readEvent);
++                        DWORD length = 0;
++                        if (ReadFile(h, buffer.data(), static_cast<DWORD>(buffer.size()), &length, &overlapped))
++                            handleReport(length);
++                        else if (GetLastError() == ERROR_IO_PENDING)
++                            pending = true;
++                        else
++                        {
++                            endReason = "read error " + std::to_string(GetLastError());
++                            break;
++                        }
++                    }
++                    if (pending)
++                    {
++                        HANDLE waits[3] = {readEvent, m_wakeEvent, m_stopEvent};
++                        const DWORD signalled = WaitForMultipleObjects(3, waits, FALSE, kWaitSliceMs);
++                        if (signalled == WAIT_OBJECT_0)
++                        {
++                            DWORD length = 0;
++                            if (GetOverlappedResult(h, &overlapped, &length, FALSE))
++                            {
++                                pending = false;
++                                handleReport(length);
++                            }
++                            else if (GetLastError() != ERROR_IO_INCOMPLETE)
++                            {
++                                pending = false;
++                                endReason = "read error " + std::to_string(GetLastError());
++                                break;
++                            }
++                        }
++                    }
++
++                    const int64_t now = nowMs();
++                    // Output: the light-bar takeover once, then the state on every motor change and as a keep-alive.
++                    if (writesOn)
++                    {
++                        const uint64_t generation = guestMotorsGeneration();
++                        const OutputState out = outputState(false, false);
++                        const bool rumbling = out.weakMotor != 0u || out.strongMotor != 0u;
++                        const bool due = generation != writtenGeneration ||
++                                         now - lastWrite >= (rumbling ? kRumbleKeepAliveMs : kIdleKeepAliveMs);
++                        if (setupPending || due)
++                        {
++                            const bool setup = setupPending;
++                            std::vector<uint8_t> report =
++                                buildOutputReport(device.model, device.link, setup ? outputState(true, false) : out, device.outputLength);
++                            DWORD error = 0;
++                            const bool ok = write(h, device, report, error);
++                            ++writes;
++                            lastWrite = now;
++                            if (setup)
++                                setupPending = false;
++                            else
++                                writtenGeneration = generation;
++                            if (m_config.trace && (writes <= 4 || (!setup && generation != m_tracedGeneration)))
++                            {
++                                const Motors motors = guestMotors(0);
++                                char line[160];
++                                std::snprintf(line, sizeof(line), "%s small=%s large=%u -> weak=%u strong=%u: %s",
++                                              setup ? "light-bar takeover" : "state", motors.small ? "on" : "off", motors.large,
++                                              out.weakMotor, out.strongMotor, ok ? "ok" : ("error " + std::to_string(error)).c_str());
++                                logLine("[sonypad] write " + std::to_string(report.size()) + " bytes (" + line + "): " +
++                                        hex(report.data(), report.size(), 16));
++                                if (!setup)
++                                    m_tracedGeneration = generation;
++                            }
++                            if (!ok && ++writeFailures >= 8 && writes == writeFailures)
++                            {
++                                writesOn = false;
++                                logLine("[sonypad] the " + std::string(modelName(device.model)) + " refuses output reports (error " +
++                                        std::to_string(error) + "): no rumble or light bar on this connection");
++                            }
++                        }
++                    }
++
++                    // A pad streams reports all the time; silence means it is gone (or another program switched it).
++                    if (reported && now - lastReport > kStaleMs)
++                        setLive(false);
++                    if (!reported && now - opened > kFirstReportMs)
++                    {
++                        endReason = "no input report within " + std::to_string(kFirstReportMs / 1000) + " s";
++                        break;
++                    }
++                    if (reported && now - lastReport > kDeadMs)
++                    {
++                        endReason = "no input report for " + std::to_string(kDeadMs / 1000) + " s";
++                        break;
++                    }
++                    if (m_config.trace && now - lastSummary >= 5000)
++                    {
++                        lastSummary = now;
++                        logLine("[sonypad] last 5 s: " + std::to_string(reports) + " input, " + std::to_string(ignored) +
++                                " other, " + std::to_string(badCrc) + " bad CRC, " + std::to_string(tooShort) + " short report(s); " +
++                                std::to_string(writes) + " write(s), " + std::to_string(writeFailures) + " failed");
++                        reports = ignored = badCrc = tooShort = 0;
++                    }
++                }
++
++                const bool closing = stopping();
++                if (pending)
++                {
++                    DWORD length = 0;
++                    CancelIoEx(h, &overlapped);
++                    GetOverlappedResult(h, &overlapped, &length, TRUE);
++                }
++                if (closing && writesOn)
++                {
++                    // The game is closing: motors off, the LEDs back to the firmware (our earlier launcher's exit).
++                    DWORD error = 0;
++                    write(h, device, buildOutputReport(device.model, device.link, outputState(false, true), device.outputLength), error);
++                }
++                setLive(false);
++                CloseHandle(h);
++                CloseHandle(readEvent);
++                CloseHandle(m_writeEvent);
++                m_writeEvent = nullptr;
++                if (announced && !closing)
++                    logLine("[sonypad] " + std::string(modelName(device.model)) + " disconnected (" + endReason +
++                            "): GLFW gamepad input until it is back");
++                else if (!announced && m_config.trace)
++                    logLine("[sonypad] " + describeDevice(device) + ": " + endReason);
++                return reported || closing;
++            }
++
++            std::mutex m_lifecycle;
++            bool m_started = false;
++            Config m_config;
++            std::thread m_thread;
++            HANDLE m_stopEvent = nullptr;
++            HANDLE m_wakeEvent = nullptr;
++            HANDLE m_doneEvent = nullptr;
++            HANDLE m_writeEvent = nullptr;
++            bool m_padWrites = false;
++            uint64_t m_tracedGeneration = 0;
++            std::map<std::wstring, int64_t> m_silentUntil;
++            std::mutex m_stateMutex;
++            InputState m_state;
++            bool m_live = false;
++        };
++
++        Host &instance()
++        {
++            static Host *host = new Host(); // never destroyed: main() leaves with _Exit, and a detached thread may use it
++            return *host;
++        }
++    }
++
++    bool available() { return true; }
++    void start(const Config &config) { instance().start(config); }
++    bool latest(InputState &out) { return instance().latest(out); }
++    void wake() { instance().wake(); }
++    void stop() { instance().stop(); }
++}
++
++#else
++
++namespace ps2x::sonypad::host
++{
++    bool available() { return false; }
++    void start(const Config &) {}
++    bool latest(InputState &) { return false; }
++    void wake() {}
++    void stop() {}
++}
++
++#endif

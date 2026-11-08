@@ -1,0 +1,614 @@
+Subject: [PATCH] Guest RAM 256 MB (N7 step 1): the most the EE's address map allows, the 32 MB layout
+ kept behind PS2X_GUEST_RAM_MB=32
+
+Main RAM is 256 MB (PS2_RAM_SIZE): the I/O space starts at 0x10000000, the uncached-accelerated mirror at
+0x30000000 needs bit 28 free and DMA tags address 28 bits, so 256 MB is the ceiling. The generated code's inline
+RAM path derives from PS2_RAM_SIZE, so every generated file recompiles (none is regenerated).
+
+How much of it a game gets is the guest layout's (PS2Runtime::guestLayout, read once from PS2X_GUEST_RAM_MB):
+- 32: the PS2's layout as before - the heap up to 0x01FA8000, the port's added data from there to the main
+  thread's stack at 0x01FE0000, GetMemorySize 32 MB.
+- anything else (the default): 256 MB - the heap's first block up to the main thread's stack (0x01FE0000, as on
+  hardware), a second block from 0x02000000 to the port's added data (its 1 MB at the top of RAM),
+  GetMemorySize 256 MB. A game that probes malloc for its largest block gets the second one.
+
+ps2xRuntime:
+- ps2_memory.h: PS2_RAM_SIZE 256 MB.
+- ps2_runtime.h/.cpp: GuestLayout + guestLayout(); the heap's hard limit from it (was the 0x01FA8000 constant);
+  resetGuestHeapLocked adds the second block; guestHeapLargestFree() (a game-side probe override's answer);
+  the initial stack pointer where the 32 MB ended (0x02000000 - 16), not the top of the larger RAM.
+- Kernel/Syscalls/System.cpp: SetupHeap/EndOfHeap's default end = the layout's first block; GetMemorySize = the
+  layout's RAM; SetupThread's "top of RAM" stack (stack -1) at 0x02000000.
+- ps2_savestate.cpp/.h: the layout's RAM size is part of the state's layout check; a state made with another RAM
+  size is refused saying so (they need making again). load() says whether a failure came before anything was
+  overwritten (`untouched`: a missing or unreadable file, another build's or RAM size's state). Main RAM is stored
+  by 4 KB pages: runs of all-zero pages and of pages filled with one word as a count, the rest raw - most of the
+  256 MB is never written, so a state is about the size of the 32 MB ones, and quicker to save and load. A state
+  with the whole RAM as one blob (made before) still loads; PS2X_STATE_RAW=1 writes that form (an A/B). The save
+  and load times (and the saved size) in the [state] lines.
+- Kernel/EeScheduler.cpp, runtime/ee_scheduler.h: such a refused load no longer stops the runtime - the game runs on
+  as it was (an in-game load, F9) or boots fresh (a load at start-up, PS2X_LOAD_STATE); the refusal is counted
+  (refusedStateLoadCount) with its file and reason (lastRefusedStateLoad). A failure after the first section was
+  applied still stops it (the machine is half restored).
+- ps2_runtime.cpp: the refusal across the bottom of the window for 10 s ("Save state not loaded - <file>: <reason>"),
+  drawn as the FPS counter is, whichever overlay is on; a "[state] on screen" line in the log when it is.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 4ddc07c6..98f9f82a 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -23,8 +23,11 @@
+ 
+ class GS;
+ 
+-constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
+-constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
++// (N7) 256 MB: the most the EE's address map allows (the I/O space at 0x10000000; the uncached-accelerated
++// mirror 0x30000000 needs bit 28 free; DMA tags reach 28 bits). How much of it a game gets is the guest
++// layout's (PS2Runtime::guestLayout: PS2X_GUEST_RAM_MB=32 gives the PS2's 32 MB layout with the same build).
++constexpr uint32_t PS2_RAM_SIZE = 256u * 1024u * 1024u; // 256MB
++constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for the RAM size's alignment
+ constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+ constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
+ constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 62152c90..c22971e6 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -445,6 +445,23 @@ public:
+     uint32_t guestHeapBase() const;
+     uint32_t guestHeapEnd() const;
+     uint32_t guestHeapLimit() const;
++    // (N7) The guest's memory layout, from PS2X_GUEST_RAM_MB (read once): 32 = the PS2's 32 MB as before (the heap
++    // up to 0x01FA8000, the port's added data from there to the main thread's stack at 0x01FE0000); anything else
++    // (the default) = 256 MB - the heap's first block up to that stack (as on hardware), a second from 0x02000000
++    // to the added data, and the added data's 1 MB at the top of RAM. A game that probes malloc for the largest
++    // block gets the second one.
++    struct GuestLayout
++    {
++        uint32_t ramMb;          // 32 or 256
++        uint32_t lowHeapLimit;   // the first block's end
++        uint32_t highHeapBase;   // the second block (0: none)
++        uint32_t highHeapLimit;
++        uint32_t addedDataBegin; // the port's added data (guest_code)
++        uint32_t addedDataEnd;
++    };
++    static const GuestLayout &guestLayout();
++    // The largest free block of the guest heap (what a malloc of that size or less finds).
++    uint32_t guestHeapLargestFree() const;
+     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c2d54c5d..6d96ec29 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -156,10 +156,12 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+-    // A game's heap runs up to 0x1FA8000: on hardware it reaches its stack (the SDK puts the main
+-    // thread's 128 KB stack at the top of RAM, 0x1FE0000); the 224 KB in between is for a port's
+-    // added data (Transformers' mods). The kernel's pools are in kernel RAM (State.h).
+-    constexpr uint32_t kGuestHeapHardLimit = 0x01FA8000u;
++    // A game's heap: its first block runs up to the layout's lowHeapLimit (PS2Runtime::guestLayout). At 32 MB that
++    // is 0x1FA8000: on hardware it reaches its stack (the SDK puts the main thread's 128 KB stack at the top of
++    // RAM, 0x1FE0000); the 224 KB in between is for a port's added data (Transformers' mods). At 256 MB (N7) the
++    // added data is at the top of RAM, so the first block reaches the stack as on hardware, and a second one
++    // runs from 0x02000000 to the added data. The kernel's pools are in kernel RAM (State.h).
++    uint32_t guestHeapHardLimit() { return PS2Runtime::guestLayout().lowHeapLimit; }
+     // Stacks for asynchronous guest callbacks (SIF command handlers, interrupt
+     // handlers). On hardware these run on the kernel's stack, in kernel RAM
+     // below 0x80000 that games never use. Carving them from the top of RAM put
+@@ -729,7 +731,7 @@ PS2Runtime::PS2Runtime()
+     m_guestHeapBlocks.clear();
+     m_guestHeapBase = kGuestHeapDefaultBase;
+     m_guestHeapEnd = kGuestHeapDefaultBase;
+-    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    m_guestHeapLimit = std::min(guestHeapHardLimit(), PS2_RAM_SIZE);
+     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+     m_guestHeapConfigured = false;
+     m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+@@ -1460,7 +1462,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+         if (!m_guestHeapConfigured)
+         {
+-            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++            const uint32_t hardLimit = std::min(guestHeapHardLimit(), PS2_RAM_SIZE);
+             m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+             m_guestHeapBase = m_guestHeapSuggestedBase;
+             m_guestHeapEnd = m_guestHeapSuggestedBase;
+@@ -2521,13 +2523,13 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
+     {
+         normalized &= PS2_RAM_MASK;
+     }
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    const uint32_t hardLimit = std::min(guestHeapHardLimit(), PS2_RAM_SIZE);
+     return std::min(normalized, hardLimit);
+ }
+ 
+ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ {
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    const uint32_t hardLimit = std::min(guestHeapHardLimit(), PS2_RAM_SIZE);
+     if (guestLimit == 0u || guestLimit > hardLimit)
+     {
+         return hardLimit;
+@@ -2562,6 +2564,13 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+     {
+         m_guestHeapBlocks.push_back({base, limit - base, true});
+     }
++    // (N7) The layout's second block, above the main thread's stack (none at 32 MB). Its own free block: the
++    // allocator never joins it with the first (they are not adjacent), and a malloc too large for the first finds it.
++    const GuestLayout &layout = guestLayout();
++    if (layout.highHeapBase != 0u && layout.highHeapLimit > layout.highHeapBase && layout.highHeapBase >= limit)
++    {
++        m_guestHeapBlocks.push_back({layout.highHeapBase, layout.highHeapLimit - layout.highHeapBase, true});
++    }
+ 
+     m_guestHeapBase = base;
+     m_guestHeapEnd = base;
+@@ -2569,6 +2578,32 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+     m_guestHeapConfigured = true;
+ }
+ 
++const PS2Runtime::GuestLayout &PS2Runtime::guestLayout()
++{
++    static const GuestLayout layout = []()
++    {
++        const char *env = std::getenv("PS2X_GUEST_RAM_MB");
++        if (env && std::atoi(env) == 32)
++            return GuestLayout{32u, 0x01FA8000u, 0u, 0u, 0x01FA8000u, 0x01FE0000u};
++        // (the main thread's stack at 0x01FE0000-0x02000000, where the game's crt0 puts it; the added data's 1 MB
++        // at the top of RAM)
++        constexpr uint32_t kAddedData = 0x00100000u;
++        return GuestLayout{PS2_RAM_SIZE >> 20, 0x01FE0000u, 0x02000000u, PS2_RAM_SIZE - kAddedData, PS2_RAM_SIZE - kAddedData,
++                           PS2_RAM_SIZE};
++    }();
++    return layout;
++}
++
++uint32_t PS2Runtime::guestHeapLargestFree() const
++{
++    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
++    uint32_t largest = 0u;
++    for (const GuestHeapBlock &block : m_guestHeapBlocks)
++        if (block.free)
++            largest = std::max(largest, block.size);
++    return largest;
++}
++
+ void PS2Runtime::ensureGuestHeapInitializedLocked()
+ {
+     if (m_guestHeapConfigured)
+@@ -3351,6 +3386,36 @@ namespace
+         }
+     };
+     std::atomic<bool> g_fpsShown{false}; // (F3, and the settings panel's)
++
++    // A refused state load (EeScheduler::refusedStateLoadCount: the game ran on): its file and reason across the
++    // bottom of the window for 10 s, whichever overlay is on.
++    struct StateNotice
++    {
++        uint64_t seen = 0u;
++        std::string text;
++        double until = 0.0;
++
++        void draw(const EeScheduler &ee)
++        {
++            if (const uint64_t refused = ee.refusedStateLoadCount(); refused != seen)
++            {
++                seen = refused;
++                text = "Save state not loaded - " + ee.lastRefusedStateLoad();
++                until = GetTime() + 10.0;
++                std::fprintf(stderr, "[state] on screen for 10 s: %s\n", text.c_str()); // (the drawing, for the logs)
++            }
++            if (text.empty() || GetTime() >= until)
++                return;
++            int size = std::max(16, GetScreenHeight() / 34);
++            const int margin = size / 2;
++            while (size > 10 && MeasureText(text.c_str(), size) > GetScreenWidth() - margin * 4)
++                --size;
++            const int width = MeasureText(text.c_str(), size);
++            const int y = GetScreenHeight() - size * 2 - margin;
++            DrawRectangle(margin, y - size / 3, width + size, size + size * 2 / 3, Color{0, 0, 0, 190});
++            DrawText(text.c_str(), margin + size / 2, y, size, Color{255, 210, 120, 255});
++        }
++    };
+ }
+ 
+ void PS2Runtime::run()
+@@ -3363,7 +3428,8 @@ void PS2Runtime::run()
+     initializeEeKernelState(m_memory.getRDRAM());
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+-    m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
++    // (N7: the stack's top where the PS2's 32 MB ended - at 256 MB the top of RAM is the port's added data)
++    m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(0x02000000u - 0x10u));
+     m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
+     m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)), std::memory_order_relaxed);
+     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
+@@ -3412,6 +3478,7 @@ void PS2Runtime::run()
+     uint64_t tick = 0;
+     int64_t lastShownNs = 0; // (moment pictures: the last one shown, for the counter)
+     FpsCounter fpsCounter;
++    StateNotice stateNotice;
+     if (const char *show = std::getenv("PS2X_SHOW_FPS"); show && *show && *show != '0')
+         fpsCounter.shown = true;
+     g_fpsShown.store(fpsCounter.shown);
+@@ -3562,6 +3629,7 @@ void PS2Runtime::run()
+             }
+             if (fpsCounter.shown)
+                 fpsCounter.draw();
++            stateNotice.draw(*m_eeScheduler);
+             ps2_settings::drawPanel();
+             if (m_debugUiInitialized && m_debugUiDrawCallback)
+             {
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 6f4e3e60..d91b9cf9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -489,23 +489,25 @@ namespace ps2_syscalls
+         const uint32_t stackSize = stackSizeSigned > 0
+                                        ? static_cast<uint32_t>(stackSizeSigned)
+                                        : 0u;
++        // (N7: "the top of RAM" for a stack is where the PS2's 32 MB ended - at 256 MB the top is the port's added data)
++        constexpr uint32_t kStackTop = 0x02000000u;
+         if (stack == 0xFFFFFFFFu)
+         {
+             if (stackSizeSigned > 0)
+             {
+                 const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+-                if (requestedSize < PS2_RAM_SIZE)
++                if (requestedSize < kStackTop)
+                 {
+-                    sp = PS2_RAM_SIZE - requestedSize;
++                    sp = kStackTop - requestedSize;
+                 }
+                 else
+                 {
+-                    sp = PS2_RAM_SIZE;
++                    sp = kStackTop;
+                 }
+             }
+             else
+             {
+-                sp = PS2_RAM_SIZE;
++                sp = kStackTop;
+             }
+         }
+         else if (stack != 0u)
+@@ -543,7 +545,7 @@ namespace ps2_syscalls
+         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA8000u; // (kGuestHeapHardLimit: ps2_runtime.cpp)
++        const uint32_t kDefaultGuestHeapEnd = PS2Runtime::guestLayout().lowHeapLimit; // (N7: the layout's first block)
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
+ 
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+@@ -583,7 +585,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+ 
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA8000u; // (kGuestHeapHardLimit: ps2_runtime.cpp)
++        const uint32_t kDefaultGuestHeapEnd = PS2Runtime::guestLayout().lowHeapLimit; // (N7: the layout's first block)
+ 
+         const uint32_t ret = runtime
+                                  ? runtime->guestHeapLimit()
+@@ -596,7 +598,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+         (void)runtime;
+-        setReturnU32(ctx, PS2_RAM_SIZE);
++        setReturnU32(ctx, PS2Runtime::guestLayout().ramMb << 20); // (N7: the layout's RAM, 32 or 256 MB)
+     }
+ 
+     void InitTLB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_savestate.cpp b/ps2xRuntime/src/lib/ps2_savestate.cpp
+index 0b90fb2c..a27a84b2 100644
+--- a/ps2xRuntime/src/lib/ps2_savestate.cpp
++++ b/ps2xRuntime/src/lib/ps2_savestate.cpp
+@@ -80,6 +80,9 @@ namespace
+         uint64_t hash = 1469598103934665603ull;
+         for (const uint64_t size : sizes)
+             hash = (hash ^ size) * 1099511628211ull;
++        // (N7) The game's view of main RAM (PS2Runtime::guestLayout, PS2X_GUEST_RAM_MB): the same build's 32 MB and
++        // 256 MB modes put the heap and the port's added data in different places, so a state of one is not the other's.
++        hash = (hash ^ PS2Runtime::guestLayout().ramMb) * 1099511628211ull;
+         return hash;
+     }
+ 
+@@ -92,6 +95,134 @@ namespace
+     constexpr uint64_t kMaxCardFileBytes = 16u * 1024u * 1024u;
+ }
+ 
++namespace
++{
++    // Main RAM in a state (N7: 256 MB, most of it never written): its 4 KB pages in runs - all-zero pages and pages
++    // filled with one word kept as a count (and the word), the rest raw. A state of the 256 MB HQ or a level is ~30 MB
++    // of RAM instead of 256. Marked so a state with the whole RAM as one blob (as before) still loads.
++    // PS2X_STATE_RAW=1: the whole RAM written as one blob, as before (an A/B of the size and the time).
++    constexpr uint64_t kRamPagesMark = 0x5345474150584D52ull; // ("RMXPAGES": not a size a blob could have)
++    constexpr size_t kRamPage = 4096u;
++    enum RamRun : uint8_t
++    {
++        kRunZero = 0u,   // u32 pages: all zero
++        kRunFilled = 1u, // u32 pages, u32 word: every word of each page that word
++        kRunRaw = 2u,    // u32 pages, then their bytes
++    };
++
++    bool rawRamStates()
++    {
++        static const bool raw = []()
++        {
++            const char *env = std::getenv("PS2X_STATE_RAW");
++            return env && *env == '1';
++        }();
++        return raw;
++    }
++
++    // A page all one word: that word, else false.
++    bool pageFilled(const uint8_t *page, uint32_t &word)
++    {
++        uint64_t first = 0u;
++        std::memcpy(&first, page, sizeof(first));
++        if (static_cast<uint32_t>(first) != static_cast<uint32_t>(first >> 32))
++            return false;
++        for (size_t at = 8u; at < kRamPage; at += 8u)
++        {
++            uint64_t value = 0u;
++            std::memcpy(&value, page + at, sizeof(value));
++            if (value != first)
++                return false;
++        }
++        word = static_cast<uint32_t>(first);
++        return true;
++    }
++
++    void saveRam(ps2x::StateWriter &out, const uint8_t *ram, size_t size)
++    {
++        if (rawRamStates())
++        {
++            out.blob(ram, size);
++            return;
++        }
++        out.u64(kRamPagesMark);
++        out.u64(size);
++        const size_t pages = size / kRamPage;
++        size_t page = 0u;
++        while (page < pages)
++        {
++            uint32_t word = 0u;
++            const bool filled = pageFilled(ram + page * kRamPage, word);
++            size_t end = page + 1u;
++            if (filled)
++            {
++                uint32_t next = 0u;
++                while (end < pages && pageFilled(ram + end * kRamPage, next) && next == word)
++                    ++end;
++                out.u8(word == 0u ? kRunZero : kRunFilled);
++                out.u32(static_cast<uint32_t>(end - page));
++                if (word != 0u)
++                    out.u32(word);
++            }
++            else
++            {
++                uint32_t next = 0u;
++                while (end < pages && !pageFilled(ram + end * kRamPage, next))
++                    ++end;
++                out.u8(kRunRaw);
++                out.u32(static_cast<uint32_t>(end - page));
++                out.bytes(ram + page * kRamPage, (end - page) * kRamPage);
++            }
++            page = end;
++        }
++    }
++
++    void loadRam(ps2x::StateReader &in, uint8_t *ram, size_t size)
++    {
++        const uint64_t first = in.u64();
++        if (first == size) // (the whole RAM as one blob: states made before, or with PS2X_STATE_RAW)
++        {
++            in.bytes(ram, size);
++            return;
++        }
++        if (first != kRamPagesMark || in.u64() != size)
++        {
++            in.fail(); // ("does not match this build")
++            return;
++        }
++        const size_t pages = size / kRamPage;
++        size_t page = 0u;
++        while (page < pages && in.ok())
++        {
++            const uint8_t kind = in.u8();
++            const uint32_t count = in.u32();
++            if (!in.ok() || count == 0u || count > pages - page)
++            {
++                in.fail();
++                return;
++            }
++            uint8_t *at = ram + page * kRamPage;
++            const size_t bytes = static_cast<size_t>(count) * kRamPage;
++            if (kind == kRunZero)
++                std::memset(at, 0, bytes);
++            else if (kind == kRunFilled)
++            {
++                const uint32_t word = in.u32();
++                for (size_t i = 0; i < bytes; i += 4u)
++                    std::memcpy(at + i, &word, 4u);
++            }
++            else if (kind == kRunRaw)
++                in.bytes(at, bytes);
++            else
++            {
++                in.fail();
++                return;
++            }
++            page += count;
++        }
++    }
++}
++
+ // PS2Runtime, GS and the other owners of the saved state name this struct as a friend.
+ struct PS2StateAccess
+ {
+@@ -100,7 +231,7 @@ struct PS2StateAccess
+     static void saveMemory(PS2Runtime &runtime, ps2x::StateWriter &out)
+     {
+         PS2Memory &memory = runtime.m_memory;
+-        out.blob(memory.m_rdram, PS2_RAM_SIZE);
++        saveRam(out, memory.m_rdram, PS2_RAM_SIZE);
+         out.blob(memory.m_scratchpad, PS2_SCRATCHPAD_SIZE);
+         out.boolean(memory.m_seenGifCopy);
+         out.podMap(memory.m_ioRegisters);
+@@ -163,7 +294,7 @@ struct PS2StateAccess
+     static void loadMemory(PS2Runtime &runtime, ps2x::StateReader &in)
+     {
+         PS2Memory &memory = runtime.m_memory;
+-        in.blob(memory.m_rdram, PS2_RAM_SIZE);
++        loadRam(in, memory.m_rdram, PS2_RAM_SIZE);
+         in.blob(memory.m_scratchpad, PS2_SCRATCHPAD_SIZE);
+         memory.m_seenGifCopy = in.boolean();
+         in.podMap(memory.m_ioRegisters);
+@@ -901,9 +1032,15 @@ namespace
+         const uint32_t tableEnd = in.u32();
+         const uint32_t tableSlots = in.u32();
+         (void)in.u64();
+-        if (!in.ok() || ramSize != PS2_RAM_SIZE || fingerprint != layoutFingerprint())
++        if (in.ok() && ramSize != PS2_RAM_SIZE)
++        {
++            reason = "made by a build with " + std::to_string(ramSize >> 20) + " MB of main RAM (this one has " +
++                     std::to_string(PS2_RAM_SIZE >> 20) + " MB) - states from before the RAM change need making again";
++            return false;
++        }
++        if (!in.ok() || fingerprint != layoutFingerprint())
+         {
+-            reason = "made by a build with a different memory layout";
++            reason = "made by a build with a different memory layout (or the other main-RAM mode, PS2X_GUEST_RAM_MB)";
+             return false;
+         }
+         if (tableBase != g_ps2RecompiledFunctionTableBase || tableEnd != g_ps2RecompiledFunctionTableEnd ||
+@@ -1019,8 +1156,10 @@ namespace ps2_savestate
+         return Result::Done;
+     }
+ 
+-    bool load(PS2Runtime &runtime, const std::filesystem::path &path, std::string &reason)
++    bool load(PS2Runtime &runtime, const std::filesystem::path &path, std::string &reason, bool *untouched)
+     {
++        if (untouched)
++            *untouched = true;
+         std::vector<uint8_t> bytes;
+         {
+             std::ifstream stream(path, std::ios::binary | std::ios::ate);
+@@ -1058,6 +1197,8 @@ namespace ps2_savestate
+         }
+ 
+         // From here on the machine is being overwritten.
++        if (untouched)
++            *untouched = false;
+         ps2vif1::sync("load state");
+         const auto apply = [&](uint32_t sectionTag, const auto &read)
+         {
+diff --git a/ps2xRuntime/include/runtime/ps2_savestate.h b/ps2xRuntime/include/runtime/ps2_savestate.h
+index 0518ae07..86a3918c 100644
+--- a/ps2xRuntime/include/runtime/ps2_savestate.h
++++ b/ps2xRuntime/include/runtime/ps2_savestate.h
+@@ -31,8 +31,10 @@ namespace ps2_savestate
+     Result save(PS2Runtime &runtime, const std::filesystem::path &path, std::string &message);
+ 
+     // A failure after the first section was applied leaves the machine half restored:
+-    // stop the runtime then.
+-    bool load(PS2Runtime &runtime, const std::filesystem::path &path, std::string &message);
++    // stop the runtime then. `untouched` (optional) says whether the failure came before anything
++    // was overwritten (a missing or unreadable file, another build's or another RAM size's state):
++    // the machine runs on as it was.
++    bool load(PS2Runtime &runtime, const std::filesystem::path &path, std::string &message, bool *untouched = nullptr);
+ 
+     // PS2X_STATE_FILE, or quick.ps2state in the working directory.
+     std::filesystem::path quickStatePath();
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index bbb38b02..dfbb278c 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -557,6 +557,14 @@ public:
+     // caller on another thread that waits for its state (the settings panel's restart).
+     [[nodiscard]] uint64_t savedStateCount() const noexcept { return m_savedStates.load(std::memory_order_acquire); }
+     [[nodiscard]] uint64_t failedStateSaveCount() const noexcept { return m_failedStateSaves.load(std::memory_order_acquire); }
++    // A state load refused before anything was overwritten (the game ran on): how many, and the last one's
++    // file and reason (for a message on screen).
++    [[nodiscard]] uint64_t refusedStateLoadCount() const noexcept { return m_refusedStateLoads.load(std::memory_order_acquire); }
++    [[nodiscard]] std::string lastRefusedStateLoad() const
++    {
++        std::lock_guard lock(m_refusedStateMutex);
++        return m_lastRefusedState;
++    }
+     // Called on the EE executor right after a state has loaded, before any guest code runs
+     // again: for a game's own state that has to agree with the loaded memory.
+     void setStateLoadedHook(std::function<void()> hook) { m_stateLoadedHook = std::move(hook); }
+@@ -785,6 +793,9 @@ private:
+     std::atomic<uint64_t> m_loadedStates{0};
+     std::atomic<uint64_t> m_savedStates{0};
+     std::atomic<uint64_t> m_failedStateSaves{0};
++    std::atomic<uint64_t> m_refusedStateLoads{0};
++    mutable std::mutex m_refusedStateMutex;
++    std::string m_lastRefusedState;
+     std::function<void()> m_stateLoadedHook; // setStateLoadedHook
+     uint64_t m_saveStateGiveUpTick = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 6bd40e51..b6d99a04 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2635,14 +2635,30 @@ bool EeScheduler::serviceStateRequests()
+     std::string reason;
+     if (!load.empty())
+     {
+-        if (ps2_savestate::load(m_runtime, load, reason))
++        bool untouched = false;
++        const auto loadStart = std::chrono::steady_clock::now();
++        if (ps2_savestate::load(m_runtime, load, reason, &untouched))
+         {
+             loaded = true;
+             m_loadedStates.fetch_add(1u, std::memory_order_relaxed);
+-            std::cerr << "[state] loaded " << load.string() << " (vblank " << m_vsyncTick << "; " << reason << ")" << std::endl;
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loadStart).count();
++            std::cerr << "[state] loaded " << load.string() << " in " << static_cast<int>(ms + 0.5) << " ms (vblank " << m_vsyncTick
++                      << "; " << reason << ")" << std::endl;
+             if (m_stateLoadedHook)
+                 m_stateLoadedHook();
+         }
++        else if (untouched)
++        {
++            // Refused before anything was overwritten (another RAM size's or build's state, a missing file): the
++            // game runs on as it was - at start-up it boots fresh - and the reason is shown on screen.
++            std::cerr << "[state] cannot load " << load.string() << ": " << reason << " (nothing changed: the game runs on)"
++                      << std::endl;
++            {
++                std::lock_guard lock(m_refusedStateMutex);
++                m_lastRefusedState = load.filename().string() + ": " + reason;
++            }
++            m_refusedStateLoads.fetch_add(1u, std::memory_order_release);
++        }
+         else
+         {
+             // Part of the machine may already be overwritten, so nothing can run on.
+@@ -2657,11 +2673,16 @@ bool EeScheduler::serviceStateRequests()
+         constexpr uint64_t kSaveStatePatienceTicks = 600u;
+         if (m_saveStateGiveUpTick == 0u)
+             m_saveStateGiveUpTick = m_vsyncTick + kSaveStatePatienceTicks;
++        const auto saveStart = std::chrono::steady_clock::now();
+         const ps2_savestate::Result result = ps2_savestate::save(m_runtime, save, reason);
+         const bool retry = result == ps2_savestate::Result::Busy && m_vsyncTick < m_saveStateGiveUpTick;
+         if (result == ps2_savestate::Result::Done)
+         {
+-            std::cerr << "[state] saved " << save.string() << " (vblank " << m_vsyncTick << "; " << reason << ")" << std::endl;
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - saveStart).count();
++            std::error_code sizeError;
++            const uintmax_t bytes = std::filesystem::file_size(save, sizeError);
++            std::cerr << "[state] saved " << save.string() << " in " << static_cast<int>(ms + 0.5) << " ms, "
++                      << (sizeError ? 0u : bytes / 1024u) << " KB (vblank " << m_vsyncTick << "; " << reason << ")" << std::endl;
+             m_savedStates.fetch_add(1u, std::memory_order_release);
+         }
+         else if (!retry)

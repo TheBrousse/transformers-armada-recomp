@@ -1,0 +1,409 @@
+Subject: [PATCH] GS GPU renderer: batch data through one ring buffer; runtime
+ threads named
+
+Each batch's vertices, draws, CLUTs and mesh/moment inputs were glBufferData'd fresh: three to
+six new buffer stores a batch, 10-20 thousand a second at 60 frames in a level. They now go
+through one 128 MB persistently mapped buffer made once, eight segments fenced in turn (the
+compute passes that write moment/mesh vertices bind the batch's stretch). PS2X_GPU_RING=0: the
+old way. Verified: a level renders as before; the ring never waited for the GPU in Amazon.
+
+The runtime's own threads now carry names (Present, VBlankWatch, Vif1, GsFeed, GsBackend,
+TexturePack) for profilers and debuggers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_gpu.cpp             | 220 +++++++++++++++---
+ ps2xRuntime/src/lib/gs/gs_texture_pack.cpp    |   2 +
+ .../src/lib/gs/gs_threaded_backend.cpp        |   3 +-
+ ps2xRuntime/src/lib/ps2_host_display.cpp      |   1 +
+ ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp |   1 +
+ ps2xRuntime/src/lib/ps2_vif1_thread.cpp       |   5 +-
+ 6 files changed, 196 insertions(+), 36 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 8e417e8..60dd21e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -715,6 +715,161 @@ struct GSGpuRenderer::Impl
+     }
+     GLuint vao = 0u, vbo = 0u, emptyVao = 0u;
+     GLuint drawBuffer = 0u, clutBuffer = 0u, memoryBuffer = 0u, swizzleBuffer = 0u;
++
++    // ---- the batches' data into one ring (PS2X_GPU_RING, on by default) ----
++    // A batch's vertices, draws, CLUTs and mesh/moment inputs were each glBufferData'd fresh: three
++    // to six new buffer stores a batch, 10-20 thousand a second at 60 frames in a level, each a new
++    // allocation for the driver to make (and, on AMD's, often fresh video memory). The ring is one
++    // persistently mapped buffer made once: each upload a copy into its next free stretch, eight
++    // segments fenced in turn. (Looked at for the "whole PC stutters" report, 2026-10-24: it was not
++    // that report's cause; it stays as the cheaper way to stream the batches.)
++    struct StreamRing
++    {
++        static constexpr size_t kSegments = 8u;
++        GLuint buffer = 0u;
++        uint8_t *data = nullptr;
++        size_t size = 0u, segment = 0u, head = 0u, current = 0u;
++        std::array<GLsync, kSegments> fences{};
++        uint64_t waits = 0u;
++
++        bool open(size_t bytes)
++        {
++            const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
++            glGenBuffers(1, &buffer);
++            glBindBuffer(GL_COPY_WRITE_BUFFER, buffer);
++            glBufferStorage(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, flags);
++            data = static_cast<uint8_t *>(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), flags));
++            glBindBuffer(GL_COPY_WRITE_BUFFER, 0u);
++            if (!data)
++            {
++                glDeleteBuffers(1, &buffer);
++                buffer = 0u;
++                return false;
++            }
++            size = bytes;
++            segment = bytes / kSegments;
++            return true;
++        }
++
++        // A stretch of `bytes` aligned to `align` (never across a segment): its offset, or SIZE_MAX
++        // when it is bigger than a segment. Entering a segment fences the one left and waits for the
++        // GPU to be done with the commands that last used the one entered.
++        size_t take(size_t bytes, size_t align)
++        {
++            bytes = std::max(bytes, align);
++            if (bytes > segment)
++                return SIZE_MAX;
++            size_t off = (head + align - 1u) / align * align;
++            if (off >= size || off / segment != (off + bytes - 1u) / segment)
++                off = ((off / segment) + 1u) % kSegments * segment;
++            const size_t seg = off / segment;
++            if (seg != current)
++            {
++                if (fences[current])
++                    glDeleteSync(fences[current]);
++                fences[current] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++                if (GLsync f = fences[seg])
++                {
++                    if (glClientWaitSync(f, 0, 0u) == GL_TIMEOUT_EXPIRED)
++                    {
++                        ++waits;
++                        while (glClientWaitSync(f, GL_SYNC_FLUSH_COMMANDS_BIT, 1'000'000'000u) == GL_TIMEOUT_EXPIRED)
++                        {
++                        }
++                    }
++                    glDeleteSync(f);
++                    fences[seg] = nullptr;
++                }
++                current = seg;
++            }
++            head = off + bytes;
++            return off;
++        }
++    };
++    StreamRing ring;
++    bool ringEnabled = false;
++    size_t ringAlign = 256u;
++    // The batch's vertices where they are now (the ring's stretch or vbo), for the attributes and
++    // the compute passes that write moment/mesh vertices into them (binding 7).
++    GLuint vertexBuffer = 0u;
++    size_t vertexOffset = 0u, vertexBytes = 0u;
++    GLuint pointedBuffer = 0u;
++    size_t pointedOffset = SIZE_MAX;
++
++    void pointVertices(GLuint buffer, size_t offset)
++    {
++        glBindVertexArray(vao);
++        glBindBuffer(GL_ARRAY_BUFFER, buffer);
++        if (buffer == pointedBuffer && offset == pointedOffset)
++            return;
++        const auto at = [offset](size_t field) { return reinterpret_cast<void *>(offset + field); };
++        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), at(offsetof(GpuVertex, x)));
++        glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(GpuVertex), at(offsetof(GpuVertex, z)));
++        glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), at(offsetof(GpuVertex, r)));
++        glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), at(offsetof(GpuVertex, s)));
++        glVertexAttribIPointer(4, 1, GL_UNSIGNED_INT, sizeof(GpuVertex), at(offsetof(GpuVertex, packed)));
++        pointedBuffer = buffer;
++        pointedOffset = offset;
++    }
++
++    // `count` vertices, room for `total` (the rest written on the GPU), the vertex source.
++    void uploadVertices(const GpuVertex *v, size_t count, size_t total)
++    {
++        const size_t bytes = total * sizeof(GpuVertex);
++        if (ringEnabled)
++        {
++            const size_t off = ring.take(bytes, ringAlign);
++            if (off != SIZE_MAX)
++            {
++                if (count)
++                    std::memcpy(ring.data + off, v, count * sizeof(GpuVertex));
++                vertexBuffer = ring.buffer;
++                vertexOffset = off;
++                vertexBytes = std::max(bytes, ringAlign);
++                pointVertices(ring.buffer, off);
++                return;
++            }
++        }
++        glBindBuffer(GL_ARRAY_BUFFER, vbo);
++        if (total != count)
++        {
++            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
++            glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(count * sizeof(GpuVertex)), v);
++        }
++        else
++            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), v, GL_STREAM_DRAW);
++        vertexBuffer = vbo;
++        vertexOffset = 0u;
++        vertexBytes = bytes;
++        pointVertices(vbo, 0u);
++    }
++
++    void bindVertexStorage()
++    {
++        if (vertexBuffer == vbo || vertexBytes == 0u)
++            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, vertexBuffer ? vertexBuffer : vbo);
++        else
++            glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 7, vertexBuffer, static_cast<GLintptr>(vertexOffset),
++                              static_cast<GLsizeiptr>(vertexBytes));
++    }
++
++    // A shader storage block's data: the ring's next stretch bound to `binding`, else `fallback`.
++    void uploadStorage(GLuint fallback, GLuint binding, const void *data, size_t bytes)
++    {
++        if (ringEnabled && bytes)
++        {
++            const size_t off = ring.take(bytes, ringAlign);
++            if (off != SIZE_MAX)
++            {
++                std::memcpy(ring.data + off, data, bytes);
++                glBindBufferRange(GL_SHADER_STORAGE_BUFFER, binding, ring.buffer, static_cast<GLintptr>(off), static_cast<GLsizeiptr>(bytes));
++                return;
++            }
++        }
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, fallback);
++        glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), data, GL_STREAM_DRAW);
++        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, fallback);
++    }
+     GLuint drawFbo = 0u, presentFbo = 0u, dummyImage = 0u;
+     std::array<GLuint, kMaxPictures> pictures{};
+     size_t pictureSlots = 0u; // (made so far: four, twelve once moment pictures are drawn)
+@@ -1686,7 +1841,20 @@ bool GSGpuRenderer::Impl::init()
+     glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), at(offsetof(GpuVertex, s)));
+     glEnableVertexAttribArray(4);
+     glVertexAttribIPointer(4, 1, GL_UNSIGNED_INT, sizeof(GpuVertex), at(offsetof(GpuVertex, packed)));
++    pointedBuffer = vbo;
++    pointedOffset = 0u;
++    vertexBuffer = vbo;
+     glGenVertexArrays(1, &emptyVao);
++    if (envFlag("PS2X_GPU_RING", true) && glad_glBufferStorage && glad_glMapBufferRange && glad_glBindBufferRange)
++    {
++        GLint align = 256;
++        glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &align);
++        ringAlign = std::max<size_t>(256u, static_cast<size_t>(align));
++        ringEnabled = ring.open(size_t{128} << 20u);
++        std::fprintf(stderr, ringEnabled ? "[gpu] the batches' data streamed through one 128 MB ring (PS2X_GPU_RING)\n"
++                                         : "[gpu] no persistently mapped ring: the batches' data in buffers made a batch\n");
++    }
++    glBindVertexArray(vao);
+ 
+     // Local memory (loaded page by page as it is needed), its swizzle, the draws, the CLUTs.
+     glGenBuffers(1, &memoryBuffer);
+@@ -4313,25 +4481,13 @@ void GSGpuRenderer::Impl::flush()
+     for (ShadowBatch &b : shadowBatches)
+         if (!b.foldCandidates.empty())
+             foldRepeats(b.vertices, b.foldCandidates);
+-    glBindVertexArray(vao);
+-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+-    if (momentVertices != 0u)
+-    {
+-        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>((vertices.size() + momentVertices) * sizeof(GpuVertex)), nullptr, GL_STREAM_DRAW);
+-        glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertices.size() * sizeof(GpuVertex)), vertices.data());
+-    }
+-    else
+-        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(GpuVertex)), vertices.data(), GL_STREAM_DRAW);
++    uploadVertices(vertices.data(), vertices.size(), vertices.size() + momentVertices);
+     if (!meshTriangles.empty())
+         expandMeshes();
+-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, drawBuffer);
+-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(draws.size() * sizeof(GpuDraw)), draws.data(), GL_STREAM_DRAW);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, drawBuffer);
++    uploadStorage(drawBuffer, 0u, draws.data(), draws.size() * sizeof(GpuDraw));
+     if (cluts.empty())
+         cluts.assign(256u, 0u);
+-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, clutBuffer);
+-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(cluts.size() * sizeof(uint32_t)), cluts.data(), GL_STREAM_DRAW);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, clutBuffer);
++    uploadStorage(clutBuffer, 3u, cluts.data(), cluts.size() * sizeof(uint32_t));
+ 
+     const GLuint frameImage = (batchNative || !drawMain) ? dummyImage : batchFrame->tex; // (a native batch draws through the GPU's own)
+     const GLuint depthImage = (batchDepth && !batchNative && drawMain) ? batchDepth->tex : dummyImage;
+@@ -4585,7 +4741,7 @@ void GSGpuRenderer::Impl::flush()
+                 glUniform2iv(nativeSourceSizeLocations[0], 4, b.sizes.data());
+             if (nativeSourceScaleLocations[0] >= 0)
+                 glUniform2iv(nativeSourceScaleLocations[0], 4, b.scales.data());
+-            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(b.vertices.size() * sizeof(GpuVertex)), b.vertices.data(), GL_STREAM_DRAW);
++            uploadVertices(b.vertices.data(), b.vertices.size(), b.vertices.size());
+             for (uint32_t i = 0; i < b.sources.size(); ++i)
+                 glBindImageTexture(2u + i, i < b.sourceCount && b.sources[i] ? b.sources[i] : dummyImage, 0, GL_FALSE, 0, GL_READ_ONLY,
+                                    GL_R32UI);
+@@ -4612,7 +4768,7 @@ void GSGpuRenderer::Impl::flush()
+             glUniform2iv(dualSourceSizeLocation, 4, b.sizes.data());
+         if (dualSourceScaleLocation >= 0)
+             glUniform2iv(dualSourceScaleLocation, 4, b.scales.data());
+-        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(b.vertices.size() * sizeof(GpuVertex)), b.vertices.data(), GL_STREAM_DRAW);
++        uploadVertices(b.vertices.data(), b.vertices.size(), b.vertices.size());
+         glBindImageTexture(0, batchFrame->shadow[0], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+         glBindImageTexture(7, batchFrame->shadow[1], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+         glBindImageTexture(1, dummyImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+@@ -4641,8 +4797,7 @@ void GSGpuRenderer::Impl::flush()
+                 glUniform2iv(sourceSizeLocations[currentVariant], 4, b.sizes.data());
+             if (sourceScaleLocations[currentVariant] >= 0)
+                 glUniform2iv(sourceScaleLocations[currentVariant], 4, b.scales.data());
+-            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(b.vertices.size() * sizeof(GpuVertex)), b.vertices.data(),
+-                         GL_STREAM_DRAW);
++            uploadVertices(b.vertices.data(), b.vertices.size(), b.vertices.size());
+             glBindImageTexture(0, batchFrame->shadow[k], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+             glBindImageTexture(1, dummyImage, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+             for (uint32_t i = 0; i < b.sources.size(); ++i)
+@@ -5496,11 +5651,8 @@ void GSGpuRenderer::Impl::drawMoments(size_t made)
+         return;
+     const uint32_t first = static_cast<uint32_t>(vertices.size());
+     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT); // (the meshes' vertices, made by kMeshExpand)
+-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, momentPieceBuffer);
+-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(momentPieceList.size() * sizeof(MomentPiece)), momentPieceList.data(),
+-                 GL_STREAM_DRAW);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, momentPieceBuffer);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, vbo);
++    uploadStorage(momentPieceBuffer, 4u, momentPieceList.data(), momentPieceList.size() * sizeof(MomentPiece));
++    bindVertexStorage();
+     glUseProgram(momentLerpProgram);
+     glUniform1ui(momentPiecesLocation, static_cast<GLuint>(momentPieceList.size()));
+     glUniform1ui(momentVerticesLocation, static_cast<GLuint>(made));
+@@ -6054,6 +6206,11 @@ void GSGpuRenderer::Impl::printStats()
+     std::fprintf(stderr, "[gpu]   read-backs and local copies: %llu, %llu of their pages drawn by the GPU\n",
+                  static_cast<unsigned long long>(statReadbacks), static_cast<unsigned long long>(statReadbackPages));
+     statReadbacks = statReadbackPages = 0u;
++    if (ringEnabled)
++    {
++        std::fprintf(stderr, "[gpu]   the ring: %llu waits for the GPU\n", static_cast<unsigned long long>(ring.waits));
++        ring.waits = 0u;
++    }
+     if (statPresents)
+         std::fprintf(stderr, "[gpu]   GPU ms per VBlank: draws %.2f, field pictures %.2f, loads %.2f, write-backs %.2f, presentation %.2f\n",
+                      gpuMs[0] / statPresents, gpuMs[1] / statPresents, gpuMs[2] / statPresents, gpuMs[3] / statPresents,
+@@ -6396,13 +6553,9 @@ void GSGpuRenderer::Impl::expandMeshes()
+     const uint32_t triangles = static_cast<uint32_t>(meshTriangles.size() / 2u);
+     const uint32_t base = static_cast<uint32_t>(meshJobs.size());
+     meshJobs.insert(meshJobs.end(), meshTriangles.begin(), meshTriangles.end());
+-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, meshDataBuffer);
+-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(meshWords.size() * 4u), meshWords.data(), GL_STREAM_DRAW);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, meshDataBuffer);
+-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, meshTableBuffer);
+-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(meshJobs.size() * 4u), meshJobs.data(), GL_STREAM_DRAW);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, meshTableBuffer);
+-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, vbo);
++    uploadStorage(meshDataBuffer, 4u, meshWords.data(), meshWords.size() * 4u);
++    uploadStorage(meshTableBuffer, 5u, meshJobs.data(), meshJobs.size() * 4u);
++    bindVertexStorage();
+     glUseProgram(meshProgram);
+     glUniform1ui(meshTrianglesLocation, triangles);
+     glUniform1ui(meshTriangleBaseLocation, base);
+@@ -6414,8 +6567,9 @@ void GSGpuRenderer::Impl::expandMeshes()
+     {
+         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+         VertexList got(vertices.size());
+-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+-        glGetBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(got.size() * sizeof(GpuVertex)), got.data());
++        glBindBuffer(GL_COPY_READ_BUFFER, vertexBuffer);
++        glGetBufferSubData(GL_COPY_READ_BUFFER, static_cast<GLintptr>(vertexOffset), static_cast<GLsizeiptr>(got.size() * sizeof(GpuVertex)),
++                           got.data());
+         static const char *names[8] = {"x", "y", "z", "rgba", "s", "t", "q", "packed"};
+         size_t index = 0;
+         for (const auto &[slot, expected] : meshExpected)
+diff --git a/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp b/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
+index bd999ae..5b92ef0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texture_pack.cpp
+@@ -1,3 +1,4 @@
++#include "ThreadNaming.h"
+ #include "gs_texture_pack.h"
+ 
+ #include "runtime/gs/ps2_gs_memory.h"
+@@ -143,6 +144,7 @@ namespace gs_texture_pack
+         // time does not wait for the disk.
+         m_reader = std::thread([this]()
+                                {
++                                   ThreadNaming::SetCurrentThreadName("TexturePack");
+                                    for (auto &texture : m_textures)
+                                    {
+                                        if (m_stop.load())
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 1ea2393..e0b6e3f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -1,3 +1,4 @@
++#include "ThreadNaming.h"
+ #include "runtime/gs/gs_threaded_backend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_draw_state.h"
+@@ -133,7 +134,7 @@ GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
+         m_gpuOnly = !ps2_gpu::mirrored();
+     }
+     m_thread = std::thread([this]()
+-                           { run(); });
++                           { ThreadNaming::SetCurrentThreadName("GsBackend"); run(); });
+ }
+ 
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index 445146f..0bae53b 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -296,6 +296,7 @@ namespace ps2_host_display
+ 
+         void watchVBlanks()
+         {
++            SetThreadDescription(GetCurrentThread(), L"VBlankWatch");
+             IDXGIFactory1 *factory = nullptr;
+             IDXGIOutput *output = nullptr;
+             HMONITOR monitor = nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+index 6b5a098..029aad7 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -396,6 +396,7 @@ namespace ps2_host_present::dxgi
+         // came late (17-48 in 2 s against 0-2) and the game fell to 56-59 frames a second.
+         void run()
+         {
++            SetThreadDescription(GetCurrentThread(), L"Present");
+             if (statsEnabled())
+                 std::fprintf(stderr, "[present] the present thread is %lu\n", GetCurrentThreadId());
+             wglMakeCurrent(g.partDc, g.partContext);
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+index 9da06a9..3981d30 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+@@ -1,3 +1,4 @@
++#include "ThreadNaming.h"
+ #include "runtime/ps2_vif1_thread.h"
+ #include "runtime/ps2_memory.h"
+ 
+@@ -477,14 +478,14 @@ namespace
+                                return;
+                            g_worker = new Worker();
+                            g_worker->thread = std::thread([]()
+-                                                          { run(*g_worker); });
++                                                          { ThreadNaming::SetCurrentThreadName("Vif1"); run(*g_worker); });
+                            const char *feed = std::getenv("PS2X_GS_FEED");
+                            if (!(feed && feed[0] == '0'))
+                            {
+                                g_gsFeed = new GsFeed();
+                                g_gsBatch.bytes.reserve(kGsBatchBytes + 4096u);
+                                g_gsFeed->thread = std::thread([]()
+-                                                              { runGs(*g_gsFeed); });
++                                                              { ThreadNaming::SetCurrentThreadName("GsFeed"); runGs(*g_gsFeed); });
+                            }
+                        });
+         return g_stopped.load(std::memory_order_relaxed) ? nullptr : g_worker;
+-- 
+2.54.0.windows.1
+

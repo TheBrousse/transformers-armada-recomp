@@ -1,0 +1,87 @@
+Subject: [PATCH] Present: back to GL's swap when the DXGI swap chain cannot take GL's pictures
+
+On NVIDIA (GTX 1080) the WGL_NV_DX_interop textures could not be made; every picture tried anew
+and failed, and the game ran at about 15 pictures a second. After three failures in a row the
+swap chain is closed and GL's own swap is used.
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_host_present.h b/ps2xRuntime/include/runtime/ps2_host_present.h
+index e01d478..cdad66f 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_present.h
++++ b/ps2xRuntime/include/runtime/ps2_host_present.h
+@@ -43,6 +43,8 @@ namespace ps2_host_present
+         // Until the present thread has copied hand-over `number`'s texture (it may be drawn into
+         // again).
+         void waitCopied(uint64_t number);
++        // The textures could not be made several times in a row: present() will not work here.
++        bool broken();
+         void close();
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_host_present.cpp b/ps2xRuntime/src/lib/ps2_host_present.cpp
+index 19e29bc..b8da5b4 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present.cpp
+@@ -95,6 +95,13 @@ namespace ps2_host_present
+             g_drawing = false;
+         }
+         PollInputEvents(); // (EndDrawing's; its swap is the swap chain's present)
++        if (dxgi::broken())
++        {
++            std::fprintf(stderr, "[present] the DXGI swap chain cannot take GL's pictures here: GL's own swap from now on\n");
++            dxgi::close();
++            g_active = false;
++            g_handed.fill(0u);
++        }
+     }
+ }
+ 
+@@ -116,6 +123,11 @@ namespace ps2_host_present::dxgi
+     {
+     }
+ 
++    bool broken()
++    {
++        return false;
++    }
++
+     void close()
+     {
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+index 029aad7..7ddf2cb 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -123,6 +123,7 @@ namespace ps2_host_present::dxgi
+             bool stop = false;
+             uint64_t handed = 0u;               // (the window's thread's count)
+             std::atomic<uint64_t> copied{0u};   // the jobs whose picture GL has copied (their texture free again)
++            std::atomic<int> fitFailures{0};    // the textures could not be made, so many times in a row
+             // PS2X_PRESENT_STATS (the present thread's)
+             uint32_t presents = 0u, failed = 0u;
+             double drawnMs = 0.0, lockMs = 0.0, blitMs = 0.0, unlockMs = 0.0, presentMs = 0.0, lockMost = 0.0, blitMost = 0.0, unlockMost = 0.0,
+@@ -326,7 +327,11 @@ namespace ps2_host_present::dxgi
+                 flight.job.drawn = nullptr;
+             }
+             if (!fit(job.width, job.height))
++            {
++                g.fitFailures.fetch_add(1, std::memory_order_relaxed);
+                 return flight;
++            }
++            g.fitFailures.store(0, std::memory_order_relaxed);
+             Picture &picture = g.pictures[g.next];
+             if (!g.lockObjects(g.interopDevice, 1, &picture.object))
+                 return flight;
+@@ -620,6 +625,13 @@ namespace ps2_host_present::dxgi
+         return job.number;
+     }
+ 
++    // GL cannot draw into Direct3D's textures here (NVIDIA's GTX 1080, 2026-10-26: every picture's
++    // try made them anew and failed, at 15 pictures a second): the caller goes back to GL's swap.
++    bool broken()
++    {
++        return g.fitFailures.load(std::memory_order_relaxed) >= 3;
++    }
++
+     void waitCopied(uint64_t number)
+     {
+         if (number == 0u || g.copied.load(std::memory_order_acquire) >= number || !g.thread.joinable())

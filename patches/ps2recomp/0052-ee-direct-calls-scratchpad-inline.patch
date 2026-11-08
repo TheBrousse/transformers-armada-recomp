@@ -1,0 +1,856 @@
+Subject: [PATCH] EE thread (FPS round 3): direct calls, the scratchpad inline; call-site and register write-back options
+
+The game thread (EE) is the frame-rate limit in levels (TODO 94). Each change runs the same guest
+code in the same order with the same EE clock: a scripted cold boot into Amazon and the fight
+route (aim, walk, fire, melee, car), both all in turbo with VIF1 on the EE thread, give the same
+game state on every frame as before (8,018 and 19,068 game ticks, on the test PC, the other PC
+and locally), and the native renderer's shots are pixel-identical.
+
+- Direct calls (ps2xRecomp config `direct_calls`): a `jal` to a known function becomes
+  runtime->dispatchGuestCall(rdram, ctx, target, source, fallthrough, PS2_CALL_TARGET(target)) -
+  the generated code reads the target's entry of the function table itself (one load from a fixed
+  place) instead of the dispatcher's lookup (thread-local table, hashing, misses into the 10 MB
+  table). The entry IS what the lookup returns (a replaced function's replacement too: replacing
+  writes the entry and bumps the lookup's generation), so the same function is entered, after
+  dispatchGuestBranch's checkpoint at the same point; the rest of a call (PS2Runtime::enterCall /
+  afterCall) is dispatchGuestBranch's code, shared. An empty entry, or PS2X_DIRECT_CALLS=0 at run
+  time, takes dispatchGuestBranch.
+- Direct call sites (config `direct_call_sites`, with `direct_calls`; off): the call itself made at
+  the jal's site when the entry is still the generated function - Ps2CallKnown: callBegin, a
+  direct call, callEnd (what dispatchGuestCall does before and after its call; the level the
+  dispatcher's scope gives back when an EeDispatcherTransfer leaves it is set back to 0 where the
+  scheduler catches one, PS2Runtime::dispatchUnwound). Measured ~2% slower than dispatchGuestCall
+  on both workers (two out-of-line calls a call instead of one); PS2X_DIRECT_CALLS=1 makes such a
+  build take dispatchGuestCall.
+- The scratchpad inline: READn/WRITEn in the generated code read and write the scratchpad's
+  memory straight after the main-RAM test (an aligned access in its 16 KB), before the
+  special-address tests and the call - PS2Runtime::Load*/Store* did exactly that after them
+  (Ps2ScratchpadRead, storeScratchpadFast; a 32-bit store still drains the completed DMA
+  handlers after it, as Store32 did). PS2Runtime::Load8..128 take the same way first (the
+  translator's constant-address scratchpad loads call them: 514 sites, which went through
+  PS2Memory::read* and translateAddress). PS2X_INLINE_SCRATCHPAD=0: as before.
+- Register write-back (ps2xRecomp config `register_write_back`, off): a register written to its
+  C++ local only, the ones written since stored back before a call, a jump to another function,
+  a syscall, a return or a loop's checkpoint (inside its `if`), with the set at a label taken
+  from the gotos to it (a fixpoint). Measured SLOWER (+3% a frame with the label states, +29%
+  with every written register at a label): the deferred stores keep the locals live across the
+  function and MSVC spills them, while it already drops most of the stores the write-through
+  form makes. Kept as an option for another compiler.
+- ps2_register_cache.h: RC_PUT_* / RC_WB for that option.
+
+Not in this patch (the port's overrides.toml): minimal_pc_stores, which existed and is now on.
+
+On a GTX 1080 / Ryzen 5 5600 test PC, Amazon from its first gate, the user's settings at 1080 lines,
+120 held, game ticks 8600-13000: see TODO 94's round-3 paragraph.
+---
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -83,6 +83,9 @@ namespace ps2recomp
+         bool m_registerCache = false;
+         bool m_indirectCallResumeOnly = false;
+         bool m_minimalPcStores = false;
++        bool m_registerWriteBack = false;
++        bool m_directCalls = false;
++        bool m_directCallSites = false;
+         std::unordered_set<uint32_t> m_fastCodegenOnly;
+         RecompilerReporter *m_reporter = nullptr;
+         std::string m_currentFunctionName;
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -193,6 +193,15 @@ namespace ps2recomp
+         // ctx->pc (and the delay slot's state) stored only before what can read it, not before
+         // every instruction: the runtime calls, the transfers (which store their own targets).
+         bool minimalPcStores = false;
++        // (with registerCache) a register written to the C++ local only, stored back to the
++        // context before a call, a jump to another function, a syscall or a return.
++        bool registerWriteBack = false;
++        // A `jal` to a function of the table: runtime->dispatchGuestCall with the target's table
++        // entry read in place (PS2_CALL_TARGET) instead of the dispatcher's lookup.
++        bool directCalls = false;
++        // (with directCalls) the call made at the jal's site (Ps2CallKnown) when the target is a
++        // generated function, not in runtime->dispatchGuestCall.
++        bool directCallSites = false;
+         std::vector<std::string> fastCodegenOnly;
+         std::vector<std::string> skipFunctions;
+         std::unordered_map<uint32_t, std::string> patches;
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -68,6 +68,9 @@ namespace ps2recomp
+             config.indirectCallResumeOnly =
+                 toml::find_or<bool>(general, "indirect_call_resume_only", config.indirectCallResumeOnly);
+             config.minimalPcStores = toml::find_or<bool>(general, "minimal_pc_stores", config.minimalPcStores);
++            config.registerWriteBack = toml::find_or<bool>(general, "register_write_back", config.registerWriteBack);
++            config.directCalls = toml::find_or<bool>(general, "direct_calls", config.directCalls);
++            config.directCallSites = toml::find_or<bool>(general, "direct_call_sites", config.directCallSites);
+             if (general.contains("fast_codegen_only") && general.at("fast_codegen_only").is_array())
+             {
+                 config.fastCodegenOnly = toml::find<std::vector<std::string>>(general, "fast_codegen_only");
+@@ -309,6 +312,9 @@ namespace ps2recomp
+         general["register_cache"] = config.registerCache;
+         general["indirect_call_resume_only"] = config.indirectCallResumeOnly;
+         general["minimal_pc_stores"] = config.minimalPcStores;
++        general["register_write_back"] = config.registerWriteBack;
++        general["direct_calls"] = config.directCalls;
++        general["direct_call_sites"] = config.directCallSites;
+         general["fast_codegen_only"] = config.fastCodegenOnly;
+         data["general"] = general;
+ 
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -236,6 +236,31 @@ namespace ps2recomp
+     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
+     {
+         const bool isCall = kind == StaticBranchKind::Call;
++        const std::string targetName = isCall && m_gen.m_directCalls ? m_gen.getFunctionName(target) : std::string();
++        const size_t suffix = targetName.rfind("_0x");
++        if (m_gen.m_directCallSites && suffix != std::string::npos && suffix + 3 < targetName.size() &&
++            targetName.find_first_not_of("0123456789abcdef", suffix + 3) == std::string::npos)
++        {
++            // (a generated function: the call made here when its table entry is still this one -
++            // Ps2CallKnown; else the runtime's way)
++            m_ss << fmt::format(
++                "{}if (!Ps2CallKnown(rdram, ctx, runtime, 0x{:X}u, 0x{:X}u, 0x{:X}u, {})) {{\n",
++                indent, target, branchPc(), fallthroughPc(), targetName);
++            m_ss << fmt::format("{}    return;\n", indent);
++            m_ss << fmt::format("{}}}\n", indent);
++            return;
++        }
++        if (!targetName.empty())
++        {
++            // (another known function: its table entry read here - the runtime takes the
++            // dispatcher's way when it is empty)
++            m_ss << fmt::format(
++                "{}if (!runtime->dispatchGuestCall(rdram, ctx, 0x{:X}u, 0x{:X}u, 0x{:X}u, PS2_CALL_TARGET(0x{:X}u))) {{\n",
++                indent, target, branchPc(), fallthroughPc(), target);
++            m_ss << fmt::format("{}    return;\n", indent);
++            m_ss << fmt::format("{}}}\n", indent);
++            return;
++        }
+         emitRuntimeBranchDispatch(fmt::format("0x{:X}u", target),
+                                   branchPc(),
+                                   isCall ? fallthroughPc() : 0u,
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -243,7 +243,7 @@ namespace ps2recomp
+         if (cg.m_registerCache && cg.fastCodegenFor(function.start))
+         {
+             std::string whyNot;
+-            if (!applyRegisterCache(text, whyNot) && !whyNot.empty() && cg.m_reporter)
++            if (!applyRegisterCache(text, whyNot, cg.m_registerWriteBack) && !whyNot.empty() && cg.m_reporter)
+             {
+                 cg.m_reporter->warning("register-cache", function.name + " left as it is: " + whyNot);
+             }
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1031,6 +1031,9 @@ namespace ps2recomp
+                 }
+                 m_codeGenerator->setFastCodegen(m_config.registerCache, m_config.indirectCallResumeOnly,
+                                                 m_config.minimalPcStores, std::move(fastOnly));
++                m_codeGenerator->m_registerWriteBack = m_config.registerWriteBack;
++                m_codeGenerator->m_directCalls = m_config.directCalls;
++                m_codeGenerator->m_directCallSites = m_config.directCallSites;
+             }
+ 
+             fs::create_directories(m_config.outputPath);
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -358,6 +358,25 @@ public:
+                              uint32_t fallthroughPc,
+                              GuestBranchKind kind,
+                              const char *debugName);
++    // (FPS round 3) A `jal` to a function of the generated table: dispatchGuestBranch for a
++    // DirectCall, with the target's table entry read by the generated code itself
++    // (PS2_CALL_TARGET: one load from a fixed place, instead of the dispatcher's lookup). The
++    // entry IS what the lookup returns - a replaced function's replacement - so the same function
++    // is entered; a null one (or PS2X_DIRECT_CALLS=0) takes dispatchGuestBranch.
++    bool dispatchGuestCall(uint8_t *rdram,
++                           R5900Context *ctx,
++                           uint32_t targetPc,
++                           uint32_t sourcePc,
++                           uint32_t fallthroughPc,
++                           RecompiledFunction targetFn);
++    // (FPS round 3) dispatchGuestCall in three parts for Ps2CallKnown, which makes the call itself
++    // in the generated code: callBegin = the checkpoint (0: due, the caller returns) and the
++    // call's level; callEnd = everything after the target returned (the level given back).
++    // dispatchUnwound: a transfer (EeDispatcherTransfer) left the levels' calls - level 0 again,
++    // as their scopes leave it in dispatchGuestBranch (the scheduler calls it where it catches one).
++    uint32_t callBegin(R5900Context *ctx, uint32_t targetPc);
++    bool callEnd(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t fallthroughPc, uint32_t level);
++    static void dispatchUnwound() noexcept;
+     void reportMissingFunction(uint8_t *rdram,
+                                R5900Context *ctx,
+                                uint32_t targetPc,
+@@ -494,6 +513,13 @@ private:
+     void freeGuestBlockLocked(uint32_t guestAddr);
+     void coalesceGuestHeapLocked();
+     void HandleIntegerOverflow(R5900Context *ctx);
++    // (dispatchGuestBranch / dispatchGuestCall) a call after its checkpoint: the target entered
++    // and how the call ended.
++    bool enterCall(uint8_t *rdram, R5900Context *ctx, RecompiledFunction targetFn, uint32_t targetPc,
++                   uint32_t sourcePc, uint32_t fallthroughPc, GuestBranchKind kind, const char *debugName);
++    template <typename Thread>
++    bool afterCall(uint8_t *rdram, R5900Context *ctx, Thread &thread, uint32_t targetPc, uint32_t entryPc,
++                   uint32_t fallthroughPc, uint32_t level);
+ 
+     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
+@@ -572,4 +598,35 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
+ extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
+ extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
+ 
++// (FPS round 3) The generated code's scratchpad loads and stores inline (ps2_runtime_macros.h);
++// PS2X_INLINE_SCRATCHPAD=0: through PS2Runtime::Load*/Store* as before.
++extern const bool g_ps2InlineScratchpad;
++
++// (FPS round 3) The function-table entry of a function's address (nullptr outside the table):
++// PS2Runtime::dispatchGuestCall's target, read by the generated code for a `jal`.
++#define PS2_CALL_TARGET(address)                                                                      \
++    (static_cast<uint32_t>((address) - g_ps2RecompiledFunctionTableBase) <                            \
++             static_cast<uint32_t>(g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) \
++         ? g_ps2RecompiledFunctionTable[static_cast<uint32_t>((address) - g_ps2RecompiledFunctionTableBase) >> 2] \
++         : nullptr)
++
++// (FPS round 3) A `jal` to a generated function (`known`): its table entry read here; when that is
++// still `known` (not replaced), the call made right here - each site its own direct call, where the
++// dispatcher had one indirect call for every target - between PS2Runtime::callBegin and callEnd,
++// which do what dispatchGuestCall does before and after it. Else (replaced, missing) and with
++// PS2X_DIRECT_CALLS=0 or 1: dispatchGuestCall (1: the entry read, 0: the lookup).
++extern const int g_ps2DirectCalls;
++static PS2_FORCEINLINE bool Ps2CallKnown(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t target,
++                                         uint32_t source, uint32_t fallthrough, PS2Runtime::RecompiledFunction known)
++{
++    const PS2Runtime::RecompiledFunction fn = PS2_CALL_TARGET(target);
++    if (fn != known || g_ps2DirectCalls != 2) [[unlikely]]
++        return runtime->dispatchGuestCall(rdram, ctx, target, source, fallthrough, fn);
++    const uint32_t level = runtime->callBegin(ctx, target);
++    if (level == 0u)
++        return false;
++    known(rdram, ctx, runtime);
++    return runtime->callEnd(rdram, ctx, target, fallthrough, level);
++}
++
+ #endif // PS2_RUNTIME_H
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -425,6 +425,34 @@ static inline bool Ps2ScratchpadRead(uint32_t addr, T &value)
+     return true;
+ }
+ 
++// (FPS round 3) The scratchpad straight from the generated code, before the special-address
++// tests and the call (PS2Runtime::Load*/Store* did the same after them): an aligned access in its
++// 16 KB, no side effect either way. PS2X_INLINE_SCRATCHPAD=0: the call as before.
++template <typename T>
++static PS2_FORCEINLINE bool Ps2ScratchpadInlineRead(uint32_t addr, T &value)
++{
++    const uint32_t offset = addr - PS2_SCRATCHPAD_BASE;
++    if (!g_ps2InlineScratchpad || offset > PS2_SCRATCHPAD_SIZE - sizeof(T) || (addr & (sizeof(T) - 1u)) != 0u)
++        return false;
++    const uint8_t *scratchpad = ps2GetScratchpadHostPtr();
++    if (!scratchpad)
++        return false;
++    std::memcpy(&value, scratchpad + offset, sizeof(T));
++    return true;
++}
++template <typename T>
++static PS2_FORCEINLINE bool Ps2ScratchpadInlineWrite(uint32_t addr, const T &value)
++{
++    const uint32_t offset = addr - PS2_SCRATCHPAD_BASE;
++    if (!g_ps2InlineScratchpad || offset > PS2_SCRATCHPAD_SIZE - sizeof(T) || (addr & (sizeof(T) - 1u)) != 0u)
++        return false;
++    uint8_t *scratchpad = ps2GetScratchpadHostPtr();
++    if (!scratchpad)
++        return false;
++    std::memcpy(scratchpad + offset, &value, sizeof(T));
++    return true;
++}
++
+ // Guest loads (READ8 ... READ128): main RAM inline in the generated code, the rest - the
+ // scratchpad, I/O and VU memory, the BIOS - through a call kept out of its way. (Until
+ // 2026-10-04 these were immediately invoked lambdas, which the compiler did not always inline
+@@ -439,6 +467,11 @@ static inline bool Ps2ScratchpadRead(uint32_t addr, T &value)
+     static PS2_FORCEINLINE type Ps2Read##bits(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,   \
+                                              uint32_t addr)                                         \
+     {                                                                                               \
++        if (addr < PS2_RAM_SIZE) /* (isSpecialAddress's first test) */                              \
++            return Ps2FastRead##bits(rdram, addr);                                                  \
++        type value;                                                                                 \
++        if (Ps2ScratchpadInlineRead(addr, value))                                                   \
++            return value;                                                                           \
+         return PS2Runtime::isSpecialAddress(addr) ? Ps2ReadSpecial##bits(rdram, ctx, runtime, addr)  \
+                                                   : Ps2FastRead##bits(rdram, addr);                  \
+     }
+@@ -460,7 +493,10 @@ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+     {                                                                                \
+         uint32_t _addr = (addr);                                                     \
+         if (PS2Runtime::isSpecialAddress(_addr))                                     \
+-            runtime->Store8(rdram, ctx, _addr, (val));                               \
++        {                                                                            \
++            if (!Ps2ScratchpadInlineWrite(_addr, (uint8_t)(val)))                    \
++                runtime->Store8(rdram, ctx, _addr, (val));                           \
++        }                                                                            \
+         else                                                                         \
+         {                                                                            \
+             ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
+@@ -473,7 +509,10 @@ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+     {                                                                                  \
+         uint32_t _addr = (addr);                                                       \
+         if (PS2Runtime::isSpecialAddress(_addr))                                       \
+-            runtime->Store16(rdram, ctx, _addr, (val));                                \
++        {                                                                              \
++            if (!Ps2ScratchpadInlineWrite(_addr, (uint16_t)(val)))                     \
++                runtime->Store16(rdram, ctx, _addr, (val));                            \
++        }                                                                              \
+         else                                                                           \
+         {                                                                              \
+             ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
+@@ -486,7 +525,12 @@ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+     {                                                                                  \
+         uint32_t _addr = (addr);                                                       \
+         if (PS2Runtime::isSpecialAddress(_addr))                                       \
+-            runtime->Store32(rdram, ctx, _addr, (val));                                \
++        {                                                                              \
++            if (Ps2ScratchpadInlineWrite(_addr, (uint32_t)(val)))                      \
++                runtime->drainCompletedDmacHandlers(rdram); /* (as Store32 there) */   \
++            else                                                                       \
++                runtime->Store32(rdram, ctx, _addr, (val));                            \
++        }                                                                              \
+         else                                                                           \
+         {                                                                              \
+             ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
+@@ -499,7 +543,10 @@ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+     {                                                                                  \
+         uint32_t _addr = (addr);                                                       \
+         if (PS2Runtime::isSpecialAddress(_addr))                                       \
+-            runtime->Store64(rdram, ctx, _addr, (val));                                \
++        {                                                                              \
++            if (!Ps2ScratchpadInlineWrite(_addr, (uint64_t)(val)))                     \
++                runtime->Store64(rdram, ctx, _addr, (val));                            \
++        }                                                                              \
+         else                                                                           \
+         {                                                                              \
+             ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
+@@ -513,7 +560,10 @@ PS2_READ_FUNCTIONS(128, __m128i, Load128)
+         uint32_t _addr = (addr);                                                     \
+         __m128i _value = (val);                                                      \
+         if (PS2Runtime::isSpecialAddress(_addr))                                     \
+-            runtime->Store128(rdram, ctx, _addr, _value);                            \
++        {                                                                            \
++            if (!Ps2ScratchpadInlineWrite(_addr, _value))                            \
++                runtime->Store128(rdram, ctx, _addr, _value);                        \
++        }                                                                            \
+         else                                                                         \
+         {                                                                            \
+             const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -444,6 +444,7 @@ void EeScheduler::run()
+         }
+         catch (const EeDispatcherTransfer &)
+         {
++            PS2Runtime::dispatchUnwound(); // (FPS round 3: the calls Ps2CallKnown made left without their scopes)
+             ++g_eeDispatchStats.transfers;
+             m_countContext = nullptr;
+             m_guestExecuting.store(false, std::memory_order_release);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1852,6 +1852,49 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     DispatchThread &thread = g_dispatchThread;
+     const RecompiledFunction targetFn = callTarget(thread, targetPc);
++    return enterCall(rdram, ctx, targetFn, targetPc, sourcePc, fallthroughPc, kind, debugName);
++}
++
++extern const bool g_ps2InlineScratchpad = []()
++{
++    const char *env = std::getenv("PS2X_INLINE_SCRATCHPAD");
++    return !env || *env != '0';
++}();
++
++// PS2X_DIRECT_CALLS: 0 = a `jal` looks its target up in the dispatcher as before, 1 = the target's
++// table entry read by the generated code (dispatchGuestCall), 2 (the default) = also the call made at
++// the jal's site (Ps2CallKnown). (A/B)
++extern const int g_ps2DirectCalls = []()
++{
++    const char *env = std::getenv("PS2X_DIRECT_CALLS");
++    return env && (*env == '0' || *env == '1') ? *env - '0' : 2;
++}();
++
++bool PS2Runtime::dispatchGuestCall(uint8_t *rdram,
++                                   R5900Context *ctx,
++                                   uint32_t targetPc,
++                                   uint32_t sourcePc,
++                                   uint32_t fallthroughPc,
++                                   RecompiledFunction targetFn)
++{
++    if (g_ps2DirectCalls == 0 || !targetFn) [[unlikely]]
++        return dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, GuestBranchKind::DirectCall, "JAL");
++    ctx->pc = targetPc;
++    // (dispatchGuestBranch's checkpoint, at the same place)
++    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++    {
++        return false;
++    }
++    return enterCall(rdram, ctx, targetFn, targetPc, sourcePc, fallthroughPc, GuestBranchKind::DirectCall, "JAL");
++}
++
++// The rest of a call after its checkpoint: the function entered, and how the call ended.
++PS2_FORCEINLINE bool PS2Runtime::enterCall(uint8_t *rdram, R5900Context *ctx, RecompiledFunction targetFn,
++                                           uint32_t targetPc, uint32_t sourcePc, uint32_t fallthroughPc,
++                                           GuestBranchKind kind, const char *debugName)
++{
++    const bool isCall = true;
++    DispatchThread &thread = g_dispatchThread;
+     if (!targetFn)
+     {
+         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+@@ -1891,7 +1934,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         ~LevelScope() { --t.level; }
+     } levelScope{thread, level};
+     targetFn(rdram, ctx, this);
++    return afterCall(rdram, ctx, thread, targetPc, entryPc, fallthroughPc, level);
++}
+ 
++// How a call ended, its level still the thread's (enterCall's scope, callEnd's).
++template <typename Thread>
++PS2_FORCEINLINE bool PS2Runtime::afterCall(uint8_t *rdram, R5900Context *ctx, Thread &thread, uint32_t targetPc,
++                                           uint32_t entryPc, uint32_t fallthroughPc, uint32_t level)
++{
+     if (isStopRequested() || ctx->pc == 0u)
+     {
+         return false;
+@@ -1966,6 +2016,37 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     return false;
+ }
+ 
++uint32_t PS2Runtime::callBegin(R5900Context *ctx, uint32_t targetPc)
++{
++    // (dispatchGuestCall up to the call: its checkpoint, then enterCall's history and level)
++    ctx->pc = targetPc;
++    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++        return 0u;
++    DispatchThread &thread = g_dispatchThread;
++    pushDispatchPc(thread.history, targetPc);
++    const uint32_t level = thread.level + 1u;
++    thread.level = level;
++    if (level < kDispatchLevels)
++        thread.resumedByDispatcher[level] = false;
++    return level;
++}
++
++bool PS2Runtime::callEnd(uint8_t *rdram, R5900Context *ctx, uint32_t targetPc, uint32_t fallthroughPc, uint32_t level)
++{
++    DispatchThread &thread = g_dispatchThread;
++    struct LevelEnd
++    {
++        DispatchThread &t;
++        ~LevelEnd() { --t.level; }
++    } levelEnd{thread};
++    return afterCall(rdram, ctx, thread, targetPc, targetPc, fallthroughPc, level);
++}
++
++void PS2Runtime::dispatchUnwound() noexcept
++{
++    g_dispatchThread.level = 0u;
++}
++
+ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+ {
+     if (exception == EXCEPTION_INTEGER_OVERFLOW)
+@@ -2600,6 +2681,9 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+ 
+ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    uint8_t scratch;
++    if (Ps2ScratchpadInlineRead(vaddr, scratch)) // (FPS round 3)
++        return scratch;
+     try
+     {
+         return m_memory.read8(vaddr);
+@@ -2613,6 +2697,9 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ 
+ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    uint16_t scratch;
++    if (Ps2ScratchpadInlineRead(vaddr, scratch)) // (FPS round 3)
++        return scratch;
+     try
+     {
+         return m_memory.read16(vaddr);
+@@ -2626,6 +2713,9 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ 
+ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    uint32_t scratch;
++    if (Ps2ScratchpadInlineRead(vaddr, scratch)) // (FPS round 3)
++        return scratch;
+     try
+     {
+         return m_memory.read32(vaddr);
+@@ -2639,6 +2729,9 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ 
+ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    uint64_t scratch;
++    if (Ps2ScratchpadInlineRead(vaddr, scratch)) // (FPS round 3)
++        return scratch;
+     try
+     {
+         return m_memory.read64(vaddr);
+@@ -2652,6 +2745,9 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ 
+ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
++    __m128i scratch;
++    if (Ps2ScratchpadInlineRead(vaddr, scratch)) // (FPS round 3)
++        return scratch;
+     try
+     {
+         return m_memory.read128(vaddr);
+diff --git a/ps2xRecomp/include/ps2recomp/register_cache.h b/ps2xRecomp/include/ps2recomp/register_cache.h
+--- a/ps2xRecomp/include/ps2recomp/register_cache.h
++++ b/ps2xRecomp/include/ps2recomp/register_cache.h
+@@ -15,7 +15,12 @@ namespace ps2recomp
+     // `functionText` is FunctionEmitter's output for one function and is rewritten in place.
+     // False when it is left as it is: nothing to cache (`whyNot` empty), or something the rewrite
+     // does not know (`whyNot` says what).
+-    bool applyRegisterCache(std::string &functionText, std::string &whyNot);
++    //
++    // `writeBack` (RecompilerConfig::registerWriteBack): a write goes to the local only, and the
++    // registers written since the context was last current are stored back right before what can
++    // look at the context - a call or jump to another function, the dispatcher, a syscall or stub,
++    // a return (a loop's checkpoint too, inside its `if`) - instead of at every write.
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack = false);
+ 
+     // Whether an instruction's C++ (one or more lines) can look at ctx->pc or the delay slot's
+     // state: it hands the context to the runtime or another function, raises an exception,
+diff --git a/ps2xRecomp/src/lib/register_cache.cpp b/ps2xRecomp/src/lib/register_cache.cpp
+--- a/ps2xRecomp/src/lib/register_cache.cpp
++++ b/ps2xRecomp/src/lib/register_cache.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <bitset>
++#include <unordered_map>
+ #include <cctype>
+ #include <string_view>
+ #include <vector>
+@@ -159,9 +160,11 @@ namespace ps2recomp
+         // Register 0 keeps the macros (their constant 0, and a write dropped unevaluated).
+         // ctx->f[n] becomes rf_<n> (written when assigned or its address taken).
+         bool rewriteLine(std::string_view line, const std::vector<char> &code, std::string &out,
+-                         Registers &regs, std::bitset<32> &fpWrites, std::string &whyNot)
++                         Registers &regs, std::bitset<32> &fpWrites, std::bitset<32> &gprWrites,
++                         bool writeBack, std::string &whyNot)
+         {
+             fpWrites.reset();
++            gprWrites.reset();
+             out.clear();
+             size_t i = 0;
+             while (i < line.size())
+@@ -252,13 +255,21 @@ namespace ps2recomp
+                 }
+                 else
+                 {
+-                    out.append(macro->cached);
++                    // (write-back: a write to the local only - RC_PUT_*; a 128-bit write keeps
++                    // RC_SET_VEC, which stores the whole register)
++                    if (writeBack && macro->write && macro->cached != "RC_SET_VEC")
++                        out.append("RC_PUT").append(macro->cached.substr(6));
++                    else
++                        out.append(macro->cached);
+                     out.push_back('(');
+                     out.append(std::to_string(reg));
+                     out.append(macro->write ? "," : ")"); // (the value keeps its space)
+                     regs.used.set(static_cast<size_t>(reg));
+                     if (macro->write)
++                    {
+                         regs.written.set(static_cast<size_t>(reg));
++                        gprWrites.set(static_cast<size_t>(reg));
++                    }
+                 }
+                 i = p;
+             }
+@@ -401,7 +412,8 @@ namespace ps2recomp
+                     else
+                     {
+                         const std::string_view callee = calleeOf(line, code, i);
+-                        if (callee == "runtime->dispatchGuestBranch")
++                        if (callee == "runtime->dispatchGuestBranch" || callee == "runtime->dispatchGuestCall" ||
++                            callee == "Ps2CallKnown")
+                         {
+                             facts.dispatch = true;
+                         }
+@@ -480,7 +492,7 @@ namespace ps2recomp
+         return false;
+     }
+ 
+-    bool applyRegisterCache(std::string &functionText, std::string &whyNot)
++    bool applyRegisterCache(std::string &functionText, std::string &whyNot, bool writeBack)
+     {
+         whyNot.clear();
+         static constexpr std::string_view kSignatureEnd =
+@@ -511,12 +523,13 @@ namespace ps2recomp
+         Registers regs;
+         std::vector<std::string> rewritten(lines.size());
+         std::vector<std::bitset<32>> fpWrites(lines.size());
++        std::vector<std::bitset<32>> gprWrites(lines.size());
+         std::vector<char> code;
+         for (size_t n = 0; n < lines.size(); ++n)
+         {
+             const std::string line = bitCastFpMoves(lines[n]);
+             markCode(line, code);
+-            if (!rewriteLine(line, code, rewritten[n], regs, fpWrites[n], whyNot))
++            if (!rewriteLine(line, code, rewritten[n], regs, fpWrites[n], gprWrites[n], writeBack, whyNot))
+                 return false;
+         }
+         if (regs.used.none() && regs.fpUsed.none())
+@@ -556,6 +569,17 @@ namespace ps2recomp
+         out.append(functionText, includeAt, bodyStart - includeAt);
+         out.append("    ").append(declare).append("\n");
+ 
++        // Write-back: the registers that may be written but not stored back yet where each label
++        // is reached by a goto (the entry's resume switch: none). The text is made again until
++        // the labels' states hold every goto's (they only grow, so this ends); without
++        // write-back, once.
++        using DirtyPair = std::pair<std::bitset<32>, std::bitset<32>>;
++        std::unordered_map<std::string, DirtyPair> labelIn, gotoOut;
++        const size_t prefixSize = out.size();
++        for (int pass = 0;; ++pass)
++        {
++        out.resize(prefixSize);
++        gotoOut.clear();
+         // Whether the locals hold the registers: false after a call or jump handed the context
+         // over, until the code after it or a label (only unreachable code reads them there).
+         bool valid = true;
+@@ -576,10 +600,67 @@ namespace ps2recomp
+         {
+             out.append(indent).append(text).push_back('\n');
+         };
++        // Write-back: the registers written since the context last had them (a superset: a
++        // label takes the union of the ways to it, a block's end the union of the ways out of
++        // it), stored back before what can look at the context.
++        std::bitset<32> dirty, fpDirty;
++        std::vector<std::pair<std::bitset<32>, std::bitset<32>>> blocks;
++        auto putWriteBack = [&](std::string_view indent)
++        {
++            if (!writeBack || (dirty.none() && fpDirty.none()))
++                return;
++            std::string stores;
++            for (int reg = 1; reg < 32; ++reg)
++            {
++                if (dirty.test(static_cast<size_t>(reg)))
++                    add(stores, "RC_WB", reg);
++            }
++            for (int reg = 0; reg < 32; ++reg)
++            {
++                if (fpDirty.test(static_cast<size_t>(reg)))
++                    add(stores, "RC_FST", reg);
++            }
++            out.append(indent).append(stores).push_back('\n');
++        };
++        auto clearDirty = [&]()
++        {
++            dirty.reset();
++            fpDirty.reset();
++        };
++        // The braces of a line in order: a block's start keeps the state before it, its end
++        // joins that (the way past the block) with the state at the end.
++        auto trackBlocks = [&](const std::string &text)
++        {
++            if (!writeBack)
++                return;
++            markCode(text, code);
++            for (size_t i = 0; i < text.size(); ++i)
++            {
++                if (!code[i])
++                    continue;
++                if (text[i] == '{')
++                {
++                    blocks.emplace_back(dirty, fpDirty);
++                }
++                else if (text[i] == '}' && !blocks.empty())
++                {
++                    dirty |= blocks.back().first;
++                    fpDirty |= blocks.back().second;
++                    blocks.pop_back();
++                }
++            }
++        };
+         // A line, then the FPU registers it wrote to the context.
+         auto putCode = [&](size_t n, std::string_view indent)
+         {
+             out.append(rewritten[n]).push_back('\n');
++            if (writeBack)
++            {
++                dirty |= gprWrites[n];
++                dirty.reset(0);
++                fpDirty |= fpWrites[n];
++                return;
++            }
+             if (fpWrites[n].none())
+                 return;
+             std::string stores;
+@@ -612,6 +693,9 @@ namespace ps2recomp
+                         // Both ways return: the dispatch, or ctx->pc and return.
+                         if (expect != Expect::None)
+                             return fail("a return inside a call's unwind", t);
++                        if (valid)
++                            putWriteBack(indent);
++                        clearDirty();
+                         valid = false;
+                     }
+                     strictRegions.push_back(strict);
+@@ -629,7 +713,15 @@ namespace ps2recomp
+             {
+                 if (expect != Expect::None)
+                     return fail("a label inside a call's unwind", t);
++                if (!valid)
++                    clearDirty(); // (no way falls into it)
+                 valid = true;
++                const auto in = labelIn.find(std::string(t.substr(0, t.size() - 1)));
++                if (in != labelIn.end())
++                {
++                    dirty |= in->second.first;
++                    fpDirty |= in->second.second;
++                }
+                 out.append(line).push_back('\n');
+                 continue;
+             }
+@@ -646,6 +738,7 @@ namespace ps2recomp
+                 if (t != "return;")
+                     return fail("not a return after a call", t);
+                 out.append(line).push_back('\n');
++                trackBlocks(line);
+                 expect = Expect::Close;
+                 continue;
+             }
+@@ -654,7 +747,9 @@ namespace ps2recomp
+                 if (t != "}")
+                     return fail("not the end of a call", t);
+                 out.append(line).push_back('\n');
++                trackBlocks(line);
+                 putLine(indent, reload);
++                clearDirty(); // (the locals loaded from the context again)
+                 valid = true;
+                 expect = Expect::None;
+                 continue;
+@@ -664,11 +759,16 @@ namespace ps2recomp
+             {
+                 if (facts.call)
+                     return fail("a call beside a branch", t);
+-                if (t.starts_with("if (!runtime->dispatchGuestBranch(") && t.ends_with(")) {"))
++                if ((t.starts_with("if (!runtime->dispatchGuestBranch(") || t.starts_with("if (!runtime->dispatchGuestCall(") ||
++                     t.starts_with("if (!Ps2CallKnown(")) &&
++                    t.ends_with(")) {"))
+                 {
+                     if (!valid)
+                         return fail("a call after a transfer", t);
++                    putWriteBack(indent);
++                    clearDirty();
+                     out.append(line).push_back('\n');
++                    trackBlocks(line);
+                     valid = false;
+                     expect = Expect::Return;
+                     continue;
+@@ -677,6 +777,7 @@ namespace ps2recomp
+                     !strictRegions.empty() && strictRegions.back() && !valid)
+                 {
+                     out.append(line).push_back('\n');
++                    trackBlocks(line);
+                     continue;
+                 }
+                 return fail("an unknown branch", t);
+@@ -691,23 +792,62 @@ namespace ps2recomp
+                 if (t == std::string(facts.callee) + "(rdram, ctx, runtime); return;")
+                 {
+                     // A jump to another function: it has the context from here on.
++                    putWriteBack(indent);
++                    clearDirty();
+                     out.append(line).push_back('\n');
+                     valid = false;
+                     continue;
+                 }
+                 if (facts.hasReturn || facts.hasGoto || facts.braces != 0 || (t.back() != ';' && t.back() != '}'))
+                     return fail("an unknown call", t);
++                putWriteBack(indent);
+                 out.append(line).push_back('\n');
+                 putLine(indent, reload);
++                clearDirty();
+                 continue;
+             }
+ 
+             if (!valid && (facts.cached || facts.hasGoto))
+                 return fail("registers used after a transfer", t);
++            // (a return - a function's end, a loop's checkpoint - or a throw hands the context on)
++            if (valid && (facts.hasReturn || t.find("throw") != std::string_view::npos))
++                putWriteBack(indent);
+             putCode(n, indent);
++            if (writeBack && facts.hasGoto)
++            {
++                // (the state each goto takes to its label)
++                for (size_t at = line.find("goto "); at != std::string::npos; at = line.find("goto ", at + 5))
++                {
++                    size_t end = at + 5;
++                    while (end < line.size() && isIdentChar(line[end]))
++                        ++end;
++                    DirtyPair &to = gotoOut[line.substr(at + 5, end - at - 5)];
++                    to.first |= dirty;
++                    to.second |= fpDirty;
++                }
++            }
++            trackBlocks(line);
+         }
++        if (valid)
++            putWriteBack("    "); // (the end of the body: the function falls through to its caller)
+         if (expect != Expect::None || !strictRegions.empty())
+             return fail("the function ends inside a call or #if", "");
++        if (!writeBack)
++            break;
++        bool grew = false;
++        for (const auto &[label, state] : gotoOut)
++        {
++            DirtyPair &in = labelIn[label];
++            const DirtyPair joined{in.first | state.first, in.second | state.second};
++            if (joined != in)
++            {
++                in = joined;
++                grew = true;
++            }
++        }
++        if (!grew)
++            break;
++        }
+         out.append(functionText, close + 1, std::string::npos);
+         functionText = std::move(out);
+         return true;
+diff --git a/ps2xRuntime/include/ps2_register_cache.h b/ps2xRuntime/include/ps2_register_cache.h
+--- a/ps2xRuntime/include/ps2_register_cache.h
++++ b/ps2xRuntime/include/ps2_register_cache.h
+@@ -68,6 +68,17 @@ static PS2_FORCEINLINE __m128i Ps2RcVec(const __m128i &reg, uint64_t low)
+         Ps2RcStore(ctx->r[n], rc_##n);                  \
+     } while (0)
+ #define RC_SET_S64(n, val) RC_SET_U64(n, val)
++
++// The write-back form (ps2xRecomp register_write_back): a write goes to the local only; the
++// generated code stores the registers written since back (RC_WB) before anything that can look
++// at the context - a call, a jump to another function, a syscall, a return.
++#define RC_PUT_U32(n, val) (rc_##n = static_cast<uint64_t>((int64_t)(int32_t)(val)))
++#define RC_PUT_S32(n, val) RC_PUT_U32(n, val)
++#define RC_PUT_ZE32(n, val) (rc_##n = static_cast<uint64_t>((int64_t)(uint32_t)(val)))
++#define RC_PUT_U64(n, val) (rc_##n = static_cast<uint64_t>((int64_t)(val)))
++#define RC_PUT_S64(n, val) RC_PUT_U64(n, val)
++#define RC_WB(n) Ps2RcStore(ctx->r[n], rc_##n)
++
+ #define RC_SET_VEC(n, val)              \
+     do                                  \
+     {                                   \

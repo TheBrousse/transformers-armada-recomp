@@ -1,0 +1,57 @@
+Subject: [PATCH] Scheduler: a settable pacing lag (the game's fixed logic rate catches its late frames up)
+
+EeScheduler::setMaxPacingLag(vblanks): how far behind the VBlank schedule pacing may fall and still catch up
+(0: the default, kMaxPacingLagVBlanks = 2). Transformers' fixed logic rate (TODO 161 a) sets about 100 ms of
+VBlanks in a level: a late frame is followed by frames back to back, their pictures left out by the renderer,
+so the game's time is not lost.
+---
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -423,6 +423,9 @@
+     // A factor for the cycles executed guest code is charged (0: PS2X_EE_CYCLE_SCALE, 1 by
+     // default). Below 1 the EE runs faster than the console's: more code fits in a VBlank.
+     void setCycleScale(double factor) noexcept;
++    // How far behind its VBlank schedule pacing may fall and still catch up (0: the default, kMaxPacingLagVBlanks): a
++    // game whose logic must keep its rate (its pictures left out instead) runs its late frames back to back.
++    void setMaxPacingLag(int vblanks) noexcept { m_maxPacingLag.store(vblanks, std::memory_order_relaxed); }
+     // The factor executed guest code is charged now, in 1/256 (setCycleScale's, else PS2X_EE_CYCLE_SCALE's; 256 = 1).
+     [[nodiscard]] uint32_t currentCycleScale256() const noexcept
+     {
+@@ -711,6 +714,7 @@
+     uint64_t m_eeCycle = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::atomic<uint32_t> m_cycleScaleOverride{0u}; // setCycleScale, in 1/256 (0: none)
++    std::atomic<int> m_maxPacingLag{0}; // setMaxPacingLag (0: kMaxPacingLagVBlanks)
+     std::atomic<int64_t> m_vblankPeriodNs{kConsoleVBlankPeriod.count()}; // setVBlankPeriod
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2178,6 +2178,7 @@
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
+                 const auto now = hostNow();
++                const int maxLag = m_maxPacingLag.load(std::memory_order_relaxed) > 0 ? m_maxPacingLag.load(std::memory_order_relaxed) : kMaxPacingLagVBlanks;
+                 // PS2X_PACE_STATS=1: every 120 VBlanks, how late they came against the
+                 // host's clock and how often the schedule was given up and restarted.
+                 static const bool paceStats = []
+@@ -2193,7 +2194,7 @@
+                     const double late = std::chrono::duration<double, std::milli>(now - scheduled.hostDeadline).count();
+                     lateSum += late;
+                     lateMost = std::max(lateMost, late);
+-                    if (now - scheduled.hostDeadline > vblankPeriod() * kMaxPacingLagVBlanks)
++                    if (now - scheduled.hostDeadline > vblankPeriod() * maxLag)
+                         ++restarts;
+                     if (++count == 120u)
+                     {
+@@ -2211,7 +2212,7 @@
+                 // count long before 16.7 ms have passed whenever the frame's work is in
+                 // the other half of the frame); left one period behind, it carries on.
+                 const auto period = vblankPeriod();
+-                if (now - scheduled.hostDeadline > period * kMaxPacingLagVBlanks)
++                if (now - scheduled.hostDeadline > period * maxLag)
+                     scheduled.hostDeadline = now - period;
+                 m_paceCycle = scheduled.deadlineCycle;
+                 m_paceHost = scheduled.hostDeadline;

@@ -1,0 +1,407 @@
+Subject: [PATCH] VIF1: lite transfers - no UNPACK into VU1 memory, no programs, while the port asks
+
+ps2vif1::setLite(predicate): while it answers true (asked once per transfer), VIF1 leaves
+out the work only VU1's programs use: an UNPACK writes nothing into VU1 data memory and
+MSCAL / MSCALF / MSCNT start no program (TOP / ITOP / DBF bookkeeping as before). MPG,
+DIRECT / DIRECTHL, the registers, MARK and the interrupts are unchanged. For a port whose
+renderer draws from the display list in main memory and in which nothing reads VU1's
+results (Transformers roadmap N5.2). Null predicate (the default): nothing changes.
+
+ps2vif1::setLiteScan(predicate): the same for the scan of each transfer on the EE's
+thread. Answering 1, the GIF data of DIRECT is not walked (its GS registers only serve
+the readbacks ahead of the queue; those are answered the plain way meanwhile and for 120
+readbacks after); interrupts and MARK as before. Answering 3, the same, and the scan done
+on the VIF1 thread as the transfer comes up instead of on the EE's before it is queued:
+the interrupts and MARK come when VIF1 gets there (as on the console), VIF1_STAT / MARK
+read what it has got to (g_scan under a lock; a scan back on the EE's thread first waits
+for the pending ones). Answering 2, walked as before on the EE's thread, but the readbacks
+met and the EE's VIF1_STAT / MARK reads with a transfer still queued are counted (a check
+mode). Null (the default): nothing changes.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vif1_thread.h b/ps2xRuntime/include/runtime/ps2_vif1_thread.h
+index e6894d5..78f1cfe 100644
+--- a/ps2xRuntime/include/runtime/ps2_vif1_thread.h
++++ b/ps2xRuntime/include/runtime/ps2_vif1_thread.h
+@@ -88,6 +88,23 @@ namespace ps2vif1
+     bool readUnobserved(uint32_t physicalAddress, uint32_t bytes, uint32_t &value);
+     bool writeUnobserved(PS2Memory &memory, uint32_t physicalAddress, uint32_t bytes, uint32_t value);
+ 
++    // Lite transfers (the game port's choice: Transformers' roadmap N5.2). While the predicate answers true - a native
++    // renderer draws everything from the display list in main memory, and nothing reads what VU1 makes of it - VIF1
++    // leaves out the work that only VU1's programs use: an UNPACK writes nothing into VU1 data memory, and MSCAL /
++    // MSCALF / MSCNT start no program (their TOP / ITOP / DBF bookkeeping as before). MPG, DIRECT / DIRECTHL (the GIF),
++    // the registers, MARK and the interrupts are as before. Asked once per transfer. Null (the default): never.
++    void setLite(bool (*predicate)());
++    bool liteNow();
++    // The same for the scan of each transfer on the EE's thread (before it is queued): while the predicate answers 1, the
++    // GIF data of DIRECT is not walked - its GS registers only serve the readbacks ahead of the queue, and those are
++    // answered the plain way meanwhile (and for a while after it: until the registers are known again). The interrupts
++    // and MARK as before. 2: walked as before, but counted as if lite (the port's check mode): the readbacks met then,
++    // and the EE's reads of VIF1_STAT / VIF1_MARK while a transfer was still queued. 3: as 1, and the scan done on the
++    // VIF1 thread as the transfer comes up, not on the EE's before it is queued - the interrupts and MARK then come
++    // when VIF1 gets to the transfer (as on the console), and VIF1_STAT / VIF1_MARK read what it has got to.
++    // Asked once per transfer. Null (the default): never.
++    void setLiteScan(int (*predicate)());
++
+     // How far the thread is in the transfer it is processing (the interpreter reports it).
+     void progress(uint32_t offsetInTransfer);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+index 78f3da2..4eaba86 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+@@ -117,6 +117,23 @@ namespace
+     }
+     std::atomic<bool> g_path1SetsTargets{false};
+     std::atomic<bool> g_aheadFailed{false};
++    int (*g_liteScanPredicate)() = nullptr; // (setLiteScan; the EE's thread)
++    int g_liteScanState = 0;                // what it answered for the last transfer
++    uint64_t g_liteScanReadbacks = 0u;
++    std::chrono::steady_clock::time_point g_liteScanLast{};
++    // (setLiteScan 3: g_scan is then also the VIF1 thread's - every access to it under this lock)
++    std::mutex g_scanMutex;
++    std::atomic<uint64_t> g_scansPending{0u};      // transfers queued whose scan the VIF1 thread has still to do
++    std::atomic<uint64_t> g_liteRegisterReads{0u}; // the EE's VIF1_STAT / VIF1_MARK reads while lite (3) or checked (2)
++    std::atomic<uint64_t> g_liteRegisterReadsAhead{0u}; // ...of them with a scan pending (3) or a transfer queued (2)
++    std::atomic<uint64_t> g_liteRegisterWritesAhead{0u}; // MARK / FBRST.STC written with a scan pending (3)
++    struct DeferredScans // (the VIF1 thread's)
++    {
++        uint64_t count = 0u;
++        double latencyMs = 0.0, maxMs = 0.0;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    } g_deferredScans;
++    std::chrono::steady_clock::time_point g_checkReadsLast = std::chrono::steady_clock::now();
+ 
+     struct Item
+     {
+@@ -126,6 +143,8 @@ namespace
+         std::function<void()> work;
+         uint64_t start = 0u; // position in the queue
+         uint64_t length = 1u;
++        bool scanHere = false; // (setLiteScan 3: the transfer's scan is the VIF1 thread's)
++        std::chrono::steady_clock::time_point postedAt{};
+     };
+ 
+     struct Worker
+@@ -138,6 +157,7 @@ namespace
+         std::atomic<uint64_t> done{0u};
+         std::atomic<uint64_t> transfersQueued{0u};
+         std::atomic<uint64_t> transfersDone{0u};
++        std::atomic<uint64_t> transfersStarted{0u}; // (setLiteScan 2: what a scan on the thread would have reached)
+         int waiters = 0;
+         bool stopping = false;
+         std::thread thread;
+@@ -426,6 +446,32 @@ namespace
+     };
+     Stats g_stats;
+ 
++    void scan(PS2Memory &memory, const uint8_t *data, uint32_t sizeBytes, uint64_t start, int liteScan);
++
++    // (setLiteScan 3) A lite transfer's scan, on the VIF1 thread as it comes up: its interrupts and MARK now.
++    void scanOnThread(const Item &item)
++    {
++        scan(*item.memory, item.data.data(), static_cast<uint32_t>(item.data.size()), item.start, 3);
++        g_scansPending.fetch_sub(1u, std::memory_order_release);
++        DeferredScans &d = g_deferredScans;
++        const auto now = std::chrono::steady_clock::now();
++        const double ms = std::chrono::duration<double, std::milli>(now - item.postedAt).count();
++        ++d.count;
++        d.latencyMs += ms;
++        d.maxMs = std::max(d.maxMs, ms);
++        if (now - d.last >= std::chrono::seconds(10))
++        {
++            std::fprintf(stderr, "[vif1] 10 s: %llu scans on the VIF1 thread (lite), their interrupts %.2f ms after the kick on average (%.2f max); "
++                                 "the EE read VIF1_STAT/MARK %llu times (%llu with a scan pending), wrote MARK/STC %llu times with one pending\n",
++                         static_cast<unsigned long long>(d.count), d.count ? d.latencyMs / static_cast<double>(d.count) : 0.0, d.maxMs,
++                         static_cast<unsigned long long>(g_liteRegisterReads.exchange(0u)),
++                         static_cast<unsigned long long>(g_liteRegisterReadsAhead.exchange(0u)),
++                         static_cast<unsigned long long>(g_liteRegisterWritesAhead.exchange(0u)));
++            d = DeferredScans{};
++            d.last = now;
++        }
++    }
++
+     void run(Worker &worker)
+     {
+         t_onThread = true;
+@@ -447,6 +493,9 @@ namespace
+             if (isTransfer)
+             {
+                 g_sampledFbrst.store(item.fbrst, std::memory_order_relaxed);
++                if (item.scanHere)
++                    scanOnThread(item);
++                worker.transfersStarted.fetch_add(1u, std::memory_order_release);
+                 item.memory->processVIF1Data(item.data.data(), static_cast<uint32_t>(item.data.size()));
+                 ps2vif1::recycleBuffer(item.data);
+             }
+@@ -712,10 +761,19 @@ namespace
+     // what the EE can observe - a code with the i bit raises the VIF1 interrupt, MARK sets
+     // the mark - and for where its PATH2 data points the GS. `start` is the transfer's
+     // position in the queue.
+-    void scan(PS2Memory &memory, const uint8_t *data, uint32_t sizeBytes, uint64_t start)
++    void scan(PS2Memory &memory, const uint8_t *data, uint32_t sizeBytes, uint64_t start, int liteScan)
+     {
++        std::lock_guard<std::mutex> scanLock(g_scanMutex);
+         Scan &s = g_scan;
+         uint32_t pos = 0u;
++        // (setLiteScan: the GIF registers of DIRECT data only serve the readbacks ahead - not walked while lite; those
++        // answers are off meanwhile and for a while after, so a readback then waits for the whole queue)
++        const bool lite = liteScan == 1 || liteScan == 3;
++        if (lite)
++        {
++            g_aheadFailed.store(true, std::memory_order_relaxed);
++            s.pendingImageQwc = 0u;
++        }
+         while (pos + 4u <= sizeBytes)
+         {
+             // The rest of a DIRECT command's data that did not fit in the previous transfer.
+@@ -726,7 +784,8 @@ namespace
+                 if (availableQw == 0u)
+                     break;
+                 const uint32_t chunkQw = std::min(s.num, availableQw);
+-                scanDirect(data + pos, chunkQw, start + pos + chunkQw * 16u);
++                if (!lite)
++                    scanDirect(data + pos, chunkQw, start + pos + chunkQw * 16u);
+                 pos += chunkQw * 16u;
+                 s.num -= chunkQw;
+                 continue;
+@@ -808,7 +867,8 @@ namespace
+             {
+                 const uint32_t qwCount = imm == 0u ? 65536u : imm;
+                 const uint32_t chunkQw = std::min<uint32_t>(qwCount, (sizeBytes - pos) / 16u);
+-                scanDirect(data + pos, chunkQw, start + pos + chunkQw * 16u);
++                if (!lite)
++                    scanDirect(data + pos, chunkQw, start + pos + chunkQw * 16u);
+                 pos += chunkQw * 16u;
+                 s.num = qwCount - chunkQw; // whatever is missing arrives with the next transfer
+             }
+@@ -861,8 +921,29 @@ namespace ps2vif1
+             return;
+         }
+         beforeQueue();
+-        scan(memory, data.data(), static_cast<uint32_t>(data.size()), g_ahead.posted);
++        const int liteScan = g_liteScanPredicate ? g_liteScanPredicate() : 0;
++        g_liteScanState = liteScan;
+         Worker *w = worker();
++        const bool deferScan = liteScan == 3 && w;
++        if (liteScan == 1 || liteScan == 3)
++            g_aheadFailed.store(true, std::memory_order_relaxed); // (before a readback can ask, even with the scan to come)
++        if (!deferScan)
++        {
++            if (g_scansPending.load(std::memory_order_acquire) != 0u)
++                ps2vif1::sync("VIF1 scan back on the EE's thread"); // (the thread's pending scans first, in order)
++            scan(memory, data.data(), static_cast<uint32_t>(data.size()), g_ahead.posted, liteScan == 3 ? 1 : liteScan);
++        }
++        if (liteScan == 2)
++        {
++            const auto now = std::chrono::steady_clock::now();
++            if (now - g_checkReadsLast >= std::chrono::seconds(10))
++            {
++                g_checkReadsLast = now;
++                std::fprintf(stderr, "[vif1] 10 s (check): the EE read VIF1_STAT/MARK %llu times while lite would be on, %llu of them before VIF1 started a transfer queued (its scan on the thread still to come)\n",
++                             static_cast<unsigned long long>(g_liteRegisterReads.exchange(0u)),
++                             static_cast<unsigned long long>(g_liteRegisterReadsAhead.exchange(0u)));
++            }
++        }
+         if (!w)
+         {
+             g_ahead.posted += data.size();
+@@ -897,6 +978,12 @@ namespace ps2vif1
+         item.length = data.size();
+         item.data = std::move(data);
+         item.fbrst = g_fbrstSource ? g_fbrstSource() : 0u;
++        if (deferScan)
++        {
++            item.scanHere = true;
++            item.postedAt = std::chrono::steady_clock::now();
++            g_scansPending.fetch_add(1u, std::memory_order_release);
++        }
+         post(std::move(item));
+     }
+ 
+@@ -912,7 +999,8 @@ namespace ps2vif1
+         beforeQueue();
+         if (!worker())
+         {
+-            scan(memory, data, sizeBytes, g_ahead.posted);
++            const int liteScan = g_liteScanPredicate ? g_liteScanPredicate() : 0;
++            scan(memory, data, sizeBytes, g_ahead.posted, liteScan == 3 ? 1 : liteScan);
+             g_ahead.posted += sizeBytes;
+             g_processed.store(g_ahead.posted, std::memory_order_relaxed);
+             g_sampledFbrst.store(g_fbrstSource ? g_fbrstSource() : 0u, std::memory_order_relaxed);
+@@ -962,13 +1050,30 @@ namespace ps2vif1
+             g_stats.wait(reason, waited, start);
+     }
+ 
++    // (setLiteScan 2 / 3: how often the EE reads them with VIF1 behind)
++    void noteLiteRegisterRead()
++    {
++        if (g_liteScanState != 2 && g_liteScanState != 3)
++            return;
++        g_liteRegisterReads.fetch_add(1u, std::memory_order_relaxed);
++        const Worker *w = g_worker;
++        const bool ahead = g_liteScanState == 3 ? g_scansPending.load(std::memory_order_relaxed) != 0u
++                                                : (w && w->transfersQueued.load() != w->transfersStarted.load());
++        if (ahead)
++            g_liteRegisterReadsAhead.fetch_add(1u, std::memory_order_relaxed);
++    }
++
+     uint32_t status()
+     {
++        noteLiteRegisterRead();
++        std::lock_guard<std::mutex> lock(g_scanMutex);
+         return g_scan.stat;
+     }
+ 
+     uint32_t mark()
+     {
++        noteLiteRegisterRead();
++        std::lock_guard<std::mutex> lock(g_scanMutex);
+         return g_scan.mark;
+     }
+ 
+@@ -981,23 +1086,35 @@ namespace ps2vif1
+             if ((value & 0x1u) != 0u) // RST: the caller resets the registers
+             {
+                 sync("VIF1 reset");
++                std::lock_guard<std::mutex> lock(g_scanMutex);
+                 g_scan.stat = g_scan.mark = g_scan.cycle = g_scan.code = g_scan.num = 0u;
+                 g_scan.pendingImageQwc = 0u;
+                 return false;
+             }
+             if ((value & 0x8u) != 0u) // STC: the stall and error flags, and INT
++            {
++                if (g_scansPending.load(std::memory_order_relaxed) != 0u)
++                    g_liteRegisterWritesAhead.fetch_add(1u, std::memory_order_relaxed);
++                std::lock_guard<std::mutex> lock(g_scanMutex);
+                 g_scan.stat &= ~(0x3Fu << 8);
++            }
+             return true;
+         case 0x10003C30u: // VIF1_MARK: a write clears MRK
++        {
++            if (g_scansPending.load(std::memory_order_relaxed) != 0u)
++                g_liteRegisterWritesAhead.fetch_add(1u, std::memory_order_relaxed);
++            std::lock_guard<std::mutex> lock(g_scanMutex);
+             g_scan.mark = value & 0xFFFFu;
+             g_scan.stat &= ~kStatMark;
+             return true;
++        }
+         case 0x10003C00u: // VIF1_STAT (FDR) and VIF1_ERR live in the I/O register table only
+         case 0x10003C20u:
+             return true;
+         default:
+             // A register the VIF1 thread works with.
+             sync("VIF1 register write");
++            std::lock_guard<std::mutex> lock(g_scanMutex);
+             if (address == 0x10003C40u)
+                 g_scan.cycle = value & 0xFFFFu;
+             else if (address == 0x10003C60u)
+@@ -1011,12 +1128,14 @@ namespace ps2vif1
+     void beforeSave(PS2Memory &memory)
+     {
+         sync("save state");
++        std::lock_guard<std::mutex> lock(g_scanMutex);
+         memory.vif1_regs.stat = (memory.vif1_regs.stat & ~(kStatMark | kStatInterrupt)) | g_scan.stat;
+         memory.vif1_regs.mark = g_scan.mark;
+     }
+ 
+     void afterLoad(const PS2Memory &memory)
+     {
++        std::lock_guard<std::mutex> lock(g_scanMutex);
+         g_scan.stat = memory.vif1_regs.stat & (kStatMark | kStatInterrupt);
+         g_scan.mark = memory.vif1_regs.mark;
+         g_scan.cycle = memory.vif1_regs.cycle;
+@@ -1040,6 +1159,26 @@ namespace ps2vif1
+         return g_sampledFbrst.load(std::memory_order_relaxed);
+     }
+ 
++    namespace
++    {
++        bool (*g_litePredicate)() = nullptr;
++    }
++
++    void setLite(bool (*predicate)())
++    {
++        g_litePredicate = predicate;
++    }
++
++    void setLiteScan(int (*predicate)())
++    {
++        g_liteScanPredicate = predicate;
++    }
++
++    bool liteNow()
++    {
++        return g_litePredicate && g_litePredicate();
++    }
++
+     void setUnobservedWord(uint32_t physicalAddress)
+     {
+         if (std::find(g_unobservedWords.begin(), g_unobservedWords.end(), physicalAddress) == g_unobservedWords.end())
+@@ -1170,6 +1309,20 @@ namespace ps2vif1
+         if (!w || t_onThread || g_stopped.load(std::memory_order_relaxed))
+             return false;
+         Ahead &a = g_ahead;
++        if (g_liteScanState != 0) // (setLiteScan: how often lite scans meet a readback)
++        {
++            ++g_liteScanReadbacks;
++            const auto now = std::chrono::steady_clock::now();
++            if (g_liteScanLast == std::chrono::steady_clock::time_point{})
++                g_liteScanLast = now;
++            else if (now - g_liteScanLast >= std::chrono::seconds(10))
++            {
++                std::fprintf(stderr, "[vif1] 10 s: %llu GS readbacks while the scan %s lite\n",
++                             static_cast<unsigned long long>(g_liteScanReadbacks), g_liteScanState == 1 ? "went" : "would go");
++                g_liteScanReadbacks = 0u;
++                g_liteScanLast = now;
++            }
++        }
+         if (g_aheadFailed.exchange(false))
+             a.blockedFor = 120;
+         if (!a.regionKnown || a.first != first || a.last != last || a.unknown || a.blockedFor > 0 ||
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 44060d7..fdf516a 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -533,6 +533,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     };
+ 
+     uint32_t pos = 0;
++    // (ps2vif1::setLite: no UNPACK into VU1 memory and no programs started, for this transfer)
++    const bool lite = ps2vif1::liteNow();
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+@@ -683,7 +685,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscalCallback)
++            if (m_vu1MscalCallback && !lite)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+         }
+@@ -701,7 +703,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscntCallback)
++            if (m_vu1MscntCallback && !lite)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+         }
+@@ -822,6 +824,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+             uint32_t totalBytes = sourceVectorCount * bytesPerVector;
+             totalBytes = (totalBytes + 3) & ~3u;
++            if (lite)
++            {
++                // (ps2vif1::setLite: its data passed over, VU1 memory untouched)
++                pos += totalBytes;
++                if (pos > sizeBytes)
++                    break;
++                continue;
++            }
+ 
+             uint32_t vuAddr = (uint32_t)imm & 0x3FFu;
+             if ((imm & 0x8000u) != 0u)

@@ -1,0 +1,98 @@
+// The game's own log (TODO 186).
+//
+// An installed copy is started by port\Play.bat with a plain `start` - nothing redirected - so a player had no log
+// to send after a freeze (Jenvery: a runs folder, no playtest.err). Here, at the very start of main, when stderr is
+// not already a file or a pipe (the playtest launcher's `2> runs\playtest.err` and the test scripts' redirection
+// keep theirs), stdout and stderr are reopened on runs\play_<yyyyMMdd_HHmmss>.out / .err in the folder the game
+// starts in, and the Windows standard handles set to them (what a restart started again inherits). The newest 10
+// sessions are kept. No window is opened. TF_SELF_LOG=0: never.
+
+#include "self_log.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <io.h>
+#include <windows.h>
+#endif
+
+namespace self_log
+{
+    namespace
+    {
+        namespace fs = std::filesystem;
+        constexpr size_t kKeep = 10;
+
+#if defined(_WIN32)
+        // stderr already somewhere: a file or a pipe (a console, nothing or an unknown handle: no)
+        bool redirected()
+        {
+            const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+            if (h == nullptr || h == INVALID_HANDLE_VALUE)
+                return false;
+            const DWORD type = GetFileType(h);
+            return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+        }
+#endif
+
+        // The oldest sessions' logs removed: the newest kKeep - 1 left, room for this one.
+        void prune(const fs::path &dir)
+        {
+            std::error_code ec;
+            std::vector<fs::path> logs;
+            for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
+            {
+                const std::string name = it->path().filename().string();
+                if (name.rfind("play_", 0) == 0 && it->path().extension() == ".err")
+                    logs.push_back(it->path());
+            }
+            std::sort(logs.begin(), logs.end()); // (the names sort by their date)
+            while (logs.size() >= kKeep)
+            {
+                fs::remove(logs.front(), ec);
+                fs::path out = logs.front();
+                fs::remove(out.replace_extension(".out"), ec);
+                logs.erase(logs.begin());
+            }
+        }
+    }
+
+    void start()
+    {
+#if defined(_WIN32)
+        if (const char *e = std::getenv("TF_SELF_LOG"); e && *e == '0')
+            return;
+        if (redirected())
+            return;
+        std::error_code ec;
+        const fs::path dir = fs::path("runs");
+        fs::create_directories(dir, ec);
+        if (!fs::is_directory(dir, ec))
+            return;
+        prune(dir);
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_s(&local, &now);
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
+        const std::string base = (dir / (std::string("play_") + stamp)).string();
+        FILE *err = nullptr, *out = nullptr;
+        if (freopen_s(&err, (base + ".err").c_str(), "w", stderr) != 0 || !err)
+            return;
+        if (freopen_s(&out, (base + ".out").c_str(), "w", stdout) != 0)
+            out = nullptr;
+        SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr))));
+        if (out)
+            SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout))));
+        std::fprintf(stderr, "[log] this session's log: %s.err (TF_SELF_LOG=0: none)\n", base.c_str());
+#endif
+    }
+}

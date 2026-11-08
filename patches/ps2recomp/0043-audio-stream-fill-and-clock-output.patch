@@ -1,0 +1,167 @@
+Subject: [PATCH] Audio stream: the fill for a producer, a clock-driven output for silent runs
+
+ps2_audio_stream::bufferedFrames() / targetFrames(): the frames held for the device now and the
+fill it aims at, so a producer whose own clock falls behind real time can keep the output from
+running dry (the native sound server mixes ahead by real time then). PS2X_AUDIO_SIM=1 with
+PS2X_AUDIO=0: the frames are taken by a clock at 48 kHz instead of a sound card (a thread calling
+the device callback), so a silent test run measures the buffer as one with sound would. The
+PS2X_AUDIO_STATS line also gives the lowest fill since the last one.
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_audio_stream.h b/ps2xRuntime/include/runtime/ps2_audio_stream.h
+index f319085..6e949ae 100644
+--- a/ps2xRuntime/include/runtime/ps2_audio_stream.h
++++ b/ps2xRuntime/include/runtime/ps2_audio_stream.h
+@@ -16,11 +16,21 @@
+ //   PS2X_AUDIO_VOLUME=<f>    0..1 (default 1)
+ //   PS2X_AUDIO_DUMP=<file>   writes everything the SPU2 produces to a WAV file
+ //                            (16 bit, stereo, 48 kHz), whatever the host plays of it
++//   PS2X_AUDIO_SIM=1         with PS2X_AUDIO=0: the frames taken by a clock at 48 kHz instead
++//                            of a sound card, so a silent run measures the buffer as one with
++//                            sound would (PS2X_AUDIO_STATS: its fill, how often it ran dry)
+ namespace ps2_audio_stream
+ {
+     // Frames of a left and a right sample at 48 kHz, from the thread that runs the IOP.
+     void push(const int16_t *samples, size_t frames);
+ 
++    // The frames held now, which the device plays before anything pushed next; -1 while nothing
++    // takes them (no sound, muted, the device not started yet). For a producer that keeps the
++    // buffer from running dry while its own clock falls behind real time.
++    long long bufferedFrames();
++    // The frames the buffer aims to hold (about 80 ms).
++    size_t targetFrames();
++
+     // PS2X_AUDIO and PS2X_AUDIO_VOLUME changed while the game runs (the settings panel, on the
+     // window thread): at once.
+     void setEnabled(bool on);
+diff --git a/ps2xRuntime/src/lib/ps2_audio_stream.cpp b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+index 2595ea6..5f360a5 100644
+--- a/ps2xRuntime/src/lib/ps2_audio_stream.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+@@ -2,10 +2,12 @@
+ #include "ps2_host_backend.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ namespace
+@@ -47,6 +49,11 @@ namespace
+ 
+         bool configured = false;
+         bool enabled = true;
++        // PS2X_AUDIO_SIM=1 with PS2X_AUDIO=0: the frames taken by a clock instead of a sound card,
++        // at 48 kHz of real time (simulateLoop) - a silent test run measures the buffer, its fill and
++        // its running dry as a run with sound would (PS2X_AUDIO_STATS).
++        bool simulate = false;
++        bool simulateStarted = false;
+         bool muted = false;       // setMuted: the game's own silence (a fast load), whatever enabled says
+         float volume = 1.0f;
+         bool deviceStarted = false;
+@@ -66,6 +73,7 @@ namespace
+         uint64_t dropped = 0;       // frames that did not fit
+         uint64_t reported = 0;
+         double lastRate = 1.0;
++        size_t lowest = kCapacity; // the fewest frames held after a device callback since the last report
+     };
+ 
+     Stream &stream()
+@@ -116,6 +124,8 @@ namespace
+             s.volume = std::clamp(static_cast<float>(std::atof(env)), 0.0f, 1.0f);
+         if (const char *env = std::getenv("PS2X_AUDIO_STATS"))
+             s.stats = !(env[0] == '0' || env[0] == '\0');
++        if (const char *env = std::getenv("PS2X_AUDIO_SIM"))
++            s.simulate = !s.enabled && env[0] == '1';
+         if (const char *env = std::getenv("PS2X_AUDIO_DUMP"); env && *env)
+         {
+             s.dump = std::fopen(env, "wb");
+@@ -211,10 +221,39 @@ namespace
+             }
+         }
+         s.lastRate = rate;
++        s.lowest = std::min(s.lowest, s.count);
++    }
++
++    // PS2X_AUDIO_SIM: a device's pace without a device - every few milliseconds the frames of the
++    // real time gone by are taken, as a sound card's callback takes them (into nothing).
++    void simulateLoop()
++    {
++        std::vector<int16_t> scratch;
++        auto last = std::chrono::steady_clock::now();
++        double owed = 0.0;
++        for (;;)
++        {
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++            const auto now = std::chrono::steady_clock::now();
++            owed += std::chrono::duration<double>(now - last).count() * kSampleRate;
++            last = now;
++            const unsigned frames = static_cast<unsigned>(std::min(owed, static_cast<double>(kSampleRate)));
++            owed -= frames;
++            if (frames == 0u)
++                continue;
++            scratch.resize(static_cast<size_t>(frames) * 2u);
++            deviceCallback(scratch.data(), frames);
++        }
+     }
+ 
+     void startDevice(Stream &s)
+     {
++        if (s.simulate && !s.simulateStarted)
++        {
++            s.simulateStarted = true;
++            std::thread(simulateLoop).detach();
++            std::fprintf(stderr, "[audio] PS2X_AUDIO_SIM: the output taken by a clock at 48 kHz (no sound card)\n");
++        }
+         if (s.deviceStarted || !s.enabled || !IsAudioDeviceReady())
+             return;
+         s.deviceStarted = true;
+@@ -249,7 +288,7 @@ namespace ps2_audio_stream
+                     s.dumpHeaderFrames = s.dumpFrames;
+                 }
+             }
+-            if (!s.enabled || s.muted)
++            if (!(s.enabled || s.simulate) || s.muted)
+                 return;
+             for (size_t i = 0; i < frames; ++i)
+             {
+@@ -271,19 +310,33 @@ namespace ps2_audio_stream
+                 s.reported = s.produced;
+                 std::fprintf(stderr,
+                              "[audio] %.1f s produced, %.1f s played; buffer %.0f ms (average %.0f), rate %.3f, "
+-                             "ran dry %llu times, dropped %.1f s, skipped %.2f s\n",
++                             "ran dry %llu times, dropped %.1f s, skipped %.2f s, lowest %.0f ms\n",
+                              static_cast<double>(s.produced) / kSampleRate, static_cast<double>(s.played) / kSampleRate,
+                              1000.0 * static_cast<double>(s.count) / kSampleRate, 1000.0 * s.averageFill / kSampleRate,
+                              s.lastRate, static_cast<unsigned long long>(s.starved),
+-                             static_cast<double>(s.dropped) / kSampleRate, static_cast<double>(s.skipped) / kSampleRate);
++                             static_cast<double>(s.dropped) / kSampleRate, static_cast<double>(s.skipped) / kSampleRate,
++                             1000.0 * static_cast<double>(std::min(s.lowest, s.count)) / kSampleRate);
++                s.lowest = kCapacity;
+             }
+         }
+ #if !defined(PLATFORM_VITA)
+-        if (!s.deviceStarted)
++        if (!s.deviceStarted || (s.simulate && !s.simulateStarted))
+             startDevice(s);
+ #endif
+     }
+ 
++    long long bufferedFrames()
++    {
++        Stream &s = stream();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!s.configured || s.muted)
++            return -1;
++        const bool consuming = (s.enabled && s.deviceStarted) || (s.simulateStarted && !s.enabled);
++        return consuming ? static_cast<long long>(s.count) : -1;
++    }
++
++    size_t targetFrames() { return kTargetFill; }
++
+     void setEnabled(bool on)
+     {
+         Stream &s = stream();

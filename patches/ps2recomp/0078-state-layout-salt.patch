@@ -1,0 +1,68 @@
+Subject: [PATCH] Save states: a game's own word in the layout check (PS2Runtime::setStateLayoutSalt)
+
+A game build can change what a save state holds in ways the runtime cannot see: code patched at recompile time
+that sizes the game's own arrays differently (Transformers' sound emitters, 35 -> 256, N7 step 3). A state made
+before such a change would load onto arrays of another size. PS2Runtime::setStateLayoutSalt(u64): set once at
+start, before any state loads, it is folded into the state's layout fingerprint - a state made with another value
+is refused like one of another RAM size (the game runs on, or boots fresh, with the message on screen). 0, the
+default, leaves the fingerprint as before: states of games that never set it still load.
+
+ps2xRuntime:
+- ps2_runtime.h/.cpp: setStateLayoutSalt / stateLayoutSalt.
+- ps2_savestate.cpp: layoutFingerprint folds in a non-zero salt.
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index c22971e..20b6d25 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -460,6 +460,11 @@ public:
+         uint32_t addedDataEnd;
+     };
+     static const GuestLayout &guestLayout();
++    // A game's own word in the save state's layout check (ps2_savestate.cpp): what its build changed that the
++    // runtime cannot see - code patched at recompile time that sizes the game's own arrays differently, say. Set
++    // once at start, before any state loads; a state made with another value is refused (another layout).
++    static void setStateLayoutSalt(uint64_t salt);
++    static uint64_t stateLayoutSalt();
+     // The largest free block of the guest heap (what a malloc of that size or less finds).
+     uint32_t guestHeapLargestFree() const;
+     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 6d96ec2..f743ea0 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2578,6 +2578,21 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+     m_guestHeapConfigured = true;
+ }
+ 
++namespace
++{
++    uint64_t g_stateLayoutSalt = 0u;
++}
++
++void PS2Runtime::setStateLayoutSalt(uint64_t salt)
++{
++    g_stateLayoutSalt = salt;
++}
++
++uint64_t PS2Runtime::stateLayoutSalt()
++{
++    return g_stateLayoutSalt;
++}
++
+ const PS2Runtime::GuestLayout &PS2Runtime::guestLayout()
+ {
+     static const GuestLayout layout = []()
+diff --git a/ps2xRuntime/src/lib/ps2_savestate.cpp b/ps2xRuntime/src/lib/ps2_savestate.cpp
+index a27a84b..8aa8da6 100644
+--- a/ps2xRuntime/src/lib/ps2_savestate.cpp
++++ b/ps2xRuntime/src/lib/ps2_savestate.cpp
+@@ -83,6 +83,9 @@ namespace
+         // (N7) The game's view of main RAM (PS2Runtime::guestLayout, PS2X_GUEST_RAM_MB): the same build's 32 MB and
+         // 256 MB modes put the heap and the port's added data in different places, so a state of one is not the other's.
+         hash = (hash ^ PS2Runtime::guestLayout().ramMb) * 1099511628211ull;
++        // (the game's own word: PS2Runtime::setStateLayoutSalt - 0, no change, unless the game sets one)
++        if (const uint64_t salt = PS2Runtime::stateLayoutSalt(); salt != 0u)
++            hash = (hash ^ salt) * 1099511628211ull;
+         return hash;
+     }
+ 

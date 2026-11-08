@@ -1,0 +1,180 @@
+Subject: [PATCH] GPU renderer: the glare shuffle done on the buffer itself
+
+Transformers' glare (Antarctica, also in Amazon) makes its frame's alpha
+byte from the scene's green: sprites through a 16-bit view of the 32-bit
+frame onto the same view, 8 columns over (a block row's columns 8-15 are
+the high halves of the words whose low halves are 0-7), FBMSK 0x3FFF
+(RGBA8888's: the 16-bit pixels' bits 8-15 written). Drawn as it is, the
+16-bit view took the whole scene through local memory and back, a GS
+pixel a value: Antarctica at the PS2's resolution at any scale. Now the
+draws are left out and each word's alpha byte made its green byte on the
+buffer, a GL pixel at a time (PS2X_GPU_COLOUR_SHUFFLE=0: as before).
+Scale 1, Amazon: the same picture to the pixel.
+
+Also PS2X_GPU_DRAWLOG_VERTS=1: the vertices of draws to 16-bit frames in
+the draw log.
+---
+ ps2xRuntime/src/lib/gs/gs_gpu.cpp       | 82 +++++++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_gpu_shaders.h | 14 +++++
+ 2 files changed, 96 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 87f41b4..355adbc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -1141,6 +1141,18 @@ struct GSGpuRenderer::Impl
+     // fog - a rough white line around it, which the user saw.
+     bool nativeFog = true;
+     void nativeFogIndex(Target &depth, uint32_t bits);
++    // Transformers' glare shuffle (Antarctica: its frame's alpha made from the scene's green, read
++    // as T8H by the glare's draws): sprites through a 16-bit view of the frame onto the same view,
++    // 8 columns over (a block row's columns 8-15 are the high halves of the words whose low halves
++    // are 0-7), FBMSK 0x3FFF (RGBA8888's: bits 8-15 of the 16-bit pixels written) - each word's
++    // alpha byte made its green byte. Through local memory that took the whole scene there and back, a GS pixel a value:
++    // the level drawn at the PS2's resolution (the user, 2026-10-23). Done on the buffer itself
++    // instead (PS2X_GPU_COLOUR_SHUFFLE=0: as before).
++    bool colourShuffleOn = true;
++    GLuint colourShuffleProgram = 0u;
++    GLint colourShuffleMaskLocation = -1;
++    uint64_t statColourShuffles = 0u;
++    void colourShuffle(Target &t, uint32_t highMask);
+     struct MomentPiece
+     {
+         uint32_t dst, a, b, count, entry;
+@@ -1442,6 +1454,7 @@ bool GSGpuRenderer::Impl::init()
+     fullFields = envFlag("PS2X_GPU_FULL_FIELDS", true);
+     frameLinesFull = envFlag("PS2X_GPU_FRAME_LINES", true);
+     roundPoints = envFlag("PS2X_GPU_ROUND_POINTS", true);
++    colourShuffleOn = envFlag("PS2X_GPU_COLOUR_SHUFFLE", true);
+     if (fullFields)
+         std::fprintf(stderr, "[gpu] full fields on (PS2X_GPU_FULL_FIELDS): the buffer of both fields kept at twice the scale down\n");
+ 
+@@ -1519,6 +1532,9 @@ bool GSGpuRenderer::Impl::init()
+             glDrawBuffer(GL_NONE);
+             glReadBuffer(GL_NONE);
+             glBindFramebuffer(GL_FRAMEBUFFER, 0);
++            colourShuffleProgram = linkProgram({kFullscreenVertex}, {kColourShuffle});
++            if (colourShuffleProgram)
++                colourShuffleMaskLocation = glGetUniformLocation(colourShuffleProgram, "uHighMask");
+             momentFogProgram = linkProgram({kFullscreenVertex}, {kMomentFog});
+             if (momentFogProgram)
+             {
+@@ -2493,6 +2509,30 @@ void GSGpuRenderer::Impl::nativeFogIndex(Target &depth, uint32_t bits)
+     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+ }
+ 
++// The glare shuffle on the buffer itself (colourShuffleOn): its words' bits `highMask` (of the top
++// half) from the same bits of the bottom half, every GL pixel.
++void GSGpuRenderer::Impl::colourShuffle(Target &t, uint32_t highMask)
++{
++    ensureLoaded(t);
++    msaaResolve(t, 12); // (the scene drawn multisampled: into the texture first)
++    const int w = t.width * t.sx, h = t.rows * t.sy;
++    glBindFramebuffer(GL_FRAMEBUFFER, drawFbo);
++    glDisable(GL_SCISSOR_TEST);
++    glViewport(0, 0, w, h);
++    glUseProgram(colourShuffleProgram);
++    glUniform1ui(colourShuffleMaskLocation, highMask);
++    glBindImageTexture(0, t.tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
++    glBindVertexArray(emptyVao);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    glBindVertexArray(vao);
++    glEnable(GL_SCISSOR_TEST);
++    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
++    t.alphaClock = ++alphaClock;
++    t.msStale = true; // (its multisampled copy filled again before it draws)
++    std::fill(std::begin(t.shadowValid), std::end(t.shadowValid), false);
++    ++statColourShuffles;
++}
++
+ // Rows of cells c0 to c1 of a depth buffer in `state`: each run of them drawn by the program bound
+ // (the pack or the unpack) through a scissor, and the same after.
+ void GSGpuRenderer::Impl::drawDepthRows(Target &t, uint8_t state, uint32_t c0, uint32_t c1)
+@@ -3347,6 +3387,35 @@ void GSGpuRenderer::Impl::prepareDraw()
+             return;
+         }
+     }
++    // Transformers' glare shuffle (colourShuffleOn): a 16-bit view's sprites onto a 32-bit buffer
++    // the GPU keeps, reading the same buffer through the same view, only bits 14-15 written - done
++    // on the buffer at once (colourShuffle) and not drawn, so it never goes through local memory.
++    if (nativeEnabled && colourShuffleOn && colourShuffleProgram && fpsm == GS_PSM_CT16 && state.prim.type == GS_PRIM_SPRITE &&
++        state.prim.tme && ctx.tex0.psm == GS_PSM_CT16 && ctx.frame.fbmsk == 0x3FFFu)
++    {
++        const uint32_t frameBlock = ctx.frame.fbp * 32u;
++        const uint32_t bw = std::max<uint32_t>(ctx.frame.fbw, 1u);
++        Target *word = findTarget(frameBlock, bw, kC32);
++        if (word)
++        {
++            const uint32_t blocks = bw * 64u / kKindPageW[kC32] * ((static_cast<uint32_t>(word->rows) + kKindPageH[kC32] - 1u) / kKindPageH[kC32]) * 32u;
++            if (ctx.tex0.tbp0 >= frameBlock && ctx.tex0.tbp0 < frameBlock + blocks && std::max<uint32_t>(ctx.tex0.tbw, 1u) == bw)
++            {
++                if (!vertices.empty())
++                {
++                    flushWhy = 5;
++                    flush();
++                }
++                // (FBMSK is RGBA8888's even over a 16-bit frame: bits 3-7 of each channel are the
++                // 5551 fields' - 0x3FFF keeps R and G's low 3 bits, so bits 8-15 are written: the
++                // green byte into the alpha byte)
++                const uint32_t fm = ctx.frame.fbmsk;
++                const uint32_t mask16 = ((fm >> 3u) & 0x1Fu) | ((fm >> 6u) & 0x3E0u) | ((fm >> 9u) & 0x7C00u) | ((fm >> 16u) & 0x8000u);
++                colourShuffle(*word, (~mask16 & 0xFFFFu) << 16u);
++                return;
++            }
++        }
++    }
+     const bool zwrite = !ctx.zbuf.zmask;
+     const Kind depthKind = kindOf(ctx.zbuf.psm);
+     const bool depthPsm = depthKind == kZ32 || depthKind == kZ16 || depthKind == kZ16S;
+@@ -6042,6 +6111,9 @@ void GSGpuRenderer::Impl::printStats()
+                      static_cast<unsigned long long>(statAlphaCopies), static_cast<unsigned long long>(statNativeFogs),
+                      static_cast<unsigned long long>(statFogShufflesLeftOut));
+         statNativeFogs = statFogShufflesLeftOut = 0u;
++        if (statColourShuffles)
++            std::fprintf(stderr, "[gpu]   colour shuffles done on the buffer: %llu\n", static_cast<unsigned long long>(statColourShuffles));
++        statColourShuffles = 0u;
+         std::fprintf(stderr, "[gpu]   native depth packed for: emulated batch %llu, texture %llu, feedback %llu, write-back %llu, growing %llu, loading %llu; unpacked after: emulated batch %llu, cells loaded %llu, new size %llu, new %llu\n",
+                      static_cast<unsigned long long>(statPackWhy[0]), static_cast<unsigned long long>(statPackWhy[1]),
+                      static_cast<unsigned long long>(statPackWhy[2]), static_cast<unsigned long long>(statPackWhy[3]),
+@@ -6192,6 +6264,16 @@ namespace
+         {
+             prims += count;
+             const float ox = s.context.xyoffset.ofx / 16.0f, oy = s.context.xyoffset.ofy / 16.0f;
++            // PS2X_GPU_DRAWLOG_VERTS=1: the vertices too, of the draws to a 16-bit frame (shuffles)
++            static const bool verts = std::getenv("PS2X_GPU_DRAWLOG_VERTS") != nullptr;
++            const bool dumpThese = verts && file && (s.context.frame.psm == GS_PSM_CT16 || s.context.frame.psm == GS_PSM_CT16S);
++            if (dumpThese)
++                std::fprintf(file, "        texa ta0 %u ta1 %u aem %u, prim fst %u iip %u\n", static_cast<unsigned>(s.texa.ta0),
++                             static_cast<unsigned>(s.texa.ta1), s.texa.aem ? 1u : 0u, s.prim.fst ? 1u : 0u, s.prim.iip ? 1u : 0u);
++            for (size_t i = 0; dumpThese && i < static_cast<size_t>(count) * each; ++i)
++                std::fprintf(file, "        v x %.2f y %.2f u %u v %u s %.4f t %.4f q %.4f rgba %u %u %u %u\n", v[i].x - ox, v[i].y - oy,
++                             static_cast<unsigned>(v[i].u), static_cast<unsigned>(v[i].v), v[i].s, v[i].t, v[i].q, v[i].r, v[i].g, v[i].b,
++                             v[i].a);
+             for (size_t i = 0; i < static_cast<size_t>(count) * each; ++i)
+             {
+                 x0 = std::min(x0, v[i].x - ox);
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+index be2940b..5da0ddb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+@@ -1663,6 +1663,20 @@ void main()
+         z = min(z, texelFetch(uMsDepth, p, i).r);
+     gl_FragDepth = z;
+ }
++)";
++
++    // A colour shuffle done in place (colourShuffle): the bits uHighMask picks of each word's top
++    // half taken from the same bits of its bottom half (a 16-bit view's draw of a word's low half
++    // into its high half, the game's way, a GL pixel at a time instead of a GS pixel).
++    inline const char *kColourShuffle = R"(#version 450 core
++layout(binding = 0, r32ui) coherent uniform uimage2D uImage;
++uniform uint uHighMask;
++void main()
++{
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    uint w = imageLoad(uImage, p).r;
++    imageStore(uImage, p, uvec4((w & ~uHighMask) | ((w << 16u) & uHighMask)));
++}
+ )";
+ 
+     inline const char *kMomentFog = R"(#version 450 core

@@ -1,0 +1,493 @@
+Subject: [PATCH] VIF1: chain summaries - a known CALL's target replaced by the port's summary of it, while the port asks
+
+ps2vif1::setChainSummaries(lite, summary, check): while `lite` answers true (asked once per VIF1 DMA chain, on the
+EE's thread as the chain is gathered), a CALL whose target `summary` knows is not followed: the call's own tag and
+data as ever, then the port's bytes instead of what the call sends, and the gather goes on at the call's return.
+The port's bytes are the same VIF codes without their UNPACKs (code and data) - for Transformers a geometry set's
+prebuilt packet, called ~1,400 times a frame (~5.5 MB in Deep Amazon), summarized once and kept (roadmap N5, step
+1). A transfer holding summaries is lite whatever setLite answers: an UNPACK does nothing else while lite, so VIF1's
+registers come out as with the whole calls.
+
+`check`: the chain is sent whole and its summarized copy goes with it; VIF1 follows the copy's codes from the
+registers it started the transfer with and checks that the registers it ended the whole transfer with (CYCLE, MODE,
+MASK, ROW, COL, ITOP(S), BASE, OFFSET, TOP(S), DBF, MARK, CODE, NUM) and the interrupts and MARKs in order are the
+same (and its follower against VIF1 itself on the whole transfer); mismatches counted and printed. Every 30 s a line:
+the chains, the calls summarized, the bytes not sent. Null (the default): nothing changes.
+
+ps2xRuntime:
+- ps2_vif1_thread.h/.cpp: setChainSummaries, summaryBegin / summaryFor / summaryAttach (the gather's side),
+  summarizedTransfer (VIF1's); the flag and the check's copy travel with the transfer (Item); the check's follower.
+- ps2_memory.cpp: the VIF1 chain gather takes the summaries (its CALL followed or not; the check's copy beside it).
+- ps2_vif1_interpreter.cpp: a transfer holding summaries is lite.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vif1_thread.h b/ps2xRuntime/include/runtime/ps2_vif1_thread.h
+index aee1c71..c2556c8 100644
+--- a/ps2xRuntime/include/runtime/ps2_vif1_thread.h
++++ b/ps2xRuntime/include/runtime/ps2_vif1_thread.h
+@@ -105,6 +105,27 @@ namespace ps2vif1
+     // Asked once per transfer. Null (the default): never.
+     void setLiteScan(int (*predicate)());
+ 
++    // Chain summaries (Transformers' roadmap N5, step 1): while `lite` answers true - asked once per VIF1 DMA chain, on
++    // the EE's thread as the chain is gathered - a CALL whose target `summary` knows is not followed: what that call
++    // would have sent VIF1 is replaced by `summary`'s bytes, the same VIF codes without its UNPACKs (code and data) -
++    // the port's own, cached per target (a geometry set's packet, prebuilt and called a thousand times a frame). The
++    // transfer is then lite whatever setLite answers (VIF1's registers come out as with the whole call: an UNPACK does
++    // nothing else while lite). `check`: the chain is sent whole, the summarized copy beside it, and VIF1 checks that
++    // its registers after the whole transfer, and the codes' interrupts and MARKs, are what the summarized copy gives
++    // (mismatches counted and printed). Null (the default): never.
++    // summary(rdram, target, bytes, size, wholeBytes): the bytes to send instead of the call (valid until the next
++    // call of it), and how many the call itself sends (for the statistics); false: the call is followed.
++    using ChainSummaryFn = bool (*)(const uint8_t *rdram, uint32_t target, const uint8_t *&bytes, uint32_t &size, uint32_t &wholeBytes);
++    void setChainSummaries(bool (*lite)(), ChainSummaryFn summary, bool check);
++    // (ps2_memory.cpp, the chain's gather) Whether to summarize the chain about to be gathered (and to check it).
++    bool summaryBegin(bool &check);
++    bool summaryFor(const uint8_t *rdram, uint32_t target, const uint8_t *&bytes, uint32_t &size, uint32_t &wholeBytes);
++    // For the transfer whose buffer starts at `data`, before it is queued: the calls summarized and the bytes they
++    // saved; with the check, the summarized copy (the transfer itself then whole).
++    void summaryAttach(const uint8_t *data, uint32_t calls, uint64_t savedBytes, std::vector<uint8_t> &&checkCopy);
++    // (the interpreter) Whether the transfer being processed on this thread holds summaries (it is then lite).
++    bool summarizedTransfer();
++
+     // How far the thread is in the transfer it is processing (the interpreter reports it).
+     void progress(uint32_t offsetInTransfer);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 26671eb..47bd28a 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1539,6 +1539,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const int kMaxChainTags = 1 << 20;
+                     const size_t kMaxChainBytes = size_t(256) << 20;
+                     std::vector<uint8_t> chainBuf = takeChainBuffer();
++                    // (ps2vif1::setChainSummaries) The check's summarized copy beside the whole chain, and whether a
++                    // summarized call is being followed for the whole one (the asp its RET comes back to).
++                    bool summaryCheck = false;
++                    int checkSkipAsp = -1;
++                    std::vector<uint8_t> checkBuf;
++                    auto put = [&](const uint8_t *from, const uint8_t *to)
++                    {
++                        chainBuf.insert(chainBuf.end(), from, to);
++                        if (summaryCheck && checkSkipAsp < 0)
++                            checkBuf.insert(checkBuf.end(), from, to);
++                    };
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -1569,7 +1580,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                                 chunk = maxSz2 - src;
+                             if (chunk == 0)
+                                 break;
+-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
++                            put(base2 + src, base2 + src + chunk);
+                             bytes -= chunk;
+                             src += chunk;
+                         }
+@@ -1588,12 +1599,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                         // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
+                         // the tag payload. VIF chains use those bytes for two VIFcodes.
+-                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
++                        put(localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+                     };
+ 
+                     const bool isVifChannel =
+                         channelBase == 0x10009000u || channelBase == 0x10008000u;
+                     const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
++                    // (ps2vif1::setChainSummaries: a CALL whose target the port has summarized is not followed - while lite)
++                    const bool summaryChain = channelBase == 0x10009000u && transferTagData && ps2vif1::summaryBegin(summaryCheck);
++                    summaryCheck = summaryChain && summaryCheck;
++                    uint32_t summarizedCalls = 0u;
++                    uint64_t summarySaved = 0u;
+ 
+                     int tagsProcessed = 0;
+                     // PS2X_DMA_TRACE=<chains> [PS2X_DMA_TRACE_AFTER=<seconds>]: logs the tags of
+@@ -1661,6 +1677,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         bool hasPayload = (tagQwc > 0);
+                         bool endChain = false;
+ 
++                        const uint32_t aspBefore = asp, asr0Before = asr0, asr1Before = asr1;
+                         switch (id)
+                         {
+                         case 0:
+@@ -1729,10 +1746,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         // END) are one stretch of memory: one copy instead of two. Thousands of tags a
+                         // frame in a level's display list.
+                         const uint64_t mergedBytes = 8ull + static_cast<uint64_t>(tagQwc) * 16ull;
++                        // (setChainSummaries) A CALL into a summarized target: its own tag and data as ever, then the summary
++                        // instead of what the call sends; on at its return. (The check: followed for the whole chain, the
++                        // summary into the summarized copy, which leaves out the call's bytes up to its RET.)
++                        const uint8_t *summaryBytes = nullptr;
++                        uint32_t summarySize = 0u, summaryWhole = 0u;
++                        const bool summarized = summaryChain && id == 5u && aspBefore < 2u && checkSkipAsp < 0 &&
++                                                ps2vif1::summaryFor(m_rdram, addr, summaryBytes, summarySize, summaryWhole);
++                        if (summarized && !summaryCheck)
++                        {
++                            asp = aspBefore, asr0 = asr0Before, asr1 = asr1Before;
++                            tagAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
++                        }
+                         if (transferTagData && hasPayload && dataAddr == currentTagAddr + 16u &&
+                             static_cast<uint64_t>(physTag) + 8ull + mergedBytes <= tagMax)
+                         {
+-                            chainBuf.insert(chainBuf.end(), tp + 8u, tp + 8u + mergedBytes);
++                            put(tp + 8u, tp + 8u + mergedBytes);
+                         }
+                         else
+                         {
+@@ -1742,6 +1771,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             if (hasPayload)
+                                 appendData(dataAddr, tagQwc);
+                         }
++                        if (summarized)
++                        {
++                            ++summarizedCalls;
++                            summarySaved += summaryWhole > summarySize ? summaryWhole - summarySize : 0u;
++                            if (summaryCheck)
++                            {
++                                checkBuf.insert(checkBuf.end(), summaryBytes, summaryBytes + summarySize);
++                                checkSkipAsp = static_cast<int>(aspBefore);
++                            }
++                            else
++                                chainBuf.insert(chainBuf.end(), summaryBytes, summaryBytes + summarySize);
++                        }
++                        else if (checkSkipAsp >= 0 && id == 6u && static_cast<int>(asp) == checkSkipAsp)
++                            checkSkipAsp = -1; // (the summarized call's RET: its bytes left out, the copy goes on)
+                         endMadr = dataAddr + (hasPayload ? static_cast<uint32_t>(tagQwc) * 16u : 0u);
+                         if (irq && tieEnabled)
+                             endChain = true;
+@@ -1781,6 +1824,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                     if (!chainBuf.empty())
+                     {
++                        if (summaryChain)
++                            ps2vif1::summaryAttach(chainBuf.data(), summarizedCalls, summarySaved,
++                                                   summaryCheck ? std::move(checkBuf) : std::vector<uint8_t>{});
+                         PendingTransfer pt;
+                         pt.fromScratchpad = false;
+                         pt.srcAddr = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 4d80854..8077cdc 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -534,7 +534,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+     uint32_t pos = 0;
+     // (ps2vif1::setLite: no UNPACK into VU1 memory and no programs started, for this transfer)
+-    const bool lite = ps2vif1::liteNow();
++    // (ps2vif1::setChainSummaries: a transfer holding summaries has no UNPACKs to do - lite whatever setLite answers)
++    const bool lite = ps2vif1::summarizedTransfer() || ps2vif1::liteNow();
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+index 2cf20cc..db92b66 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_thread.cpp
+@@ -40,6 +40,11 @@ namespace
+     constexpr uint8_t kGsTrxreg = 0x52;
+     constexpr uint8_t kGsTrxdir = 0x53;
+ 
++    struct ChainSummaryFnHolder
++    {
++        ps2vif1::ChainSummaryFn fn = nullptr;
++    };
++
+     // What the thread that queues transfers (the EE) keeps for itself. The registers in
+     // PS2Memory belong to whoever processes the transfers.
+     struct Scan
+@@ -135,6 +140,29 @@ namespace
+     } g_deferredScans;
+     std::chrono::steady_clock::time_point g_checkReadsLast = std::chrono::steady_clock::now();
+ 
++    // (setChainSummaries) The port's choice, the transfer being gathered's summaries, and the statistics.
++    bool (*g_summaryLite)() = nullptr;
++    ChainSummaryFnHolder g_summaryFn{};
++    bool g_summaryCheck = false;
++    struct SummaryAttached // (summaryAttach, for the transfer about to be queued)
++    {
++        const uint8_t *data = nullptr;
++        uint32_t calls = 0u;
++        uint64_t savedBytes = 0u;
++        std::vector<uint8_t> checkCopy;
++    } g_summaryAttached;
++    struct SummaryStats
++    {
++        uint64_t chains = 0u, calls = 0u, savedBytes = 0u, sentBytes = 0u;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    } g_summaryStats;
++    struct SummaryCheck // (the VIF1 thread's)
++    {
++        uint64_t transfers = 0u, differing = 0u;
++        int told = 0;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    } g_summaryCheckStats;
++
+     struct Item
+     {
+         PS2Memory *memory = nullptr; // a transfer when set
+@@ -144,6 +172,8 @@ namespace
+         uint64_t start = 0u; // position in the queue
+         uint64_t length = 1u;
+         bool scanHere = false; // (setLiteScan 3: the transfer's scan is the VIF1 thread's)
++        bool summarized = false;          // (setChainSummaries: it holds summaries - lite)
++        std::vector<uint8_t> summaryCheck; // (...the check: the summarized copy of this whole transfer)
+         std::chrono::steady_clock::time_point postedAt{};
+     };
+ 
+@@ -166,6 +196,7 @@ namespace
+     std::once_flag g_workerOnce;
+     std::atomic<bool> g_stopped{false};
+     thread_local bool t_onThread = false;
++    thread_local bool t_summarized = false; // (setChainSummaries: the transfer being processed holds summaries)
+     thread_local uint64_t t_itemStart = 0u;
+     thread_local int t_gifPath = 0;
+ 
+@@ -472,6 +503,137 @@ namespace
+         }
+     }
+ 
++    // (setChainSummaries' check) What a lite transfer does to VIF1's registers, followed from `r` the way
++    // PS2Memory::processVIF1Data does while lite (an UNPACK: its data passed over), with its interrupts and MARKs in order
++    // (an i bit: 1 << 31; a MARK: its value).
++    void followRegisters(VIFRegisters &r, const uint8_t *data, uint32_t sizeBytes, std::vector<uint32_t> &events)
++    {
++        uint32_t pos = 0u;
++        while (pos + 4u <= sizeBytes)
++        {
++            const uint8_t current = static_cast<uint8_t>((r.code >> 24) & 0x7Fu);
++            if ((current == 0x50u || current == 0x51u) && r.num != 0u)
++            {
++                const uint32_t availableQw = (sizeBytes - pos) / 16u;
++                if (availableQw == 0u)
++                    break;
++                const uint32_t chunkQw = std::min<uint32_t>(r.num, availableQw);
++                pos += chunkQw * 16u;
++                r.num -= chunkQw;
++                continue;
++            }
++            uint32_t cmd = 0u;
++            std::memcpy(&cmd, data + pos, 4u);
++            pos += 4u;
++            const uint8_t opcode = static_cast<uint8_t>((cmd >> 24) & 0x7Fu);
++            const uint32_t imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
++            r.code = cmd;
++            r.num = num;
++            if ((cmd & 0x80000000u) != 0u)
++                events.push_back(1u << 31);
++            if ((opcode & 0x60u) == 0x60u)
++            {
++                const uint32_t vn = (opcode >> 2) & 3u, vl = opcode & 3u;
++                const uint32_t bits = vl == 0u ? 32u : (vl == 1u ? 16u : (vl == 2u ? 8u : (vn == 3u ? 4u : 16u)));
++                const uint32_t bytesPerVector = (((vl == 3u && vn == 3u) ? 16u : (vn + 1u) * bits) + 7u) / 8u;
++                const uint32_t writeCount = num == 0u ? 256u : num;
++                uint32_t cl = r.cycle & 0xFFu, wl = (r.cycle >> 8) & 0xFFu;
++                cl = cl ? cl : 1u, wl = wl ? wl : 1u;
++                uint32_t sourceCount = writeCount;
++                if (cl < wl)
++                    sourceCount = (writeCount / wl) * cl + std::min(writeCount % wl, cl);
++                pos += (sourceCount * bytesPerVector + 3u) & ~3u;
++                if (pos > sizeBytes)
++                    break;
++                continue;
++            }
++            switch (opcode)
++            {
++            case 0x01u: r.cycle = imm; break;
++            case 0x02u: r.ofst = imm & 0x3FFu, r.tops = r.base & 0x3FFu, r.stat &= ~(1u << 7); break;
++            case 0x03u: r.base = imm & 0x3FFu; break;
++            case 0x04u: r.itops = imm & 0x3FFu; break;
++            case 0x05u: r.mode = imm & 3u; break;
++            case 0x07u: r.mark = imm, r.stat |= 1u << 6, events.push_back(imm); break;
++            case 0x14u: case 0x15u: case 0x17u:
++            {
++                r.top = r.tops & 0x3FFu, r.itop = r.itops & 0x3FFu;
++                r.tops = ((r.stat & (1u << 7)) != 0u) ? (r.base & 0x3FFu) : ((r.base + r.ofst) & 0x3FFu);
++                r.stat ^= 1u << 7;
++                break;
++            }
++            case 0x20u:
++                if (pos + 4u > sizeBytes)
++                    return;
++                std::memcpy(&r.mask, data + pos, 4u), pos += 4u;
++                break;
++            case 0x30u: case 0x31u:
++                if (pos + 16u > sizeBytes)
++                    return;
++                std::memcpy(opcode == 0x30u ? r.row : r.col, data + pos, 16u), pos += 16u;
++                break;
++            case 0x4Au:
++                pos += (num == 0u ? 256u : num) * 8u;
++                if (pos > sizeBytes)
++                    return;
++                break;
++            case 0x50u: case 0x51u:
++            {
++                const uint32_t qwCount = imm == 0u ? 65536u : imm;
++                const uint32_t chunkQw = std::min<uint32_t>(qwCount, (sizeBytes - pos) / 16u);
++                pos += chunkQw * 16u;
++                r.num = qwCount - chunkQw;
++                break;
++            }
++            default: break;
++            }
++        }
++    }
++
++    // The registers VIF1 ended the whole transfer with, against what its summarized copy gives (and the interrupts and
++    // MARKs of both); and the follower itself against VIF1 on the whole one.
++    void checkSummarized(const VIFRegisters &before, const PS2Memory &memory, const std::vector<uint8_t> &whole,
++                         const std::vector<uint8_t> &summarized)
++    {
++        VIFRegisters a = before, b = before;
++        std::vector<uint32_t> ea, eb;
++        followRegisters(a, whole.data(), static_cast<uint32_t>(whole.size()), ea);
++        followRegisters(b, summarized.data(), static_cast<uint32_t>(summarized.size()), eb);
++        const VIFRegisters &real = memory.vif1_regs;
++        auto same = [](const VIFRegisters &x, const VIFRegisters &y) {
++            return x.cycle == y.cycle && x.mode == y.mode && x.mask == y.mask && x.itops == y.itops && x.base == y.base &&
++                   x.ofst == y.ofst && x.tops == y.tops && x.itop == y.itop && x.top == y.top && x.mark == y.mark &&
++                   ((x.stat ^ y.stat) & 0xC0u) == 0u && x.code == y.code && x.num == y.num &&
++                   std::memcmp(x.row, y.row, sizeof(x.row)) == 0 && std::memcmp(x.col, y.col, sizeof(x.col)) == 0;
++        };
++        SummaryCheck &c = g_summaryCheckStats;
++        ++c.transfers;
++        const bool follower = same(a, real), regs = same(b, real), events = ea == eb;
++        if (!(follower && regs && events))
++        {
++            ++c.differing;
++            if (c.told < 12)
++            {
++                ++c.told;
++                std::fprintf(stderr, "[vif1] summary check: %s%s%s (whole %zu bytes, summarized %zu; %zu / %zu interrupts+MARKs; real cycle %04x "
++                                     "mode %u itops %03x tops %03x top %03x dbf %u code %08x num %u, summarized cycle %04x mode %u itops %03x "
++                                     "tops %03x top %03x dbf %u code %08x num %u)\n",
++                             follower ? "" : "the follower differs from VIF1 on the whole transfer; ", regs ? "" : "the registers differ; ",
++                             events ? "" : "the interrupts / MARKs differ", whole.size(), summarized.size(), ea.size(), eb.size(),
++                             real.cycle, real.mode, real.itops, real.tops, real.top, (real.stat >> 7) & 1u, real.code, real.num,
++                             b.cycle, b.mode, b.itops, b.tops, b.top, (b.stat >> 7) & 1u, b.code, b.num);
++            }
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - c.last >= std::chrono::seconds(30))
++        {
++            std::fprintf(stderr, "[vif1] 30 s of the summary check: %llu transfers, %llu differing\n",
++                         static_cast<unsigned long long>(c.transfers), static_cast<unsigned long long>(c.differing));
++            c.transfers = c.differing = 0u;
++            c.last = now;
++        }
++    }
++
+     void run(Worker &worker)
+     {
+         t_onThread = true;
+@@ -496,7 +658,12 @@ namespace
+                 if (item.scanHere)
+                     scanOnThread(item);
+                 worker.transfersStarted.fetch_add(1u, std::memory_order_release);
++                const VIFRegisters before = item.memory->vif1_regs; // (setChainSummaries' check: where both start from)
++                t_summarized = item.summarized;
+                 item.memory->processVIF1Data(item.data.data(), static_cast<uint32_t>(item.data.size()));
++                t_summarized = false;
++                if (!item.summaryCheck.empty())
++                    checkSummarized(before, *item.memory, item.data, item.summaryCheck);
+                 ps2vif1::recycleBuffer(item.data);
+             }
+             else if (item.work)
+@@ -920,6 +1087,33 @@ namespace ps2vif1
+             recycleBuffer(data);
+             return;
+         }
++        // (setChainSummaries) A chain gathered with summaries (lite), or whole with its summarized copy beside it (the check).
++        bool summarized = false;
++        std::vector<uint8_t> summaryCheck;
++        if (SummaryAttached &a = g_summaryAttached; a.data)
++        {
++            if (a.data == data.data())
++            {
++                summarized = a.calls != 0u && a.checkCopy.empty();
++                summaryCheck = std::move(a.checkCopy);
++                SummaryStats &st = g_summaryStats;
++                ++st.chains;
++                st.calls += a.calls;
++                st.savedBytes += a.savedBytes;
++                st.sentBytes += data.size();
++                const auto now = std::chrono::steady_clock::now();
++                if (now - st.last >= std::chrono::seconds(30))
++                {
++                    std::fprintf(stderr, "[vif1] 30 s of chain summaries%s: %llu chains, %llu calls summarized, %.1f MB not sent (%.1f MB sent)\n",
++                                 g_summaryCheck ? " (checked: sent whole)" : "", static_cast<unsigned long long>(st.chains),
++                                 static_cast<unsigned long long>(st.calls), st.savedBytes / 1048576.0, st.sentBytes / 1048576.0);
++                    st = SummaryStats{};
++                    st.last = now;
++                }
++            }
++            a.data = nullptr;
++            a.checkCopy.clear();
++        }
+         beforeQueue();
+         const int liteScan = g_liteScanPredicate ? g_liteScanPredicate() : 0;
+         g_liteScanState = liteScan;
+@@ -949,7 +1143,12 @@ namespace ps2vif1
+             g_ahead.posted += data.size();
+             g_processed.store(g_ahead.posted, std::memory_order_relaxed);
+             g_sampledFbrst.store(g_fbrstSource ? g_fbrstSource() : 0u, std::memory_order_relaxed);
++            const VIFRegisters before = memory.vif1_regs;
++            t_summarized = summarized;
+             memory.processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
++            t_summarized = false;
++            if (!summaryCheck.empty())
++                checkSummarized(before, memory, data, summaryCheck);
+             recycleBuffer(data);
+             return;
+         }
+@@ -977,6 +1176,8 @@ namespace ps2vif1
+         item.memory = &memory;
+         item.length = data.size();
+         item.data = std::move(data);
++        item.summarized = summarized;
++        item.summaryCheck = std::move(summaryCheck);
+         item.fbrst = g_fbrstSource ? g_fbrstSource() : 0u;
+         if (deferScan)
+         {
+@@ -1179,6 +1380,41 @@ namespace ps2vif1
+         return g_litePredicate && g_litePredicate();
+     }
+ 
++    void setChainSummaries(bool (*lite)(), ChainSummaryFn summary, bool check)
++    {
++        g_summaryLite = lite;
++        g_summaryFn.fn = summary;
++        g_summaryCheck = check;
++    }
++
++    bool summaryBegin(bool &check)
++    {
++        g_summaryAttached.data = nullptr;
++        if (!g_summaryLite || !g_summaryFn.fn || t_onThread || !g_summaryLite())
++            return false;
++        check = g_summaryCheck;
++        return true;
++    }
++
++    bool summaryFor(const uint8_t *rdram, uint32_t target, const uint8_t *&bytes, uint32_t &size, uint32_t &wholeBytes)
++    {
++        return g_summaryFn.fn && g_summaryFn.fn(rdram, target, bytes, size, wholeBytes);
++    }
++
++    void summaryAttach(const uint8_t *data, uint32_t calls, uint64_t savedBytes, std::vector<uint8_t> &&checkCopy)
++    {
++        SummaryAttached &a = g_summaryAttached;
++        a.data = data;
++        a.calls = calls;
++        a.savedBytes = savedBytes;
++        a.checkCopy = std::move(checkCopy);
++    }
++
++    bool summarizedTransfer()
++    {
++        return t_summarized;
++    }
++
+     void setUnobservedWord(uint32_t physicalAddress)
+     {
+         if (std::find(g_unobservedWords.begin(), g_unobservedWords.end(), physicalAddress) == g_unobservedWords.end())

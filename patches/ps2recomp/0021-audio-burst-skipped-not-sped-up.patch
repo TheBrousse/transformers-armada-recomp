@@ -1,0 +1,105 @@
+Subject: [PATCH] Audio stream: a burst is skipped, not played faster
+
+The playback rate followed the buffer's fill between 0.72 and 1.25: after
+every stall (a load, a hitch) the late samples came at once and played up
+to a quarter faster for a couple of seconds - the pitch went up. The rate
+now stays within half a percent (inaudible, enough for clock drift); a
+burst above 180 ms is skipped down to the target fill, crossfaded over
+256 frames. The skipped part is the sound of the moment the stall already
+went silent for. PS2X_AUDIO_STATS reports what was skipped.
+---
+ ps2xRuntime/src/lib/ps2_audio_stream.cpp | 50 ++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_audio_stream.cpp b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+index 06c8841..2595ea6 100644
+--- a/ps2xRuntime/src/lib/ps2_audio_stream.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio_stream.cpp
+@@ -13,10 +13,19 @@ namespace
+     constexpr unsigned kSampleRate = 48000u;
+     constexpr size_t kCapacity = kSampleRate;            // frames the buffer holds: a second
+     constexpr size_t kTargetFill = kSampleRate * 8u / 100u; // frames it should hold: 80 ms
+-    // How far the playback rate may leave 1: enough for a machine at three quarters of
+-    // its speed, beyond that the sound breaks up instead.
+-    constexpr double kMinRate = 0.72;
+-    constexpr double kMaxRate = 1.25;
++    // How far the playback rate may leave 1: half a percent, which no one hears (a pitch shift of
++    // 9 cents at most), enough to follow the small drift between the machine's clock and the
++    // sound card's. It used to reach 0.72-1.25 to absorb bursts, and every burst then played
++    // up to a quarter faster: the pitch went up after each load or hitch. A burst is handled by
++    // kSkipAbove instead.
++    constexpr double kMinRate = 0.995;
++    constexpr double kMaxRate = 1.005;
++    // More than this held (the machine stalled, the sound card played silence meanwhile, then the
++    // late samples came at once): the surplus is skipped down to kTargetFill, crossfaded over
++    // kSkipFade frames so it does not click. What is skipped is the sound of the moment the
++    // stall already went quiet for.
++    constexpr size_t kSkipAbove = kSampleRate * 18u / 100u; // 180 ms
++    constexpr unsigned kSkipFade = 256u;                     // ~5 ms
+     // The rate follows the fill level averaged over about this long, so that the bursts
+     // the samples arrive in do not make the pitch wobble.
+     constexpr double kAverageSeconds = 1.5;
+@@ -32,6 +41,9 @@ namespace
+         bool playing = false;     // false until the buffer has filled up (again)
+         bool overflowed = false;  // the machine runs ahead of real time (turbo): keep quiet
+         int16_t last[2] = {0, 0};
++        size_t fadeFrom = 0;      // a skip's crossfade: the skipped-over frame playing out under the new one
++        unsigned fadeLeft = 0;
++        uint64_t skipped = 0;     // frames skipped (PS2X_AUDIO_STATS)
+ 
+         bool configured = false;
+         bool enabled = true;
+@@ -139,6 +151,17 @@ namespace
+             return;
+         }
+ 
++        if (s.playing && s.count > kSkipAbove)
++        {
++            // A burst after a stall: skip the surplus (crossfaded) instead of playing it faster.
++            const size_t skip = s.count - kTargetFill;
++            s.fadeFrom = s.read;
++            s.fadeLeft = kSkipFade;
++            s.read = (s.read + skip) % kCapacity;
++            s.count -= skip;
++            s.skipped += skip;
++            s.averageFill = static_cast<double>(kTargetFill);
++        }
+         const double blend = std::min(1.0, static_cast<double>(frames) / (kSampleRate * kAverageSeconds));
+         s.averageFill += (static_cast<double>(s.count) - s.averageFill) * blend;
+         const double rate = std::clamp(1.0 + (s.averageFill - static_cast<double>(kTargetFill)) /
+@@ -163,8 +186,19 @@ namespace
+             }
+             const int16_t *a = &s.ring[2u * s.read];
+             const int16_t *b = &s.ring[2u * ((s.read + 1u) % kCapacity)];
+-            s.last[0] = static_cast<int16_t>(a[0] + (b[0] - a[0]) * s.position);
+-            s.last[1] = static_cast<int16_t>(a[1] + (b[1] - a[1]) * s.position);
++            double l = a[0] + (b[0] - a[0]) * s.position, r = a[1] + (b[1] - a[1]) * s.position;
++            if (s.fadeLeft > 0u)
++            {
++                // (the skipped-over sound fading out under the sound after the skip)
++                const int16_t *f = &s.ring[2u * s.fadeFrom];
++                const double w = static_cast<double>(s.fadeLeft) / static_cast<double>(kSkipFade);
++                l = l * (1.0 - w) + f[0] * w;
++                r = r * (1.0 - w) + f[1] * w;
++                s.fadeFrom = (s.fadeFrom + 1u) % kCapacity;
++                --s.fadeLeft;
++            }
++            s.last[0] = static_cast<int16_t>(std::clamp(l, -32768.0, 32767.0));
++            s.last[1] = static_cast<int16_t>(std::clamp(r, -32768.0, 32767.0));
+             out[2u * i] = s.last[0];
+             out[2u * i + 1u] = s.last[1];
+             s.position += rate;
+@@ -237,11 +271,11 @@ namespace ps2_audio_stream
+                 s.reported = s.produced;
+                 std::fprintf(stderr,
+                              "[audio] %.1f s produced, %.1f s played; buffer %.0f ms (average %.0f), rate %.3f, "
+-                             "ran dry %llu times, dropped %.1f s\n",
++                             "ran dry %llu times, dropped %.1f s, skipped %.2f s\n",
+                              static_cast<double>(s.produced) / kSampleRate, static_cast<double>(s.played) / kSampleRate,
+                              1000.0 * static_cast<double>(s.count) / kSampleRate, 1000.0 * s.averageFill / kSampleRate,
+                              s.lastRate, static_cast<unsigned long long>(s.starved),
+-                             static_cast<double>(s.dropped) / kSampleRate);
++                             static_cast<double>(s.dropped) / kSampleRate, static_cast<double>(s.skipped) / kSampleRate);
+             }
+         }
+ #if !defined(PLATFORM_VITA)

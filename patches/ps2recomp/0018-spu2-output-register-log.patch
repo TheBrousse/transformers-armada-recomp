@@ -1,0 +1,31 @@
+Subject: [PATCH] PS2X_SPU2_LOG=2: the SPU2 registers that reach the output
+
+For comparing a host sound engine with the emulated one: every voice volume, pitch and envelope
+write, key on/off, the VMIX/MMIX gates and the cores' volumes, with the IOP cycle.
+---
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index c44b777..ba31524 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -886,6 +886,21 @@ namespace ps2x::iop::detail
+                              offset >= kCoreVolumes ? static_cast<int>((offset - kCoreVolumes) / kCoreVolumesStep)
+                                                     : (offset >= 0x400u ? 1 : 0));
+         }
++        // PS2X_SPU2_LOG=2: what reaches the output, to compare a host sound engine with: the
++        // voices' volumes, pitches and envelopes, key on/off, the gates (VMIX*, MMIX) and every core volume.
++        static const bool loggedAll = []()
++        {
++            const char *env = std::getenv("PS2X_SPU2_LOG");
++            return env != nullptr && env[0] == '2';
++        }();
++        if (loggedAll)
++        {
++            const uint32_t local = offset & 0x3FFu;
++            const bool voice = local < 0x180u && (local & 0xEu) <= 8u; // VOLL, VOLR, PITCH, ADSR1, ADSR2
++            const bool gates = local >= 0x188u && local <= 0x1A6u;
++            if (voice || gates || offset >= kCoreVolumes)
++                std::fprintf(stderr, "[spu2] %llu %03x = %04x\n", static_cast<unsigned long long>(cycle), offset, value);
++        }
+         if (offset >= kCoreVolumes)
+         {
+             reg(offset) = value;

@@ -1,0 +1,179 @@
+Subject: [PATCH] VU0 micro programs on the fast VU engine
+
+VU0's micro programs (VCALLMS) ran on the reference interpreter, which models
+every pipeline stage: in a Transformers level with water (vlxWaterEffect) they
+took 78% of the EE thread (37 ms a frame). ps2vu1fast::runVu0 runs them on the
+fast engine: VU0's 4 KB of code mirrored to the 16 KB it decodes (VU0 wraps),
+decoded again when VU0's code generation changes; the engine table now locked
+(VU0 on the EE thread, VU1 on the VIF1 thread). Measured: 96,000 runs verified
+against the reference with no state or cycle difference (PS2X_VU0_FAST=verify),
+the EE's frame 37 -> 10.9 ms, the picture pixel-identical. PS2X_VU0_FAST=0:
+the reference.
+---
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp | 46 +++++++++++++++++++++++--
+ ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp | 29 +++++++++++++++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_fast.h   |  7 ++++
+ 3 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 0f8c0e7..a59f3f8 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -40,6 +40,23 @@ static const void *fastVerifyKey(const VU1Interpreter *vu)
+     return reinterpret_cast<const char *>(vu) + 1;
+ }
+ 
++// VU0's micro programs (VCALLMS) on the fast engine too (ps2vu1fast::runVu0): in a Transformers level
++// with water (vlxWaterEffect) they took 78% of the EE thread on the reference interpreter.
++// PS2X_VU0_FAST=0: the reference; =verify: both, the differences reported.
++static ps2vu1fast::Mode vu0Mode()
++{
++    static const ps2vu1fast::Mode mode = []()
++    {
++        const char *env = std::getenv("PS2X_VU0_FAST");
++        if (env && *env == '0')
++            return ps2vu1fast::Mode::Reference;
++        if (env && std::strcmp(env, "verify") == 0)
++            return ps2vu1fast::Mode::Verify;
++        return ps2vu1fast::Mode::Fast;
++    }();
++    return mode;
++}
++
+ static void reportVerifiedRun(uint32_t startPc, const VU1State &reference, const VU1State &fast,
+                               uint64_t referenceCycles, uint64_t fastCycles,
+                               const uint8_t *referenceData, const uint8_t *fastData, uint32_t dataSize,
+@@ -169,7 +186,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ void VU1Interpreter::resetScheduler()
+ {
+-    if (m_unit == Unit::VU1 && ps2vu1fast::mode() == ps2vu1fast::Mode::Fast)
++    if ((m_unit == Unit::VU1 ? ps2vu1fast::mode() : vu0Mode()) == ps2vu1fast::Mode::Fast)
+     {
+         // The fast engine keeps its own pipelines; clearing the unused reference ones
+         // (the XGKICK buffer alone is 64 KB) on every MSCAL is wasted time.
+@@ -196,7 +213,7 @@ void VU1Interpreter::resetScheduler()
+     m_nextWriteSequence = 0;
+     m_efuResourceReady = 0;
+     m_workingClip = m_state.clip;
+-    if (m_unit == Unit::VU1)
++    if (m_unit == Unit::VU1 || vu0Mode() != ps2vu1fast::Mode::Reference)
+     {
+         ps2vu1fast::resetPipelines(this, m_state);
+         ps2vu1fast::resetPipelines(fastVerifyKey(this), m_state);
+@@ -1932,6 +1949,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    if (m_unit == Unit::VU0 && vu0Mode() != ps2vu1fast::Mode::Reference && !g_vu1RunningReference)
++    {
++        if (vu0Mode() == ps2vu1fast::Mode::Fast)
++        {
++            ps2vu1fast::runVu0(this, m_state, m_cycle, m_stopRequested, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++            m_state.cycles = m_cycle;
++            return;
++        }
++        const VU1State before = m_state;
++        const std::vector<uint8_t> dataBefore(vuData, vuData + dataSize);
++        const uint64_t cycleBefore = m_cycle;
++        g_vu1RunningReference = true;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        g_vu1RunningReference = false;
++        VU1State fast = before;
++        std::vector<uint8_t> fastData = dataBefore;
++        uint64_t fastCycle = cycleBefore;
++        bool fastStop = false;
++        ps2vu1fast::runVu0(fastVerifyKey(this), fast, fastCycle, fastStop, vuCode, codeSize, fastData.data(), dataSize, gs, memory,
++                           maxCycles);
++        const std::vector<uint8_t> noPackets;
++        reportVerifiedRun(before.pc, m_state, fast, m_cycle - cycleBefore, fastCycle - cycleBefore, vuData, fastData.data(), dataSize,
++                          noPackets, noPackets, ps2vu1fast::flagTracking(fastVerifyKey(this)));
++        return;
++    }
+     if (m_unit == Unit::VU1 && !g_vu1RunningReference)
+     {
+         const ps2vu1fast::Mode mode = ps2vu1fast::mode();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+index e581c5a..e3e7cd9 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+@@ -28,6 +28,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <deque>
+ #include <functional>
+ #include <limits>
+@@ -256,6 +257,11 @@ namespace
+         uint64_t epoch = 1;
+         uint64_t decodedGeneration = kNever;
+         const uint8_t *decodedCode = nullptr;
++        // VU0 (runVu0): its 4 KB of code mirrored to the 16 KB the engine decodes (an address past
++        // 4 KB is the same instruction, as VU0 wraps), and its own code generation.
++        bool vu0 = false;
++        std::vector<uint8_t> vu0Mirror;
++        uint64_t vu0MirrorGeneration = kNever;
+         const uint8_t *needFlags = nullptr; // CodeImage::needFlags of the current image
+         std::vector<std::unique_ptr<CodeImage>> images;
+         CodeImage *image = nullptr;
+@@ -2257,7 +2263,7 @@ namespace
+ 
+     void syncCode(Engine &e, const uint8_t *code, PS2Memory *memory)
+     {
+-        const uint64_t generation = memory ? memory->getVU1CodeGeneration() : kNever - 1u;
++        const uint64_t generation = memory ? (e.vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration()) : kNever - 1u;
+         if (memory && generation == e.decodedGeneration && code == e.decodedCode)
+             return;
+         e.decodedGeneration = generation;
+@@ -2365,6 +2371,9 @@ namespace
+         static thread_local Engine *lastEngine = nullptr;
+         if (owner == lastOwner && lastEngine)
+             return *lastEngine;
++        // (VU1 runs on the VIF1 thread, VU0's micro programs on the EE's: the table is shared)
++        static std::mutex registryMutex;
++        std::lock_guard<std::mutex> lock(registryMutex);
+         std::unique_ptr<Engine> &slot = engines()[owner];
+         if (!slot)
+         {
+@@ -3203,4 +3212,22 @@ namespace ps2vu1fast
+                        dataSize, code, capturedPackets);
+         }
+     }
++
++    void runVu0(const void *owner, VU1State &state, uint64_t &cycle, bool &stopRequested,
++                const uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
++                GS &gs, PS2Memory *memory, uint32_t maxCycles)
++    {
++        Engine &e = engineFor(owner);
++        e.vu0 = true;
++        const uint64_t generation = memory ? memory->getVU0CodeGeneration() : kNever - 1u;
++        if (e.vu0Mirror.size() != kCodeBytes || !memory || generation != e.vu0MirrorGeneration)
++        {
++            e.vu0Mirror.assign(kCodeBytes, 0u);
++            if (codeSize > 0u)
++                for (uint32_t at = 0; at < kCodeBytes; at += codeSize)
++                    std::memcpy(e.vu0Mirror.data() + at, code, std::min<uint32_t>(codeSize, kCodeBytes - at));
++            e.vu0MirrorGeneration = generation;
++        }
++        run(owner, state, cycle, stopRequested, e.vu0Mirror.data(), kCodeBytes, data, dataSize, gs, memory, maxCycles, nullptr);
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h
+index 0ec110a..ce702e3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h
+@@ -38,6 +38,13 @@ namespace ps2vu1fast
+              const uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
+              GS &gs, PS2Memory *memory, uint32_t maxCycles, std::vector<uint8_t> *capture);
+ 
++    // VU0's micro programs (VCALLMS) the same way: its 4 KB of code mirrored to the engine's
++    // 16 KB, decoded again when VU0's code generation changes; no XGKICK on VU0. PS2X_VU0_FAST=0:
++    // the reference interpreter, =verify: both, the differences reported (VU1Interpreter::run).
++    void runVu0(const void *owner, VU1State &state, uint64_t &cycle, bool &stopRequested,
++                const uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
++                GS &gs, PS2Memory *memory, uint32_t maxCycles);
++
+     // Empties the pipelines (VU1Interpreter::resetScheduler, i.e. MSCAL and reset).
+     void resetPipelines(const void *owner, const VU1State &state);
+ 

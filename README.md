@@ -1,0 +1,202 @@
+<p align="center">
+  <img src="docs/images/hero.jpg" alt="Optimus Prime on the jungle path in Amazon Basin, native renderer at 21:9" width="100%">
+</p>
+
+<h1 align="center">Transformers (PS2): PC Port</h1>
+
+<p align="center">
+  The 2004 PlayStation 2 game <i>Transformers</i> (released in North America as
+  <i>Transformers Armada: Prelude to Energon</i>), recompiled into a native Windows game.
+</p>
+
+<p align="center">
+  <a href="https://github.com/kayliox/transformers-armada-recomp/releases/latest/download/tfa-setup.exe"><img src="https://img.shields.io/badge/Download-Setup%20for%20Windows-2b7bd6?style=for-the-badge&logo=windows&logoColor=white" alt="Download the setup for Windows" height="56"></a>
+  &nbsp;
+  <a href="https://github.com/kayliox/transformers-armada-recomp/releases"><img src="https://img.shields.io/github/downloads/kayliox/transformers-armada-recomp/total?style=for-the-badge&label=downloads&color=444" alt="Total downloads" height="56"></a>
+</p>
+
+<p align="center">
+  <b>The setup contains no game.</b> You need your own copy of <b>Transformers (USA, SLUS-20668)</b> as an
+  <code>.iso</code> disc image. The setup installs the tools it needs and builds the game on your PC from your disc.
+</p>
+
+<p align="center">
+  <a href="https://github.com/kayliox/transformers-armada-recomp/releases"><img src="https://img.shields.io/github/v/release/kayliox/transformers-armada-recomp?label=version" alt="Latest version"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/renderer-Direct3D%2012-purple" alt="Direct3D 12">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-green" alt="GPL-3.0">
+</p>
+
+---
+
+<!-- Trailer: shown once the YouTube video is up. Replace TRAILER_VIDEO_ID and remove this comment's markers.
+## Trailer
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=TRAILER_VIDEO_ID"><img src="docs/images/trailer.jpg" alt="Watch the trailer" width="80%"></a>
+</p>
+-->
+
+## What you get
+
+- **A native PC game.** The game's own code runs as a Windows program. No emulator to set up.
+- **A new Direct3D 12 renderer** with high resolutions, anti-aliasing, supersampling and sharp textures.
+- **Widescreen and ultrawide:** 16:9, 21:9 and wider, with the HUD at the screen edges and a field of view slider.
+- **High frame rates:** smooth motion up to your screen's refresh rate. The game always runs at its true speed.
+- **Longer draw distances:** the forest, the grass and the scenery reach much further than on the PS2.
+- **HD textures**, made on your own graphics card from your own disc.
+- **Sharp text and new button prompts** for PlayStation, Xbox and keyboard.
+- **Keyboard and mouse**, DualSense, DualShock 4 and Xbox controllers, all at the same time.
+- **Native PC sound**, a settings menu (F1), photo mode (F8) and built-in updates.
+
+## The PS2 and the PC port
+
+Each pair shows the same place. On the left, the original game as it looks on the PlayStation 2 (4:3).
+On the right, the PC port at 21:9 with every graphics setting at its maximum.
+
+<table>
+  <tr>
+    <th>PlayStation 2</th>
+    <th>PC port, 21:9, Ultra</th>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-hq.jpg" width="100%" alt="The Autobot HQ on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-hq.jpg" width="100%" alt="The Autobot HQ in the PC port at 21:9"></td>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-minicons.jpg" width="100%" alt="The HQ Mini-Con menu on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-minicons.jpg" width="100%" alt="The HQ Mini-Con menu in the PC port at 21:9"></td>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-globe.jpg" width="100%" alt="The mission globe, Amazon selected on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-globe.jpg" width="100%" alt="The mission globe, Amazon selected in the PC port at 21:9"></td>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-gate.jpg" width="100%" alt="The warp gate to Amazon Basin on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-gate.jpg" width="100%" alt="The warp gate to Amazon Basin in the PC port at 21:9"></td>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-jungle.jpg" width="100%" alt="The jungle path in Amazon Basin on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-jungle.jpg" width="100%" alt="The same jungle path in the PC port at 21:9"></td>
+  </tr>
+  <tr>
+    <td width="36%"><img src="docs/images/ps2-pause.jpg" width="100%" alt="The pause menu in Amazon Basin on the PS2"></td>
+    <td width="64%"><img src="docs/images/pc-pause.jpg" width="100%" alt="The pause menu in Amazon Basin in the PC port at 21:9"></td>
+  </tr>
+</table>
+
+### Text and button prompts
+
+The game's fonts are redrawn sharp, and the button prompts follow the device you use.
+
+<table>
+  <tr>
+    <td width="22%"><b>PlayStation 2</b></td>
+    <td><img src="docs/images/prompts-ps2.jpg" width="100%" alt="The original prompt bar on the PS2"></td>
+  </tr>
+  <tr>
+    <td><b>PC, PlayStation controller</b></td>
+    <td><img src="docs/images/prompts-playstation.jpg" width="100%" alt="Sharp text with PlayStation buttons"></td>
+  </tr>
+  <tr>
+    <td><b>PC, Xbox controller</b></td>
+    <td><img src="docs/images/prompts-xbox.jpg" width="100%" alt="Sharp text with Xbox buttons"></td>
+  </tr>
+  <tr>
+    <td><b>PC, keyboard and mouse</b></td>
+    <td><img src="docs/images/prompts-keyboard.jpg" width="100%" alt="Sharp text with keyboard keys"></td>
+  </tr>
+</table>
+
+### The settings menu
+
+Press **F1** at any time. Most settings change at once, while you play.
+
+<p align="center">
+  <img src="docs/images/menu-graphics.jpg" width="100%" alt="The F1 menu, Graphics page">
+</p>
+
+## Requirements
+
+- Windows 10 or 11, 64-bit.
+- A graphics card with DirectX 12 and Vulkan (any recent AMD, NVIDIA or Intel card).
+- About 15 GB of free disk space.
+- Your own disc image of **Transformers (USA)**, `SLUS-20668`. Other regions do not work yet.
+
+The setup installs everything else for you (Git, Python and the Visual Studio C++ build tools).
+
+## Install
+
+1. **Download** `tfa-setup.exe` with the button above.
+2. **Run it**, pick your disc image and an install folder, then press **Install**.
+   The first build takes about 15 to 25 minutes. Making the HD textures takes longer, and you can skip it.
+3. **Play.** The setup ends with a Play button. Later, start the game with `Play.bat` in the install folder.
+
+The game checks for updates by itself. When there is one, **F1 > About > Update now** installs it and puts you
+back where you were.
+
+Prefer the command line, or want to build it yourself? See **[docs/BUILDING.md](docs/BUILDING.md)**.
+
+## Controls
+
+A controller, the keyboard and the mouse all work at the same time. Click into the game window to use the mouse.
+Esc gives the mouse back.
+
+| Action | PlayStation | Xbox | Keyboard and mouse |
+|---|---|---|---|
+| Move | Left stick | Left stick | W A S D |
+| Camera | Right stick | Right stick | Mouse |
+| Fire | R1 | RB | Left mouse button |
+| Jump | L1 | LB | Space |
+| Transform | Triangle | Y | T or F |
+| Mini-Con abilities | L2 / R2 | LT / RT | Left Shift / E |
+| Aiming view | R3 | Right stick click | Right mouse button |
+| Confirm / Back | Cross / Circle | A / B | X / C |
+| Pause | Options (Start) | Menu | Enter or P |
+
+Every key can be changed in **F1 > Controls**. The full list, with the function keys, is in
+**[docs/PLAYING.md](docs/PLAYING.md)**.
+
+## Help
+
+- **Player guide:** [docs/PLAYING.md](docs/PLAYING.md) (settings, controls, updates)
+- **Problems:** [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) (common fixes and FAQ)
+- **Bugs and ideas:** open an [issue](https://github.com/kayliox/transformers-armada-recomp/issues).
+  Never attach disc images, save states or memory card files: they contain game data.
+
+## How it works
+
+The game's PlayStation 2 program (MIPS code for the Emotion Engine) is translated to C++ ahead of time with
+[PS2Recomp](https://github.com/ran-j/PS2Recomp), then built into a Windows program. A runtime stands in for the
+console hardware. On top of that, this port replaces the PS2's graphics with a native Direct3D 12 renderer and its
+sound with native PC sound.
+
+The translation happens on your PC, from your disc. This repository holds only the recipe: the tools, the
+runtime and the port's own code.
+
+## No game data
+
+This repository contains no game data: no disc images, no executables, no extracted files and no code generated
+from the game. Everything is built from your own copy. A commit check keeps it that way.
+
+## Contributing
+
+Issues and pull requests are welcome. See **[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)**.
+
+## Credits
+
+- **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** by ran-j: the recompiler and runtime this port is built on (GPL-3.0).
+- **kayliox:** the PC port, the renderer and the sound.
+- **Jenvery:** the HQ frame-rate fix.
+- **TPepperoni666:** the stick response and the Xbox button prompts.
+- The approach follows [Project Amp](https://gitlab.com/ztpeditor/project-amp), which brought *Amplitude* to PC the same way.
+- Third-party components and their licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Licence
+
+The code in this repository is licensed under the GNU General Public License v3.0, like PS2Recomp. See
+[LICENSE](LICENSE).
+
+This is an unofficial fan project. It is not affiliated with or endorsed by Hasbro, Atari, Melbourne House or
+Sony Interactive Entertainment. *Transformers* is a trademark of Hasbro. The screenshots are captured from the
+game for illustration.

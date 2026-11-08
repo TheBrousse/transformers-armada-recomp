@@ -1,0 +1,68 @@
+Subject: [PATCH] R5900 semantics: MOVZ/MOVN move 64 bits, sign branches test all 64 bits
+
+Two places where the translation differed from the R5900 (and PCSX2), found by comparing with the
+fixes another PS2Recomp port of this game collected (docs/TODO.md 97):
+- MOVZ/MOVN are 64-bit conditional moves: rd's upper 64 bits stay. The translation copied all 128
+  bits (SET_GPR_VEC), putting rs's upper half into rd. Now SET_GPR_U64 (425 places in the game).
+- BLEZ/BGTZ/BLTZ/BGEZ (and their likely and and-link forms) test the sign of the whole 64-bit
+  register (bit 63), not of its low word (5,179 places). Only a genuine 64-bit value whose low
+  word's sign differs takes another way; 32-bit results are sign-extended, so they branch as before.
+Same idea in ran-j/PS2Recomp PR #135 (MOVZ/MOVN) and the Shadow of the Colossus fork 3c46932 (the
+branches); written here against this tree.
+---diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 291d312..b971f1e 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -413,12 +413,16 @@ namespace ps2recomp
+         case OPCODE_BNE:
+         case OPCODE_BNEL:
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
++        // The R5900's BLEZ/BGTZ/BLTZ/BGEZ (and their likely and and-link forms) test the whole 64-bit
++        // register (the sign is bit 63, PCSX2: SD[0]), not its low word: a genuine 64-bit value's low
++        // word can have a different sign. 32-bit results are sign-extended to 64 bits everywhere, so
++        // ordinary 32-bit code branches as before.
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -426,12 +430,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..7feea93 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -120,10 +120,12 @@ namespace ps2recomp
+             return fmt::format("SET_GPR_U64(ctx, {}, ((int64_t)GPR_S64(ctx, {}) < (int64_t)GPR_S64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
+         case SPECIAL_SLTU:
+             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
++        // R5900 movz/movn are 64-bit (doubleword) conditional moves like the other 64-bit ALU ops:
++        // rd's upper 64 bits stay (PCSX2: UD[0] only). A 128-bit copy put rs's upper half into rd.
+         case SPECIAL_MOVZ:
+-            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MOVN:
+-            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MFSA:
+             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
+         case SPECIAL_MTSA:

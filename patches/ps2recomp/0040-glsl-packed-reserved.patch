@@ -1,0 +1,55 @@
+Subject: [PATCH] GS shaders: no "packed" names (NVIDIA)
+
+"packed" is a reserved word in GLSL. NVIDIA's compiler refuses it as a name (a parameter of the
+display shader, a member of the vertex structs of two compute shaders), so those shaders did not
+build on NVIDIA GPUs and the picture fell back to the PS2's size. Renamed.
+---
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+index 5da0ddb..1f37276 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.h
+@@ -162,7 +162,7 @@ struct Vertex
+     float s;
+     float t;
+     float q;
+-    uint packed;
++    uint drawFog; // (draw index | fog << 24; not "packed", a reserved word in GLSL)
+ };
+ layout(std430, binding = 7) writeonly buffer Vertices { Vertex vertices[]; };
+ layout(std430, binding = 4) readonly buffer MeshWords { uint words[]; };
+@@ -309,7 +309,7 @@ void main()
+             v.t = 0.0;
+             v.q = 0.0;
+         }
+-        v.packed = (entry & 0xFFFFFFu) | (((kick >> 4u) & 0xFFu) << 24u);
++        v.drawFog = (entry & 0xFFFFFFu) | (((kick >> 4u) & 0xFFu) << 24u);
+         vertices[slot + c] = v;
+     }
+ }
+@@ -1322,7 +1322,7 @@ uniform ivec4 uScales;   // scale of circuit 1's buffer, of circuit 2's (x | y <
+                          // rows each make two lines of the picture (frame mode, its buffer at twice the scale down)
+ out vec4 oColor;
+ 
+-ivec2 unpackScale(int packed) { return max(ivec2(packed & 255, packed >> 8), ivec2(1)); }
++ivec2 unpackScale(int v) { return max(ivec2(v & 255, v >> 8), ivec2(1)); } // ("packed" is reserved in GLSL: NVIDIA refuses it)
+ 
+ // a / b for a >= 0 and b a scale (1 to 16), in float: integer division takes a run of slow
+ // multiplies. (a + 0.5) / b is at least 1/32 from a whole number, more than the rounding.
+@@ -1544,7 +1544,7 @@ struct Vertex
+     float s;
+     float t;
+     float q;
+-    uint packed;
++    uint drawFog;
+ };
+ layout(std430, binding = 7) buffer Vertices { Vertex vertices[]; };
+ struct Piece
+@@ -1607,7 +1607,7 @@ void main()
+     o.s = v * b.s + w * a.s;
+     o.t = v * b.t + w * a.t;
+     o.q = v * b.q + w * a.q;
+-    o.packed = (p.entry & 0xFFFFFFu) | (mixByte(b.packed >> 24u, a.packed >> 24u, u, t) << 24u);
++    o.drawFog = (p.entry & 0xFFFFFFu) | (mixByte(b.drawFog >> 24u, a.drawFog >> 24u, u, t) << 24u);
+     vertices[dst] = o;
+ }
+ )";

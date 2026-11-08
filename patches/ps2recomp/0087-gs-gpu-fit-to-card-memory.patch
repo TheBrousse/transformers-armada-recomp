@@ -1,0 +1,146 @@
+Subject: [PATCH] GS GPU renderer: Resolution and Multisampling fitted to the graphics card's memory (TODO 202)
+
+At Resolution 8 with 8x multisampling the emulated renderer holds about 10 GB of graphics memory (measured in
+Amazon on an RX 7900 XTX: scale 8 + 8 samples 10.3 GB, scale 8 alone 2.9 GB, scale 4 + 8 samples 3.5 GB). On an
+8 GB GTX 1080 the GPU's work then stalled until Windows reset the GPU (nvlddmkm event 153), and NVIDIA's OpenGL
+driver ends the program when that happens (0xC0000409 in nvoglv64.dll, two seconds after the reset). At the start
+the card's memory is read (GL_NVX_gpu_memory_info on NVIDIA, GL_ATI_meminfo's free texture memory on AMD) and the
+Resolution and samples asked are lowered for this run, until an estimate made from those measurements (plus a
+sixth) fits in 85% of it: 8 samples to 4 first, then the Resolution down to 4, then 2 samples and none, then the
+Resolution further. The settings stay as chosen; one log line says what was drawn instead. A card that does not
+tell its memory keeps the settings. PS2X_GPU_MEMORY_MB=<n> gives the card's memory (tests), =0 no limit.
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu.cpp b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+index 60dd21e..57d1a6b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu.cpp
+@@ -63,6 +63,97 @@ namespace
+     GLFWwindow *g_context = nullptr; // the GPU renderer's, on a hidden window
+     std::atomic<bool> g_view{false};
+     std::atomic<int> g_scaleX{1}, g_scaleY{1}; // GL pixels per GS pixel across and down (chosen with the window)
++    std::atomic<int> g_msaaMost{8};            // the most samples the graphics card's memory allows (fitToMemory)
++
++    // PS2X_GPU_MSAA as asked (4 when not given), no more than the card's memory allows.
++    int msaaAsked()
++    {
++        return std::min(envInt("PS2X_GPU_MSAA", 4), g_msaaMost.load());
++    }
++
++    // (TODO 202) The graphics card's own memory in MB, or 0 when the driver does not say: NVIDIA's total
++    // (GL_NVX_gpu_memory_info), AMD's free texture memory at the start (GL_ATI_meminfo). PS2X_GPU_MEMORY_MB=<n>
++    // gives it (tests); =0: no limit.
++    int cardMemoryMb()
++    {
++        if (const char *env = std::getenv("PS2X_GPU_MEMORY_MB"); env && *env)
++            return std::max(0, std::atoi(env));
++        GLint count = 0;
++        glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++        bool nvx = false, ati = false;
++        for (GLint i = 0; i < count; ++i)
++        {
++            const char *name = reinterpret_cast<const char *>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
++            nvx = nvx || std::strcmp(name, "GL_NVX_gpu_memory_info") == 0;
++            ati = ati || std::strcmp(name, "GL_ATI_meminfo") == 0;
++        }
++        GLint kb[4] = {0, 0, 0, 0};
++        if (nvx)
++            glGetIntegerv(0x9047 /* GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX */, kb);
++        else if (ati)
++            glGetIntegerv(0x87FC /* GL_TEXTURE_FREE_MEMORY_ATI */, kb);
++        while (glGetError() != GL_NO_ERROR)
++        {
++        }
++        return kb[0] > 0 ? kb[0] / 1024 : 0;
++    }
++
++    // (TODO 202) The renderer's graphics memory at a scale and a number of samples, in MB: its buffers grow with the
++    // pixels (across x down) and the multisampled copies with the samples too. Measured in Amazon (full fields on,
++    // the default; the most the game held over 3-5 minutes, an RX 7900 XTX): scale 8 and 8 samples 10.3 GB,
++    // scale 8 alone 2.9 GB, scale 4 and 8 samples 3.5 GB - about 1160 + 26.6 a pixel + 14.6 a pixel and sample.
++    // A sixth more for what the measures missed.
++    double memoryNeededMb(int sx, int sy, int samples)
++    {
++        const double pixels = static_cast<double>(sx) * sy;
++        return (1160.0 + 26.6 * pixels + 14.6 * pixels * std::max(samples, 0)) * 7.0 / 6.0;
++    }
++
++    // (TODO 202) At Resolution 8 with 8x multisampling the renderer holds about 10 GB, more than many cards have
++    // (a GTX 1080: 8 GB). There the GPU's work stalled until Windows reset it, and NVIDIA's OpenGL driver ends the
++    // program when that happens (0xC0000409 in nvoglv64.dll, two seconds after the driver's reset event). So the
++    // Resolution and Multisampling asked are lowered, for this run only (the settings stay as chosen), until the
++    // renderer fits in 85% of the card's memory: 8 samples to 4 first, then the Resolution down to 4, then the
++    // samples to 2 and none, then the Resolution further.
++    void fitToMemory(int &sx, int &sy)
++    {
++        const int card = cardMemoryMb();
++        int samples = std::min(envInt("PS2X_GPU_MSAA", 4), 8);
++        samples = samples >= 8 ? 8 : (samples >= 4 ? 4 : (samples >= 2 ? 2 : 0));
++        const int askedX = sx, askedY = sy, askedSamples = samples;
++        if (card <= 0)
++            return;
++        const double budget = card * 0.85;
++        const auto lowerScale = [&]()
++        {
++            if (sx >= sy && sx > 1)
++                --sx;
++            else if (sy > 1)
++                --sy;
++        };
++        while (memoryNeededMb(sx, sy, samples) > budget)
++        {
++            if (samples > 4)
++                samples = 4;
++            else if (std::max(sx, sy) > 4)
++                lowerScale();
++            else if (samples > 0)
++                samples = samples > 2 ? 2 : 0;
++            else if (sx > 1 || sy > 1)
++                lowerScale();
++            else
++                break;
++        }
++        g_msaaMost.store(samples);
++        if (sx != askedX || sy != askedY || samples != askedSamples)
++            std::fprintf(stderr, "[gpu] the graphics card has %d MB: Resolution %dx%d with %d samples would need about %.0f, "
++                                 "drawn at %dx%d with %d samples (about %.0f) - the settings stay as chosen (TODO 202)\n",
++                         card, askedX, askedY, askedSamples, memoryNeededMb(askedX, askedY, askedSamples), sx, sy, samples,
++                         memoryNeededMb(sx, sy, samples));
++        else
++            std::fprintf(stderr, "[gpu] the graphics card has %d MB: Resolution %dx%d with %d samples needs about %.0f\n", card, sx, sy,
++                         samples, memoryNeededMb(sx, sy, samples));
++    }
+ 
+     // The newest picture, for the window.
+     std::mutex g_pictureMutex;
+@@ -174,8 +265,11 @@ bool ps2_gpu::createContext()
+         scaleY = nearest(height / 448.0);
+         scaleX = ps2_host_display::widescreenTv() ? nearest(std::min(width, height * 16.0 / 9.0) / 512.0) : scaleY;
+     }
+-    g_scaleX.store(std::clamp(scaleX, 1, 8));
+-    g_scaleY.store(std::clamp(scaleY, 1, 8));
++    scaleX = std::clamp(scaleX, 1, 8);
++    scaleY = std::clamp(scaleY, 1, 8);
++    fitToMemory(scaleX, scaleY);
++    g_scaleX.store(scaleX);
++    g_scaleY.store(scaleY);
+     std::fprintf(stderr, "[gpu] OpenGL context for the GS renderer created (%s)\n",
+                  reinterpret_cast<const char *>(glGetString(GL_RENDERER)));
+     return true;
+@@ -1701,7 +1795,7 @@ bool GSGpuRenderer::Impl::init()
+             // Multisampling of the scene (PS2X_GPU_MSAA=2/4/8, 4 by default since the user's OK on
+             // 2026-10-08, 0 off): the native batches that draw with a depth buffer - the scene - into
+             // multisampled copies of their buffers (Target::ms).
+-            if (const int asked = envInt("PS2X_GPU_MSAA", 4); asked > 1 && !envFlag("PS2X_MOMENT_BLOCKY", false))
++            if (const int asked = msaaAsked(); asked > 1 && !envFlag("PS2X_MOMENT_BLOCKY", false))
+             {
+                 GLint most = 0;
+                 glGetIntegerv(GL_MAX_SAMPLES, &most);
+@@ -1792,7 +1886,7 @@ bool GSGpuRenderer::Impl::init()
+             momentMainToo = envFlag("PS2X_MOMENT_MAIN", false);
+             continuity = envFlag("PS2X_MOMENT_CONTINUITY", false);
+             carry = envFlag("PS2X_MOMENT_CARRY", true);
+-            if (const int asked = envInt("PS2X_GPU_MSAA", 4); asked > 1 && !envFlag("PS2X_MOMENT_BLOCKY", false))
++            if (const int asked = msaaAsked(); asked > 1 && !envFlag("PS2X_MOMENT_BLOCKY", false))
+             {
+                 GLint most = 0;
+                 glGetIntegerv(GL_MAX_SAMPLES, &most);

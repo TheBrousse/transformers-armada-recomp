@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuses commits that add game data (tools/check_no_game_data.py), and - in the public repository (no overlay/) -
+# anything else that must not be published (tools/check_publishable.py --staged). Turned on by setup.ps1, or:
+#   git config core.hooksPath .githooks
+python tools/check_no_game_data.py || exit 1
+if [ ! -d overlay ]; then
+    python tools/check_publishable.py --staged || exit 1
+fi
+exit 0

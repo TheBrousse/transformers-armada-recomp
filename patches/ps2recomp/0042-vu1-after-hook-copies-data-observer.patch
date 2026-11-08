@@ -1,0 +1,219 @@
+Subject: [PATCH] VU1: a hook after each program run, the microcode on copies, the EE's VU1 data accesses observed
+
+For a check of what leaving VU1 program runs out would change (Transformers' TF_NATIVE_NOVU1=check):
+ps2vu1native::setAfterHook (called when a run offered to the hook has ended), Run::microcode (the
+fast engine on another state and data memory, its packets captured, from fresh pipelines) and
+ps2vu1native::setDataObserver (the EE's loads and stores of VU1 data memory). All unset by default:
+nothing changes without them.
+---
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_native.h b/ps2xRuntime/include/runtime/ps2_vu1_native.h
+index 8c67f6a..942d79c 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_native.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1_native.h
+@@ -2,6 +2,7 @@
+ #define PS2_VU1_NATIVE_H
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ struct VU1State;
+ 
+@@ -31,6 +32,10 @@ namespace ps2vu1native
+         // Null when the run has to be the microcode's to the word (PS2X_VU1_NATIVE=check) or when
+         // the renderer cannot draw meshes (meshesWanted()).
+         void (*sendBytes)(void *context, const uint8_t *data, uint32_t bytes) = nullptr;
++        // Runs the microcode itself on another state and data memory (copies, for a check): the
++        // fast engine from state.pc to the program's end, its packets appended to `packets`
++        // (each packet's bytes in turn), nothing sent. Only during a hook call.
++        void (*microcode)(void *context, VU1State &state, uint8_t *data, std::vector<uint8_t> &packets) = nullptr;
+     };
+ 
+     // Whether the GS renderer draws meshes (the GPU renderer, its mesh path on): set by the GS.
+@@ -39,6 +44,17 @@ namespace ps2vu1native
+ 
+     using Hook = bool (*)(Run &run);
+     void setHook(Hook hook);
++
++    // Called when a program run that was offered to the hook has ended - done by the hook or by
++    // the microcode - with the state and data memory as it left them (null: not called).
++    using AfterHook = void (*)(const VU1State &state, const uint8_t *data, uint32_t dataSize);
++    void setAfterHook(AfterHook hook);
++
++    // The EE's accesses to VU1 data memory (byte offset, size, a store or a load), for a check:
++    // called on the EE's thread once the VIF1 thread has caught up (null: not called).
++    using DataObserver = void (*)(uint32_t offset, uint32_t bytes, bool write);
++    void setDataObserver(DataObserver observer);
++    DataObserver dataObserver();
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index f35ed91..a46fa04 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_address.h"
+ #include "runtime/ps2_host_display.h"
+ #include "runtime/ps2_vif1_thread.h"
++#include "runtime/ps2_vu1_native.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include <atomic>
+@@ -650,9 +651,16 @@ bool PS2Memory::isScratchpad(uint32_t address) const
+     return ps2IsScratchpadAddress(address);
+ }
+ 
++namespace
++{
++    thread_local bool t_vuWrite = false; // (ps2vu1native's data observer: the mapping is for a store)
++}
++
+ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
+ {
+-    return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
++    uint8_t *mapped = const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
++    t_vuWrite = false; // (set by the stores below before they map)
++    return mapped;
+ }
+ 
+ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const
+@@ -689,7 +697,11 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+     }
+     const uint8_t *data = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+     if (data)
++    {
+         ps2vif1::sync("VU1 data memory");
++        if (ps2vu1native::DataObserver observer = ps2vu1native::dataObserver())
++            observer(offset, size, t_vuWrite);
++    }
+     return data;
+ }
+ 
+@@ -1013,7 +1025,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
+     {
+         uint32_t vuOffset = 0;
+         uint32_t vuLimit = 0;
+-        if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
++        if (uint8_t *vuMem = (t_vuWrite = true, mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit)))
+         {
+             (void)vuLimit;
+             vuMem[vuOffset] = value;
+@@ -1057,7 +1069,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
+     {
+         uint32_t vuOffset = 0;
+         uint32_t vuLimit = 0;
+-        if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
++        if (uint8_t *vuMem = (t_vuWrite = true, mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit)))
+         {
+             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
+             if (vuMem == m_vu0Code)
+@@ -1126,7 +1138,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+         {
+             return;
+         }
+-        if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
++        if (uint8_t *vuMem = (t_vuWrite = true, mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit)))
+         {
+             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
+             if (vuMem == m_vu0Code)
+@@ -1182,7 +1194,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+     {
+         uint32_t vuOffset = 0;
+         uint32_t vuLimit = 0;
+-        if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
++        if (uint8_t *vuMem = (t_vuWrite = true, mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit)))
+         {
+             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
+             if (vuMem == m_vu0Code)
+@@ -1251,7 +1263,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     {
+         uint32_t vuOffset = 0;
+         uint32_t vuLimit = 0;
+-        if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
++        if (uint8_t *vuMem = (t_vuWrite = true, mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit)))
+         {
+             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
+             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+index e3e7cd9..9d524a3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.cpp
+@@ -2462,6 +2462,7 @@ namespace
+     // ------------------------------------------------------------------------------
+ 
+     ps2vu1native::Hook g_nativeHook = nullptr;
++    ps2vu1native::AfterHook g_afterHook = nullptr;
+ 
+     enum class NativeMode : uint8_t
+     {
+@@ -2514,6 +2515,8 @@ namespace
+         submitKickPacket(e, bytes);
+     }
+ 
++    void nativeMicrocode(void *context, VU1State &state, uint8_t *data, std::vector<uint8_t> &packets); // (below run)
++
+     // PS2X_VU1_NATIVE=check: the hook's run on copies, to be compared with the microcode's.
+     struct NativeCheck
+     {
+@@ -2822,11 +2825,15 @@ namespace
+ namespace ps2vu1native
+ {
+     void setHook(Hook hook) { g_nativeHook = hook; }
++    void setAfterHook(AfterHook hook) { g_afterHook = hook; }
+ 
+     namespace
+     {
+         std::atomic<bool> g_meshesWanted{false};
++        std::atomic<DataObserver> g_dataObserver{nullptr};
+     }
++    void setDataObserver(DataObserver observer) { g_dataObserver.store(observer, std::memory_order_release); }
++    DataObserver dataObserver() { return g_dataObserver.load(std::memory_order_acquire); }
+     void setMeshesWanted(bool wanted) { g_meshesWanted.store(wanted, std::memory_order_relaxed); }
+     bool meshesWanted() { return g_meshesWanted.load(std::memory_order_relaxed); }
+ }
+@@ -2928,11 +2935,14 @@ namespace ps2vu1fast
+                 ps2vu1native::Run native{&state, data, dataSize, code, e.image ? e.image->hash : 0u, &e, &nativeSend};
+                 if (ps2vu1native::meshesWanted())
+                     native.sendBytes = &nativeSendBytes;
++                native.microcode = &nativeMicrocode;
+                 if (g_nativeHook(native))
+                 {
+                     e.cycle += 1u; // (no later run can tell how long it took)
+                     state.cycles = e.cycle;
+                     cycle = e.cycle;
++                    if (g_afterHook && !e.vu0)
++                        g_afterHook(state, data, dataSize);
+                     return;
+                 }
+             }
+@@ -3211,6 +3221,8 @@ namespace ps2vu1fast
+             writeBatch(e, state, batchCapture().routines, capturedPc, capturedItop, capturedTop, capturedBefore, data,
+                        dataSize, code, capturedPackets);
+         }
++        if (g_afterHook && programEnded && !capture && !capturing && !e.vu0)
++            g_afterHook(state, data, dataSize);
+     }
+ 
+     void runVu0(const void *owner, VU1State &state, uint64_t &cycle, bool &stopRequested,
+@@ -3231,3 +3243,21 @@ namespace ps2vu1fast
+         run(owner, state, cycle, stopRequested, e.vu0Mirror.data(), kCodeBytes, data, dataSize, gs, memory, maxCycles, nullptr);
+     }
+ }
++
++namespace
++{
++    // ps2vu1native::Run::microcode: the program on copies, by an engine of its own (as
++    // PS2X_VU1_VERIFY's second run), its packets captured.
++    void nativeMicrocode(void *context, VU1State &state, uint8_t *data, std::vector<uint8_t> &packets)
++    {
++        Engine &e = *static_cast<Engine *>(context);
++        static const int copiesEngine = 0; // (its address: the engine's key)
++        // Nothing of a run before (the other world's) carries over: its pipelines start from the state
++        // alone, as the real engine's do after a program end (drained: the working CLIP is state.clip).
++        ps2vu1fast::resetPipelines(&copiesEngine, state);
++        uint64_t cycle = state.cycles;
++        bool stop = false;
++        ps2vu1fast::run(&copiesEngine, state, cycle, stop, e.decodedCode, kCodeBytes, data, e.dataMask + 1u, *e.gs, e.memory,
++                        64u * 1024u * 1024u, &packets);
++    }
++}

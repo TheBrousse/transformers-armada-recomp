@@ -1,0 +1,63 @@
+Subject: [PATCH] input: the Transformers keyboard and mouse layout
+
+WASD move, the mouse looks; left click fires (R1), right click the aiming view (R3, which the
+game toggles), middle click jumps (L1); Space jump (L1), T transform (Triangle), Q / E / Z the
+L1 / R2 / L2 Mini-Cons, Esc or P pause (Start). X stays Cross (the menus), Enter Start, the
+arrows the D-pad; R Square, C Circle, Shift L2, Ctrl R2, G L3, B R3, Alt R1, Tab Select.
+Esc still also gives the mouse back to the desktop.
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index a1e7281..5768499 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -483,24 +483,27 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+     }
+ 
+-    // Keyboard, on top of the gamepad.
++    // Keyboard, on top of the gamepad. The layout for Transformers (its buttons: L1 jumps and is
++    // the movement Mini-Con, Triangle transforms, R1 fires, R2 and L2 are Mini-Con abilities, R3
++    // the aiming view, Start pauses): WASD move, Space jump, T transform, Q / E / Z the L1 / R2 /
++    // L2 Mini-Cons, Esc or P pause; X and the arrows for the menus (Cross), Enter Start.
+     if (live)
+     {
+         press(IsKeyDown(KEY_UP), PAD_UP);
+         press(IsKeyDown(KEY_DOWN), PAD_DOWN);
+         press(IsKeyDown(KEY_LEFT), PAD_LEFT);
+         press(IsKeyDown(KEY_RIGHT), PAD_RIGHT);
+-        press(IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_X), PAD_CROSS);
++        press(IsKeyDown(KEY_X), PAD_CROSS);
+         press(IsKeyDown(KEY_C) || IsKeyDown(KEY_BACKSPACE), PAD_CIRCLE);
+-        press(IsKeyDown(KEY_Z) || IsKeyDown(KEY_R) || IsKeyDown(KEY_KP_0), PAD_SQUARE);
+-        press(IsKeyDown(KEY_V) || IsKeyDown(KEY_F) || IsKeyDown(KEY_KP_1), PAD_TRIANGLE);
+-        press(IsKeyDown(KEY_Q), PAD_L1);
+-        press(IsKeyDown(KEY_E), PAD_R1);
+-        press(IsKeyDown(KEY_LEFT_SHIFT), PAD_L2);
+-        press(IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_SHIFT), PAD_R2);
++        press(IsKeyDown(KEY_R) || IsKeyDown(KEY_KP_0), PAD_SQUARE);
++        press(IsKeyDown(KEY_T) || IsKeyDown(KEY_V) || IsKeyDown(KEY_F) || IsKeyDown(KEY_KP_1), PAD_TRIANGLE);
++        press(IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_Q), PAD_L1);
++        press(IsKeyDown(KEY_LEFT_ALT), PAD_R1);
++        press(IsKeyDown(KEY_Z) || IsKeyDown(KEY_LEFT_SHIFT), PAD_L2);
++        press(IsKeyDown(KEY_E) || IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_SHIFT), PAD_R2);
+         press(IsKeyDown(KEY_G), PAD_L3);
+-        press(IsKeyDown(KEY_T), PAD_R3);
+-        press(IsKeyDown(KEY_ENTER), PAD_START);
++        press(IsKeyDown(KEY_B), PAD_R3);
++        press(IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_ESCAPE) || IsKeyDown(KEY_P), PAD_START);
+         press(IsKeyDown(KEY_TAB), PAD_SELECT);
+ 
+         const float keyLx = keyAxis(KEY_A, KEY_D);
+@@ -524,9 +527,9 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     {
+         if (g_mouseButtonsLive.load(std::memory_order_relaxed))
+         {
+-            press(IsMouseButtonDown(MOUSE_BUTTON_LEFT), PAD_R1);
+-            press(IsMouseButtonDown(MOUSE_BUTTON_RIGHT), PAD_L1);
+-            press(IsMouseButtonDown(MOUSE_BUTTON_MIDDLE), PAD_R3);
++            press(IsMouseButtonDown(MOUSE_BUTTON_LEFT), PAD_R1);   // fire
++            press(IsMouseButtonDown(MOUSE_BUTTON_RIGHT), PAD_R3);  // the aiming view (the game toggles it)
++            press(IsMouseButtonDown(MOUSE_BUTTON_MIDDLE), PAD_L1); // jump
+         }
+         const float mouseX = g_mouseStickX.load(std::memory_order_relaxed);
+         const float mouseY = g_mouseStickY.load(std::memory_order_relaxed);
