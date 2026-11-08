@@ -1,5 +1,11 @@
 # What's new
 
+## 0.2.6
+
+**Fixed**
+- The setup no longer stops at "Tools" with "pip install cmake failed" when another program (for example Inkscape)
+  has put its own Python on your PC. It now uses a full Python install, or installs one.
+
 ## 0.2.5
 
 **Fixed**

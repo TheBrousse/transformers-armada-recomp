@@ -43,7 +43,9 @@ function Find-Python {
         "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue |
         Sort-Object FullName -Descending | ForEach-Object FullName
     foreach ($exe in ($candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)) {
-        Invoke-Probe { & $exe -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" } | Out-Null
+        # (3.11 or newer WITH pip: a Python bundled inside another program - Inkscape's, found on a player's PATH -
+        # has no pip, and the build installs its tools with pip)
+        Invoke-Probe { & $exe -c "import sys, pip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" } | Out-Null
         if ($LASTEXITCODE -eq 0) { return $exe }
     }
     return $null
