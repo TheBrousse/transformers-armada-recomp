@@ -1,0 +1,34 @@
+# Builds the setup program (installer/, tfa-setup.exe) on GitHub's Windows machines whenever it
+# changes on main, and publishes it as a release of its own (installer/publish_release.ps1: tag
+# setup-v<VERSION>, marked latest). The README's download button points at
+# releases/latest/download/tfa-setup.exe. Every build is a NEW release, never a re-upload over an
+# older one: replacing an asset resets its download count, and the downloads badge adds up all of
+# them. The exe holds no game code or data: it runs setup.ps1 on the player's PC with their own disc.
+name: Setup program
+
+on:
+  push:
+    branches: [main]
+    paths: ["installer/**", ".github/workflows/setup-exe.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: setup-exe
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tfa-setup.exe
+        working-directory: installer
+        run: cargo build --release --locked
+      - name: Publish it as a release of its own
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: ./installer/publish_release.ps1 -Exe installer/target/release/tfa-setup.exe -Commit $env:GITHUB_SHA
