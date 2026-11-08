@@ -1,5 +1,13 @@
 # What's new
 
+## 0.3.5
+
+**New**
+- Playing with keyboard and mouse, the game's help texts name your keys: "W A S D - Move/Strafe" and "Mouse -
+  Look/Aim" instead of the analog sticks, also for steering, recon mode and the Glide Mini-Con. With a controller the
+  original words come back.
+- Existing installs also get the desktop shortcut, with their next update.
+
 ## 0.3.4
 
 **New**

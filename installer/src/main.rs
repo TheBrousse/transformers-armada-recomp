@@ -418,6 +418,8 @@ impl Job {
                 .map_err(|e| format!("{e}\n\nThe full log: {}", log_path.display()))?;
             copy_self(&self.folder);
             let _ = std::fs::remove_file(self.folder.join(UNFINISHED_MARK));
+            // (installs from before the shortcut get it with their next update, once)
+            desktop_shortcut_once(&self.folder, &repo);
             return Ok(());
         }
 

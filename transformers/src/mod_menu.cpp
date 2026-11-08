@@ -782,6 +782,9 @@ namespace mod_menu
         Overlay g_overlay = Overlay::None;
         std::string g_userLayout;  // the player's own layout, under an overlay
         std::string g_overlaySet;  // the layout the overlay put in (changed meanwhile: the player's new one stays)
+        // (TODO 223) The player's own layout while an overlay is in (key_text.cpp reads it on the game's thread)
+        std::mutex g_playerLayoutMutex;
+        std::string g_playerLayoutCopy; // empty: no overlay (the layout in force is the player's)
 
         std::string joined(const std::string &a, const std::string &b)
         {
@@ -858,6 +861,8 @@ namespace mod_menu
                 // (the player's layout back - unless it was changed under the overlay: that one stays)
                 if (ps2_host_input::keyBindings() == g_overlaySet)
                     ps2_host_input::setKeyBindings(g_userLayout);
+                std::lock_guard<std::mutex> lock(g_playerLayoutMutex);
+                g_playerLayoutCopy.clear();
             }
             static const char *const kOverlayNames[] = {"the player's", "the car's", "the menus'", "the pause screen's pages'", "the pause screen's"};
             std::fprintf(stderr, "[mod menu] keys: %s layout\n", kOverlayNames[static_cast<int>(want)]);
@@ -865,6 +870,10 @@ namespace mod_menu
             if (want == Overlay::None)
                 return;
             g_userLayout = ps2_host_input::keyBindings();
+            {
+                std::lock_guard<std::mutex> lock(g_playerLayoutMutex);
+                g_playerLayoutCopy = g_userLayout;
+            }
             if (want == Overlay::Car)
             {
                 const std::string forward = listFor(g_userLayout, "lup"), back = listFor(g_userLayout, "ldown");
@@ -2272,6 +2281,16 @@ namespace mod_menu
         ps2_host_input::setKeyboardPrompts(g_keyPrompts.load());
         moveKeyPrompts(); // (before the renderer reads the pack)
 #endif
+    }
+
+    std::string playerKeyLayout()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_playerLayoutMutex);
+            if (!g_playerLayoutCopy.empty())
+                return g_playerLayoutCopy;
+        }
+        return ps2_host_input::keyBindings();
     }
 
     bool isOpen()

@@ -20,6 +20,7 @@
 #include "hq_animation_tween.h"
 #include "port_ext.h"
 #include "guest_code.h"
+#include "key_text.h"
 #include "actor_guard.h"
 #include "revisit_music.h"
 #include "pool_growth.h"
@@ -7832,6 +7833,7 @@ namespace
     {
         testStall(runtime);
         reportSlowFrame(rdram, runtime);
+        key_text::frame(rdram); // (the sticks' words for the keyboard: key_text.h)
         ps2_host_display::trace("frame kick", runtime->memory().gs().dispfb2);
         if (g_frameLog)
         {

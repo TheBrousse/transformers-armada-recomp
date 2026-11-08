@@ -10,6 +10,8 @@
 //
 // TF_NATIVE_DEBUG=1: the D3D12 debug layer (messages in the debugger output).
 #include "nr_types.h"
+#include "nr_backend.h"
+#include "nr_draw.h"
 #include "nr_glshare.h"
 #include "nr_occlusion.h"
 #include "view_turn.h"
@@ -1072,37 +1074,8 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
 }
 )";
 
-        struct Constants
-        {
-            float rows[16];
-            float screen[4];
-            float misc[4];
-            float flags[4];
-            float test[4];
-            float mode[4];
-            float p[24][4];
-            float texScale[4];
-            float squeeze[4];
-            float wrapS[4], wrapT[4];
-            float dest[4];
-            float lod[4], lodf[4];
-            float clipRows[16];
-            float clipOn[4];
-            float standIn[4]; // (w: alpha + 2; 0 = none - the shader's standIn)
-            float down[4];    // (x: the supersampled copy's four taps)
-            float clipRowsB[16]; // (N9 stage 3: clipRows in the frame before's pose)
-            float pose[4];       // (N9 stage 3: x the camera's turn applies, y the vertices' frame-before stream)
-            float lightsB[12];   // (N9 stage 3: p[8..10] of 0x21f0 in the frame before's pose)
-        };
-        // (N9 stage 3) The picture's constants (the shader's b1): where it lies between the frame before's pose and this
-        // frame's, the camera's turn. In video memory, a slot's own 256 bytes, written before each picture by a list of
-        // its own from the upload ring (kPictureUp a picture).
-        struct PictureConstants
-        {
-            float picture[4];
-            float turn[16];
-            float turnClip[16];
-        };
+        using Constants = draw::Constants; // (the layout the shaders read: nr_draw.h)
+        using PictureConstants = draw::PictureConstants; // (nr_draw.h; in video memory, a slot's own 256 bytes, written before each picture by a list of its own from the upload ring - kPictureUp a picture)
         constexpr UINT kMaxPictures = 24u; // (a frame's pictures from one recording: N9 stage 3; State's lists' 24)
         // (their timestamps a slot: each picture's start and end, then the frame's list's start - written by the list itself
         // and copied out after each picture: on the RX 5700 XT a timestamp in the small list before the frame's came out
@@ -1132,87 +1105,11 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
             UINT64 argsAt = 0;
         };
 
-        void boundsOf(const Mesh &mesh, GpuMesh &m)
-        {
-            m.lo[0] = m.lo[1] = m.lo[2] = 1e30f;
-            m.hi[0] = m.hi[1] = m.hi[2] = -1e30f;
-            for (const Vertex &v : mesh.vertices)
-            {
-                const float p[3] = {v.x, v.y, v.z};
-                for (int k = 0; k < 3; ++k)
-                    m.lo[k] = std::min(m.lo[k], p[k]), m.hi[k] = std::max(m.hi[k], p[k]);
-            }
-        }
-
-        // Whether a box lies inside all six of the clipping matrix's planes (|x|, |y|, |z| <= w): then 0x0480
-        // cuts nothing and the draw needs no clipping (the planes are linear: its eight corners decide).
-        bool boxInside(const GpuMesh &m, const float (*clip)[4])
-        {
-            for (int c = 0; c < 8; ++c)
-            {
-                const float x = (c & 1) ? m.hi[0] : m.lo[0], y = (c & 2) ? m.hi[1] : m.lo[1], z = (c & 4) ? m.hi[2] : m.lo[2];
-                float k[4];
-                for (int r = 0; r < 4; ++r)
-                    k[r] = clip[0][r] * x + clip[1][r] * y + clip[2][r] * z + clip[3][r];
-                if (!(std::fabs(k[0]) <= k[3] && std::fabs(k[1]) <= k[3] && std::fabs(k[2]) <= k[3]))
-                    return false;
-            }
-            return true;
-        }
-
-        // A clipping draw's triangles in runs, in their own order (TODO 62): 0 wholly inside all six planes
-        // (drawn without the clipping shader, its output for them the same: the triangle as it is,
-        // screen-linear colour), 1 crossing one (through the shader), 2 wholly outside one (not drawn,
-        // as the shader drops it). Near a plane (within a hair of the GPU's own rounding) a triangle counts
-        // as crossing, so the shader decides it as before. False: more runs than worth the switches.
-        struct ClipRun
-        {
-            uint32_t first = 0, count = 0;
-            int kind = 0;
-        };
-        bool clipRunsOf(const Mesh &mesh, const float (*clip)[4], std::vector<ClipRun> &runs)
-        {
-            runs.clear();
-            // Per vertex and plane: `side` bit p = not clearly inside plane p, `out` bit p = clearly outside it.
-            static thread_local std::vector<uint8_t> side, out;
-            const size_t n = mesh.vertices.size();
-            side.resize(n);
-            out.resize(n);
-            for (size_t i = 0; i < n; ++i)
-            {
-                const Vertex &v = mesh.vertices[i];
-                float k[4];
-                for (int r = 0; r < 4; ++r)
-                    k[r] = clip[0][r] * v.x + clip[1][r] * v.y + clip[2][r] * v.z + clip[3][r];
-                const float eps = 1e-4f * (std::fabs(k[3]) + 1.0f);
-                const float d[6] = {k[3] - k[0], k[3] + k[0], k[3] - k[1], k[3] + k[1], k[3] - k[2], k[3] + k[2]};
-                uint8_t s = 0, o = 0;
-                for (int p = 0; p < 6; ++p)
-                {
-                    s |= static_cast<uint8_t>((d[p] < eps ? 1u : 0u) << p);
-                    o |= static_cast<uint8_t>((d[p] < -eps ? 1u : 0u) << p);
-                }
-                side[i] = s;
-                out[i] = o;
-            }
-            const auto &idx = mesh.indices;
-            for (size_t t = 0; t + 2 < idx.size(); t += 3)
-            {
-                const uint32_t a = idx[t], b = idx[t + 1], c = idx[t + 2];
-                if (a >= n || b >= n || c >= n)
-                    return false;
-                const int kind = (out[a] & out[b] & out[c]) ? 2 : ((side[a] | side[b] | side[c]) ? 1 : 0);
-                if (!runs.empty() && runs.back().kind == kind)
-                    runs.back().count += 3u;
-                else
-                {
-                    if (runs.size() >= 24u)
-                        return false;
-                    runs.push_back(ClipRun{static_cast<uint32_t>(t), 3u, kind});
-                }
-            }
-            return true;
-        }
+        // (the box, the inside test and the clip runs: nr_draw.h)
+        void boundsOf(const Mesh &mesh, GpuMesh &m) { draw::boundsOf(mesh, m.lo, m.hi); }
+        bool boxInside(const GpuMesh &m, const float (*clip)[4]) { return draw::boxInside(m.lo, m.hi, clip); }
+        using draw::ClipRun;
+        using draw::clipRunsOf;
 
         struct GpuTexture
         {
@@ -2900,62 +2797,39 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             return g.height > 448u ? std::log2(static_cast<float>(g.height) / 448.0f) : 0.0f;
         }
 
-        void tex1Constants(uint64_t tex1, float *lod, float *lodf)
-        {
-            static const bool off = std::getenv("TF_NATIVE_TEX1") && *std::getenv("TF_NATIVE_TEX1") == '0';
-            if (off)
-                return;
-            const uint32_t mmin = static_cast<uint32_t>(tex1 >> 6) & 7u;
-            lod[0] = 1.0f;
-            lod[1] = static_cast<float>(static_cast<int32_t>(static_cast<uint32_t>(tex1 >> 32) << 20) >> 20) / 16.0f;
-            lod[2] = static_cast<float>(1u << ((tex1 >> 19) & 3u));
-            lod[3] = static_cast<float>(std::min<uint32_t>(static_cast<uint32_t>(tex1 >> 2) & 7u, 6u));
-            lodf[0] = static_cast<float>(tex1 & 1u);
-            if ((tex1 & 1u) == 0u)
-                lod[1] -= texSharpShift();
-            lodf[1] = static_cast<float>((tex1 >> 5) & 1u);
-            lodf[2] = mmin == 1u || mmin >= 4u ? 1.0f : 0.0f;
-            lodf[3] = mmin == 2u || mmin == 4u ? 1.0f : mmin == 3u || mmin == 5u ? 2.0f : 0.0f;
-        }
+        void tex1Constants(uint64_t tex1, float *lod, float *lodf) { draw::tex1Constants(tex1, texSharpShift(), lod, lodf); } // (nr_draw.h)
 
+        // (the GS's ALPHA as the blend: nr_draw.h, in neutral terms - here Direct3D 12's)
+        D3D12_BLEND blendOf(gfx::Blend b)
+        {
+            switch (b)
+            {
+            case gfx::Blend::Zero: return D3D12_BLEND_ZERO;
+            case gfx::Blend::One: return D3D12_BLEND_ONE;
+            case gfx::Blend::SrcAlpha: return D3D12_BLEND_SRC_ALPHA;
+            case gfx::Blend::InvSrcAlpha: return D3D12_BLEND_INV_SRC_ALPHA;
+            case gfx::Blend::DestAlpha: return D3D12_BLEND_DEST_ALPHA;
+            case gfx::Blend::InvDestAlpha: return D3D12_BLEND_INV_DEST_ALPHA;
+            case gfx::Blend::Factor: return D3D12_BLEND_BLEND_FACTOR;
+            case gfx::Blend::InvFactor: return D3D12_BLEND_INV_BLEND_FACTOR;
+            }
+            return D3D12_BLEND_ONE;
+        }
         BlendKey blendOf(uint64_t alpha, bool abe)
         {
+            const gfx::BlendState n = draw::blendOf(alpha, abe);
             BlendKey k;
-            if (!abe)
-                return k;
-            const int a = static_cast<int>(alpha & 3u), b = static_cast<int>((alpha >> 2) & 3u), c = static_cast<int>((alpha >> 4) & 3u),
-                      d = static_cast<int>((alpha >> 6) & 3u);
-            // Coefficients: (weight of C, constant), for Cs (0) and Cd (1).
-            int cw[2] = {0, 0}, k1[2] = {0, 0};
-            if (a < 2)
-                cw[a] += 1;
-            if (b < 2)
-                cw[b] -= 1;
-            if (d < 2)
-                k1[d] += 1;
-            const D3D12_BLEND cf = c == 0 ? D3D12_BLEND_SRC_ALPHA : c == 1 ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_BLEND_FACTOR;
-            const D3D12_BLEND icf = c == 0 ? D3D12_BLEND_INV_SRC_ALPHA : c == 1 ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_BLEND_FACTOR;
-            auto factor = [&](int w, int k, bool &negative) {
-                negative = false;
-                if (w == 0)
-                    return k ? D3D12_BLEND_ONE : D3D12_BLEND_ZERO;
-                if (w == 1)
-                    return k ? D3D12_BLEND_ONE : cf; // (1 + C taken as 1)
-                negative = !k;
-                return k ? icf : cf;                 // -C + 1 = 1 - C; -C alone: subtract
-            };
-            bool ns = false, nd = false;
-            k.src = factor(cw[0], k1[0], ns);
-            k.dst = factor(cw[1], k1[1], nd);
-            static const bool noPremultiply = std::getenv("TF_NATIVE_PREMULTIPLY") && *std::getenv("TF_NATIVE_PREMULTIPLY") == '0';
-            if (!noPremultiply && a == 0 && b == 2 && c != 1 && d != 0)
-            {
-                k.src = D3D12_BLEND_ONE;
-                k.premultiply = c == 0 ? 1 : 2;
-            }
-            k.op = ns && !nd ? D3D12_BLEND_OP_REV_SUBTRACT : nd && !ns ? D3D12_BLEND_OP_SUBTRACT : D3D12_BLEND_OP_ADD;
-            k.enabled = true;
+            k.src = blendOf(n.src);
+            k.dst = blendOf(n.dst);
+            k.op = n.op == gfx::BlendOp::RevSubtract ? D3D12_BLEND_OP_REV_SUBTRACT : n.op == gfx::BlendOp::Subtract ? D3D12_BLEND_OP_SUBTRACT : D3D12_BLEND_OP_ADD;
+            k.enabled = n.enabled;
+            k.premultiply = n.premultiply;
             return k;
+        }
+        D3D12_COMPARISON_FUNC compareOf(gfx::Compare c)
+        {
+            return c == gfx::Compare::Never ? D3D12_COMPARISON_FUNC_NEVER : c == gfx::Compare::Always ? D3D12_COMPARISON_FUNC_ALWAYS
+                   : c == gfx::Compare::GreaterEqual ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
         }
 
         uint64_t pipelineKey(const BlendKey &b, bool depthTest, D3D12_COMPARISON_FUNC func, bool depthWrite, uint32_t writeMask, bool picture,
@@ -3342,19 +3216,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         }
 
         // FBMSK as the colour channels written: a channel whose 8 bits are all masked is left alone.
-        uint32_t writeMaskOf(uint32_t fbmsk)
-        {
-            uint32_t mask = 0u;
-            if ((fbmsk & 0x000000FFu) != 0x000000FFu)
-                mask |= D3D12_COLOR_WRITE_ENABLE_RED;
-            if ((fbmsk & 0x0000FF00u) != 0x0000FF00u)
-                mask |= D3D12_COLOR_WRITE_ENABLE_GREEN;
-            if ((fbmsk & 0x00FF0000u) != 0x00FF0000u)
-                mask |= D3D12_COLOR_WRITE_ENABLE_BLUE;
-            if ((fbmsk & 0xFF000000u) != 0xFF000000u)
-                mask |= D3D12_COLOR_WRITE_ENABLE_ALPHA;
-            return mask;
-        }
+        // (FBMSK's channels: nr_draw.h - the neutral bits are Direct3D 12's)
+        static_assert(gfx::kWriteR == D3D12_COLOR_WRITE_ENABLE_RED && gfx::kWriteG == D3D12_COLOR_WRITE_ENABLE_GREEN &&
+                          gfx::kWriteB == D3D12_COLOR_WRITE_ENABLE_BLUE && gfx::kWriteA == D3D12_COLOR_WRITE_ENABLE_ALPHA,
+                      "the write mask bits");
+        uint32_t writeMaskOf(uint32_t fbmsk) { return draw::writeMaskOf(fbmsk); }
 
         // (picture: drawn into the picture itself, RGBA as the window's GL takes it - the GS buffers'
         // targets are BGRA. A pipeline must name the format it draws into: one made for BGRA drawing
@@ -8547,8 +8413,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 // Depth: TEST's ZTE / ZTST (0 never, 1 always, 2 GEQUAL, 3 GREATER), ZBUF's ZMSK.
                 const bool zte = ((pass.test >> 16) & 1u) != 0u && !(fogDebug && fog);
                 const uint32_t ztst = static_cast<uint32_t>(pass.test >> 17) & 3u;
-                const D3D12_COMPARISON_FUNC func = ztst == 0u ? D3D12_COMPARISON_FUNC_NEVER : ztst == 1u ? D3D12_COMPARISON_FUNC_ALWAYS
-                                                   : ztst == 2u ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
+                const D3D12_COMPARISON_FUNC func = compareOf(draw::compareOfZtst(ztst));
                 const bool zwrite = ((pass.zbuf >> 32) & 1u) == 0u;
                 {
                     // (TODO 100: the depth-equal passes a little nearer - the shader's pose.z, a share of the depth: 1e-4, a ten-
@@ -10126,4 +9991,55 @@ namespace nr
 {
     void preUpload(const std::shared_ptr<const Texture> &texture) { d3d::preUploadImpl(texture); }
     bool rendererStarting() { return d3d::startingNow(); }
+}
+
+// (Roadmap P3, step S1) The Direct3D 12 backend as nr_backend.h's interface: today's nr::d3d calls behind it.
+namespace nr
+{
+    namespace
+    {
+        class D3d12Backend final : public Backend
+        {
+        public:
+            void prepare() override { d3d::prepare(); }
+            bool start() override { return d3d::start(); }
+            bool startingNow() override { return d3d::startingNow(); }
+            bool drawsPictures() override { return d3d::drawsPictures(); }
+            bool deviceLost() override { return d3d::deviceLost(); }
+            bool grassGpuReady() override { return d3d::grassGpuReady(); }
+            double waitForFrameSlot() override { return d3d::waitForFrameSlot(); }
+            void render(const Frame &frame, const std::string &shotPath) override { d3d::render(frame, shotPath); }
+            void preUpload(const std::shared_ptr<const Texture> &texture) override { d3d::preUploadImpl(texture); }
+            bool latestPicture(std::vector<uint32_t> &pixels, uint32_t &width, uint32_t &height, uint64_t &serial, bool &has3D) override
+            {
+                return d3d::latestPicture(pixels, width, height, serial, has3D);
+            }
+            void setSharedPictures(bool on) override { d3d::setSharedPictures(on); }
+            bool latestShared(d3d::SharedPicture &out, uint64_t &serial) override { return d3d::latestShared(out, serial); }
+            void sharedHeld(int index) override { d3d::sharedHeld(index); }
+            bool waitPicture(uint64_t serial, int64_t untilNs, int64_t &lastNs) override { return d3d::waitPicture(serial, untilNs, lastNs); }
+            int pacingMode() override { return d3d::pacingMode(); }
+            void setWindowLines(int lines) override { d3d::setWindowLines(lines); }
+            void setAntiAliasing(int mode) override { d3d::setAntiAliasing(mode); }
+            void setSupersampling(bool on) override { d3d::setSupersampling(on); }
+            void setSpeedupsForced(int on) override { d3d::setSpeedupsForced(on); }
+            uint32_t largeImageCap() override { return d3d::largeImageCap(); }
+            uint64_t largeImageBudget() override { return d3d::largeImageBudget(); }
+            uint64_t largeImageBytes() override { return d3d::largeImageBytes(); }
+            uint64_t adapterMemoryMB() override { return d3d::adapterMemoryMB(); }
+            int qualityPreset() override { return d3d::qualityPreset(); }
+            double gpuPictureMs() override { return d3d::gpuPictureMs(); }
+            double gpuExtraMs() override { return d3d::gpuExtraMs(); }
+            double cpuPictureMs() override { return d3d::cpuPictureMs(); }
+            double replayWaitMs() override { return d3d::replayWaitMs(); }
+            double slotWaitMs() override { return d3d::slotWaitMs(); }
+            double pacerDelayMs() override { return d3d::pacerDelayMs(); }
+        };
+    }
+
+    Backend &backend()
+    {
+        static D3d12Backend b;
+        return b;
+    }
 }

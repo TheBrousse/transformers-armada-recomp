@@ -137,7 +137,8 @@ def match_file(rel, path, native, backup, ledger, prefixes=None, threshold=0.05,
     bpath = os.path.join(backup, rel)
     st = os.stat(path)
     entry = ledger.get(rel)
-    ours = (entry is not None and entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns) or            (entry is None and os.path.exists(bpath))  # (the backups made before the ledger: the first run's)
+    ours = ((entry is not None and entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns) or
+            (entry is None and os.path.exists(bpath)))  # (the backups made before the ledger: the first run's)
     source = bpath if ours and os.path.exists(bpath) else path
     parts = rel.split("/")
     group = parts[3] if rel.upper().startswith("TFA/LEVELS/EPISODES/") and len(parts) > 3 else "/".join(parts[:2])

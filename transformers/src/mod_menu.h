@@ -12,6 +12,7 @@
 // build (PS2X_ENABLE_DEBUG_UI, on by default). TF_MOD_MENU=1 opens it from the start.
 
 #include <cstdint>
+#include <string>
 
 class PS2Runtime;
 
@@ -22,6 +23,9 @@ namespace mod_menu
     void addSettings();
     void draw(PS2Runtime &runtime);
     bool isOpen();
+    // The player's own key layout (controls.txt over the defaults), also while the menus' or the car's keys are in
+    // (those overlays move Enter, Space and Escape): the one the game's hints describe. Any thread.
+    std::string playerKeyLayout();
     // Once a rendered frame, with the pad override (overrides.cpp): the buttons of a code being
     // entered, as TF_INPUT's (1 << n, see padButton there), 0 when none.
     uint16_t padButtons(uint64_t tick);
