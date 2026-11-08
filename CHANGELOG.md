@@ -1,5 +1,12 @@
 # What's new
 
+## 0.2.7
+
+**New**
+- The game can be started straight from its .exe, for example as a non-Steam game in Steam (Steam Deck with Proton).
+  It finds its own folder and makes its settings file on the first start, like Play.bat. Building the game still
+  needs Windows.
+
 ## 0.2.6
 
 **Fixed**

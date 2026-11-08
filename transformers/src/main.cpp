@@ -51,6 +51,35 @@ void tfKeepFullSpeedInBackground(); // profiler.cpp (TODO 197: no Windows thrott
 
 namespace
 {
+    // The game started straight from a launcher that does not open it in its own folder (Steam's "Add a non-Steam
+    // game" under Proton, a shortcut to the exe; a player's report): the game folder - the one above the exe that
+    // holds settings.example.ini - becomes the current folder, and settings.ini is made on the first start, as
+    // Play.bat does. Started from Play.bat (or with the game folder current) nothing changes.
+    void enterGameFolder()
+    {
+        std::error_code e;
+        auto isGameFolder = [&](const fs::path &d)
+        { return fs::exists(d / "settings.example.ini", e) || fs::exists(d / "overlay" / "settings.example.ini", e); };
+        if (!isGameFolder(fs::current_path(e)))
+        {
+            for (fs::path d = fs::path(GetApplicationDirectory()); !d.empty(); d = d.parent_path())
+            {
+                if (isGameFolder(d))
+                {
+                    fs::current_path(d, e);
+                    break;
+                }
+                if (d == d.parent_path())
+                    break;
+            }
+        }
+        const fs::path here = fs::current_path(e);
+        if (!fs::exists(here / "settings.ini", e))
+            for (const fs::path &example : {here / "overlay" / "settings.example.ini", here / "settings.example.ini"})
+                if (fs::exists(example, e) && fs::copy_file(example, here / "settings.ini", e))
+                    break;
+    }
+
     // TF_MONITOR=<n>: open the window centred on monitor n (0 = primary; full screen there
     // too) without taking keyboard focus. The test scripts use it to keep runs off the main
     // screen.
@@ -187,6 +216,7 @@ int main(int argc, char *argv[])
 {
     // (TODO 186) The game's own log, runs\play_<date>.err / .out, when its output goes nowhere else (an installed
     // copy's Play.bat): first, so that everything below is in it.
+    enterGameFolder(); // (first: the log, settings.ini and the game's files are all found from the game folder)
     self_log::start();
     tfKeepFullSpeedInBackground(); // (TODO 197: movies and the clock at full speed with the game alt-tabbed)
     // The runtime logs a lot from the game thread. Unbuffered, every token is a
