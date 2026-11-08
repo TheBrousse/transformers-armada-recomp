@@ -1,5 +1,11 @@
 # What's new
 
+## 0.3.3
+
+**Fixed**
+- HQ with Hot Shot in a 4:3 picture: the character select showed jumbled letters where his car pictures belong, and
+  the QUIT station showed a big grey panel after leaving Options. Both show the right pictures now.
+
 ## 0.3.2
 
 **Fixed**

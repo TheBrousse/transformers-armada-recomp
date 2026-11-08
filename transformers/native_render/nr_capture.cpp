@@ -97,6 +97,7 @@ namespace nr
         std::vector<uint32_t> g_prefetchBlocks;  // state blocks captured since the last frame: their textures made ahead (prefetchBlockTextures)
         uint64_t g_bindExact = 0, g_bindGuess = 0; // captures bound by TEX0's block / by the last texture
         uint64_t g_boundRefit = 0; // (TODO 206) draws whose binding, larger than TEX0, gave way to the upload at TBP
+        uint64_t g_boundByUpload = 0; // (TODO 124) SetTexture draws whose binding gave way to a later upload at TBP
         uint32_t g_stateBlock = 0; // the last state block applied (its GS registers: TEX0_1 at +0x30)
         // Which wrote a GS register last, in the display list's order: the state block applied last (a
         // DMA call of its packet) or func_00225D60 (a register written on its own, its shadow kept at
@@ -113,7 +114,12 @@ namespace nr
         struct Upload
         {
             uint32_t texture = 0, level = 0;
+            uint64_t seq = 0; // (TODO 124: g_tableSeq when the game's thread recorded it)
         };
+        // (TODO 124) The order the game's thread saw uploads and SetTexture bindings in: a texture uploaded at a block
+        // after the last binding there is what the GS holds (textureOf).
+        uint64_t g_tableSeq = 0;
+        std::unordered_map<uint32_t, uint64_t> g_bindSeq; // TEX0's block -> g_tableSeq of SetTexture's last binding there
         // The texture tables below (uploads, bindings, conversions): the game's thread and the
         // renderer's (the 2D's textures) both use them.
         std::recursive_mutex g_texMutex;
@@ -1283,8 +1289,29 @@ namespace nr
                                       static_cast<uint64_t>(word(rdram, kGsShadow + 8u * reg + 4u)) << 32;
                 if (!g_registerWrite[reg])
                     return nullptr;
-                auto it = g_tbpTextures.find(static_cast<uint32_t>(tex0) & 0x3FFFu);
-                return textureFor(rdram, tex0, it != g_tbpTextures.end() ? it->second : 0u);
+                const uint32_t tbp = static_cast<uint32_t>(tex0) & 0x3FFFu;
+                auto it = g_tbpTextures.find(tbp);
+                uint32_t bound = it != g_tbpTextures.end() ? it->second : 0u;
+                // (TODO 124: a texture uploaded at TBP after SetTexture's last binding there is what the GS holds - the
+                // draw came before its own binding was recorded. The HQ with Hot Shot selected, 4:3: his car picture
+                // (CHARPIC) uploaded over the label font's pages (6MILL_COL, bound there last), its first draw read the
+                // font's binding - font glyphs where the car is; on the ring, the QUIT icon (ICON2) drawn with a room
+                // texture (RM_07) - a big grey panel. TF_NATIVE_UPLOADWINS=0: the binding, as before.)
+                static const bool uploadWins = !(std::getenv("TF_NATIVE_UPLOADWINS") && *std::getenv("TF_NATIVE_UPLOADWINS") == '0');
+                if (uploadWins && bound)
+                    if (auto up = g_uploads.find(tbp); up != g_uploads.end() && up->second.texture && up->second.texture != bound &&
+                                                       word(rdram, up->second.texture) == 0x006B4760u &&
+                                                       word(rdram, up->second.texture + 0x98u + 4u * std::min(word(rdram, up->second.texture + 0x90u), 15u)) ==
+                                                           up->second.level)
+                    {
+                        const auto b = g_bindSeq.find(tbp);
+                        if (up->second.seq > (b != g_bindSeq.end() ? b->second : 0u))
+                        {
+                            bound = up->second.texture;
+                            ++g_boundByUpload;
+                        }
+                    }
+                return textureFor(rdram, tex0, bound);
             }
             if (word(rdram, g_stateBlock + at + 8u) != (context == 2 ? 0x07u : 0x06u))
                 return nullptr;
@@ -2323,8 +2350,9 @@ namespace nr
             splitListHere(rdram);
             {
                 std::lock_guard<std::recursive_mutex> lock(g_texMutex);
-                g_uploads[getRegU32(ctx, 7) & 0x3FFFu] = Upload{getRegU32(ctx, 4), getRegU32(ctx, 6)};
-                logChange(false, getRegU32(ctx, 7) & 0x3FFFu, Upload{getRegU32(ctx, 4), getRegU32(ctx, 6)});
+                const Upload up{getRegU32(ctx, 4), getRegU32(ctx, 6), ++g_tableSeq};
+                g_uploads[getRegU32(ctx, 7) & 0x3FFFu] = up;
+                logChange(false, getRegU32(ctx, 7) & 0x3FFFu, up);
                 rememberLevel(rdram, getRegU32(ctx, 6));
                 // (TODO 164 stage 2: the texture made ahead, on the pool, when its image comes - its large image asked for)
                 if (prefetchMode() == 1)
@@ -2489,10 +2517,11 @@ namespace nr
                 if (!level)
                     continue;
                 auto t = owner.find(level);
-                const Upload u{t != owner.end() ? t->second : 0u, level};
+                Upload u{t != owner.end() ? t->second : 0u, level};
                 Upload &was = g_uploads[block];
                 if (was.level == u.level && was.texture == u.texture)
                     continue;
+                u.seq = ++g_tableSeq;
                 was = u;
                 logChange(false, block, u); // (its texels were kept when the capture queued the upload: uploadLevel)
                 ++g_groupLevels;
@@ -4329,6 +4358,7 @@ namespace nr
                 splitListHere(rdram);
                 std::lock_guard<std::recursive_mutex> lock(g_texMutex);
             g_tbpTextures[word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu] = kept;
+                g_bindSeq[word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu] = ++g_tableSeq;
                 logChange(true, word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu, Upload{kept, 0u});
             }
             if (g_why > 0)
@@ -4633,7 +4663,7 @@ namespace nr
                 g_frame.tick = tick;
                 std::fprintf(stderr,
                              "[native render] frame at tick %llu: %zu draws, %zu meshes (%llu decoded, %llu empty), "
-                             "%llu immediate so far, textures %llu converted (%llu upscaled, %llu of them a large image shared, %llu large let go of for video memory), %llu not, %llu draws with no upload known, state blocks bound %llu by TEX0, %llu guessed, %llu bindings larger than TEX0 given the upload at TBP; %llu kept in GS memory alone (from targets), %llu group loads (%llu levels); %llu with the game's own mip levels\n",
+                             "%llu immediate so far, textures %llu converted (%llu upscaled, %llu of them a large image shared, %llu large let go of for video memory), %llu not, %llu draws with no upload known, state blocks bound %llu by TEX0, %llu guessed, %llu bindings larger than TEX0 given the upload at TBP, %llu bindings older than the upload at TBP given it; %llu kept in GS memory alone (from targets), %llu group loads (%llu levels); %llu with the game's own mip levels\n",
                              static_cast<unsigned long long>(tick), g_frame.draws.size(), g_meshes.size(),
                              static_cast<unsigned long long>(g_decoded), static_cast<unsigned long long>(g_failed),
                              static_cast<unsigned long long>(g_immediate),
@@ -4641,6 +4671,7 @@ namespace nr
                              static_cast<unsigned long long>(g_largeShares), static_cast<unsigned long long>(g_largeEvicted),
                              static_cast<unsigned long long>(g_texturesFailed), static_cast<unsigned long long>(g_texturesUnknown),
                              static_cast<unsigned long long>(g_bindExact), static_cast<unsigned long long>(g_bindGuess), static_cast<unsigned long long>(g_boundRefit),
+                             static_cast<unsigned long long>(g_boundByUpload),
                              static_cast<unsigned long long>(g_texturesVram), static_cast<unsigned long long>(g_groupLoads),
                              static_cast<unsigned long long>(g_groupLevels), static_cast<unsigned long long>(g_texturesGameMips));
                 for (Counted &c : g_counted)
