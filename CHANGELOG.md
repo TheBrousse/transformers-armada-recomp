@@ -6,6 +6,10 @@
 - Once the game is built, starting the setup again starts the game straight away, so a game launcher (for example
   Quiver) can use the setup as its Play button. Hold Shift while starting it to open the setup's window instead.
 
+**Fixed**
+- Emulated renderer: a single garbled frame (red and green bands) that sometimes showed a second or two after
+  loading a save state.
+
 ## 0.2.8
 
 **Fixed**
