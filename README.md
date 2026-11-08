@@ -29,13 +29,11 @@
 
 ---
 
-<!-- Trailer: shown once the YouTube video is up. Replace TRAILER_VIDEO_ID and remove this comment's markers.
 ## Trailer
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=TRAILER_VIDEO_ID"><img src="docs/images/trailer.jpg" alt="Watch the trailer" width="80%"></a>
+  <a href="https://www.youtube.com/watch?v=i5nzhxsKbaU"><img src="docs/images/trailer.jpg" alt="Watch the trailer" width="80%"></a>
 </p>
--->
 
 ## What you get
 
