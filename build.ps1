@@ -197,9 +197,46 @@ if (-not (Test-Path (Join-Path $Game $ElfName))) {
 }
 
 # 2. Tools -----------------------------------------------------------------
-$genArgs = @("-A", "x64")
-if ($Generator) { $genArgs += @("-G", $Generator) }
-$cmakeArgs = @("-S", $Root, "-B", $Build) + $genArgs
+# The Visual Studio that builds: the newest install that has the C++ tools and that this CMake knows.
+# Left to itself, CMake takes the first install of its default version, which can be one without the
+# C++ tools (a C#-only Visual Studio next to the Build Tools): "No CMAKE_CXX_COMPILER could be found"
+# (a player's setup, 2026-11-09). A build folder already set up with a C++ install keeps it; one set up
+# with an install without them (that configure failed) is set up again.
+function Get-VsCppInstances {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vswhere)) { return @() }
+    $ErrorActionPreference = "Continue"
+    $json = (& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json 2>$null | Out-String)
+    try { $list = @($json | ConvertFrom-Json) } catch { return @() }
+    $help = (& cmake --help 2>$null | Out-String)
+    $names = @{ 15 = "Visual Studio 15 2017"; 16 = "Visual Studio 16 2019"; 17 = "Visual Studio 17 2022"; 18 = "Visual Studio 18 2026" }
+    @($list | Where-Object { $_.installationPath -and $_.installationVersion } | ForEach-Object {
+        $major = [int]($_.installationVersion -split '\.')[0]
+        if ($names.ContainsKey($major) -and $help.Contains($names[$major])) {
+            [pscustomobject]@{ Path = $_.installationPath; Version = [version]$_.installationVersion; Generator = $names[$major] }
+        }
+    } | Sort-Object Version -Descending)
+}
+function Get-GeneratorArgs([string]$Dir) {
+    $a = @("-A", "x64")
+    if ($Generator) { return $a + @("-G", $Generator) }
+    $vs = @(Get-VsCppInstances)
+    if (-not $vs) { return $a }   # (no vswhere, or no C++ install this CMake knows: CMake's own choice, as before)
+    $norm = { param($p) ("$p" -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
+    $cache = Join-Path $Dir "CMakeCache.txt"
+    if (Test-Path -LiteralPath $cache) {
+        $m = Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.*)$' | Select-Object -First 1
+        $was = if ($m) { & $norm $m.Matches[0].Groups[1].Value } else { "" }
+        if ($was -and @($vs | Where-Object { (& $norm $_.Path) -eq $was })) { return $a }
+        Write-Host "  (the build folder $(Split-Path $Dir -Leaf) was set up with a Visual Studio without the C++ tools: setting it up again)" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $cache -Force
+        $files = Join-Path $Dir "CMakeFiles"
+        if (Test-Path -LiteralPath $files) { Remove-Item -LiteralPath $files -Recurse -Force }
+    }
+    $a + @("-G", $vs[0].Generator, "-DCMAKE_GENERATOR_INSTANCE=$($vs[0].Path)")
+}
+$genArgs = Get-GeneratorArgs $ToolsBuild
+$cmakeArgs = @("-S", $Root, "-B", $Build) + (Get-GeneratorArgs $Build)
 if ($Public) { $cmakeArgs += "-DTF_OVERLAY_DIR=" } # (the overlay left out: transformers\CMakeLists.txt)
 
 # What the translation (steps 3-4) depends on, one line per input: "<name> <SHA-256>". The

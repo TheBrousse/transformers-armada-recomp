@@ -1,5 +1,12 @@
 # What's new
 
+## 0.4.3
+
+**Fixed**
+- The setup no longer stops at "Disc and game" with "No CMAKE_CXX_COMPILER could be found" on PCs that have
+  more than one Visual Studio installed. It now uses the one that has the C++ tools. Run the setup again; the
+  steps it already finished are kept.
+
 ## 0.4.2
 
 **New**
