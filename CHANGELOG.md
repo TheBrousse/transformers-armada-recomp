@@ -1,5 +1,30 @@
 # What's new
 
+## 0.4.1
+
+**Fixed**
+- The films (intro, story and ending movies) now fill the screen at their own wide shape. Before, they sat small in
+  the middle inside a 4:3 box.
+- With the "one-hit kills" cheat on, the boss fights (Starscream, Megatron, Cyclonus, Tidal Wave) could never end:
+  the boss lost all his health at the first hit but was never knocked down, so the level stayed stuck. The bosses
+  now take normal hits with that cheat (F1 > Mods & cheats > "One-hit kills on bosses" brings back the original
+  behaviour). This was in the original game too.
+- Loading a save state made at a higher frame rate while the game is limited to 30 fps no longer makes everything run
+  twice as fast.
+- The darker patches on some jungle ground have softer edges instead of hard straight lines.
+
+**New**
+- RecompLauncher support (thanks to Xarishark): a release now also comes as a small ZIP that RecompLauncher can
+  install and start. It uses your own USA disc image and builds the game for you, the same way as the setup, and
+  RecompLauncher can show and change the main display, graphics and controller settings. In RecompLauncher's
+  Big Picture mode the game starts in full screen, unless you already picked a display mode yourself.
+- "Smooth pictures between frames" (off by default) now moves body parts along their turn instead of in a straight
+  line, so they no longer shrink for a moment while turning.
+
+**Changed**
+- Behind the scenes the native renderer is being split into a game part and a graphics-card part, the first step
+  toward a Vulkan renderer for Linux, the Steam Deck and Android. Nothing should look different.
+
 ## 0.4.0
 
 **Fixed**

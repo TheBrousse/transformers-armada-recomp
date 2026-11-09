@@ -12,9 +12,11 @@
 #include "nr_types.h"
 #include "nr_backend.h"
 #include "nr_draw.h"
+#include "nr_device.h"
 #include "nr_glshare.h"
 #include "nr_occlusion.h"
 #include "view_turn.h"
+#include "runtime/ps2_host_display.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -102,6 +104,7 @@ cbuffer Draw : register(b0)
     float4 clipRowsB[4];           // (N9 stage 3) clipRows in the frame before's pose
     float4 pose;                   // (N9 stage 3) x: the camera's turn of the picture applies (the scene's 3D); y: the vertices blended
     float4 lightsB[3];             // (N9 stage 3) p[8..10] of 0x21f0 (the lights, the eye in the mesh's space) in the frame before's pose
+    float4 clipRowsM[4];           // (TODO 101 a) clipRows halfway between the two poses, along the turn (nr_passes.cpp midPose)
 };
 // (N9 stage 3) The picture: one frame's recording drawn once for each picture between frames, these its own - where it lies
 // between the frame before's pose and this frame's (each matrix blended so), and the camera's turn since the frame's input.
@@ -124,6 +127,8 @@ struct VsIn { float3 pos : POSITION; float4 colour : COLOR; float2 uv : TEXCOORD
              float4 iRow0 : IROW0; float4 iRow1 : IROW1; float4 iRow2 : IROW2; float4 iRow3 : IROW3; float4 iP0 : IPZERO;
              // (N9 stage 3: the matrix in the frame before's pose)
              float4 iRowB0 : IROWB0; float4 iRowB1 : IROWB1; float4 iRowB2 : IROWB2; float4 iRowB3 : IROWB3;
+             // (TODO 101 a: the matrix halfway between the two poses, along the turn)
+             float4 iRowM0 : IROWM0; float4 iRowM1 : IROWM1; float4 iRowM2 : IROWM2; float4 iRowM3 : IROWM3;
              // (N9 stage 3: a mesh made anew each frame - its vertex the frame before, pose.y)
              float3 posB : POSB; float4 colourB : COLORB; float sizeB : PSIZEB; };
 // (The colour linear on the screen, as the GS's Gouraud shading steps it: no perspective correction -
@@ -157,6 +162,15 @@ float4 posed(float4 b, float4 a)
 {
     return picture.x >= 1.0 ? a : b + (a - b) * picture.x;
 }
+// (TODO 101 a) The same through the pose halfway m (the axes turned by half the turn, nr_passes.cpp midPose): the curve
+// through the three - at 0 b, at 1 a, at a half m - so an axis that turns keeps its length (a straight blend of the
+// rows shortens it: the parts of a model shrank in the pictures between frames, up to 78% at the fixed 120). A row
+// that is the average (the origin's, a pose that does not turn) gives the straight blend.
+float4 posed3(float4 b, float4 m, float4 a)
+{
+    const float t = picture.x;
+    return t >= 1.0 ? a : b * ((1.0 - t) * (1.0 - 2.0 * t)) + m * (4.0 * t * (1.0 - t)) + a * (t * (2.0 * t - 1.0));
+}
 
 VsOut vs(VsIn i)
 {
@@ -168,7 +182,8 @@ VsOut vs(VsIn i)
         i.colour = i.colourB + (i.colour - i.colourB) * picture.x;
         i.size = i.sizeB + (i.size - i.sizeB) * picture.x;
     }
-    float4 row0 = posed(i.iRowB0, i.iRow0), row1 = posed(i.iRowB1, i.iRow1), row2 = posed(i.iRowB2, i.iRow2), row3 = posed(i.iRowB3, i.iRow3);
+    float4 row0 = posed3(i.iRowB0, i.iRowM0, i.iRow0), row1 = posed3(i.iRowB1, i.iRowM1, i.iRow1), row2 = posed3(i.iRowB2, i.iRowM2, i.iRow2),
+           row3 = posed3(i.iRowB3, i.iRowM3, i.iRow3);
     if (pose.x > 0.5)
     {
         // (the camera's turn since the frame's input, on the screen: N9 stage 3)
@@ -269,8 +284,8 @@ VsOut vs(VsIn i)
     o.clipB = float2(1.0, 1.0);
     if (clipOn.x > 0.5 && mode.w < 0.5)
     {
-        float4 k = posed(clipRowsB[0], clipRows[0]) * ipos.x + posed(clipRowsB[1], clipRows[1]) * ipos.y + posed(clipRowsB[2], clipRows[2]) * ipos.z +
-                   posed(clipRowsB[3], clipRows[3]);
+        float4 k = posed3(clipRowsB[0], clipRowsM[0], clipRows[0]) * ipos.x + posed3(clipRowsB[1], clipRowsM[1], clipRows[1]) * ipos.y +
+                   posed3(clipRowsB[2], clipRowsM[2], clipRows[2]) * ipos.z + posed3(clipRowsB[3], clipRowsM[3], clipRows[3]);
         if (pose.x > 0.5)
             k = mul(k, float4x4(turnClip[0], turnClip[1], turnClip[2], turnClip[3]));
         o.clipA = float4(k.w - k.x, k.w + k.x, k.w - k.y, k.w + k.y);
@@ -1086,17 +1101,18 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
         static_assert(sizeof(PictureConstants) <= kPredicateAt, "the picture's constants overlap its predicate");
         constexpr UINT kConstantStride = (sizeof(Constants) + 255u) & ~255u; // (CBV alignment)
         constexpr UINT64 kConstantRing = 32ull << 20;                         // a frame's passes' constants
-        constexpr UINT kInstanceStride = 144u;                                 // a pass's matrix, q0, the matrix's frame-before pose (IROW0-3, IPZERO, IROWB0-3)
+        constexpr UINT kInstanceStride = 208u;                                 // a pass's matrix, q0, the matrix's frame-before pose, halfway (IROW0-3, IPZERO, IROWB0-3, IROWM0-3)
         constexpr UINT kInstanceRing = 32768u;                                 // a frame's passes' (entries)
 
         struct GpuMesh
         {
             std::weak_ptr<const Mesh> mesh;
-            ID3D12Resource *buffer = nullptr; // vertices then indices
+            uint32_t meshId = 0; // (P3 S3: the device's mesh - its buffers; 0: the frame's ring, or the grass's own)
+            gfx::RingSpan ringVertices, ringIndices; // (a frame's own mesh: where it went in the Vertices ring)
+            // (Until sub-step 3 binds through the device: the views it was made with.)
             D3D12_VERTEX_BUFFER_VIEW vbv{};
             D3D12_INDEX_BUFFER_VIEW ibv{};
-            ID3D12Resource *vram = nullptr; // (the same in video memory, TODO 94 - meshVram) and its views
-            D3D12_VERTEX_BUFFER_VIEW vbvV{};
+            D3D12_VERTEX_BUFFER_VIEW vbvV{}; // (the video memory copy's, TODO 94 - meshVram)
             D3D12_INDEX_BUFFER_VIEW ibvV{};
             UINT count = 0;
             float lo[3] = {}, hi[3] = {}; // the vertices' box (the core's clipping: a mesh wholly inside needs none)
@@ -1114,8 +1130,8 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
         struct GpuTexture
         {
             std::weak_ptr<const Texture> texture;
-            ID3D12Resource *resource = nullptr;
-            UINT slot = 0; // in the shader-visible heap
+            gfx::TextureId id = 0; // (P3 S3: the device's texture; 0 the white one)
+            UINT slot = 0; // its view in the shader-visible heap (the device's; kept here until sub-step 3 binds by id)
             UINT64 largeBytes = 0; // a large image's video memory (g_largeBytes, TODO 94); 0: a game texture
         };
         // The large images' video memory in all (TODO 94: largeImageBytes - the capture's eviction reads it).
@@ -1148,6 +1164,7 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
             ID3DBlob *vsCode = nullptr, *psCode = nullptr, *gsCode = nullptr;
             ID3DBlob *psTiny = nullptr, *psInterp = nullptr; // (TF_NATIVE_ZWALT 128 / 256: measuring aids)
             std::unordered_map<uint64_t, ID3D12PipelineState *> pipelines; // by pipelineKey
+            uint64_t pipelinesChanged = 0; // (counted up whenever an entry is added or replaced: the device's last-asked shortcut)
             ID3D12Resource *dynamic = nullptr; // this frame's meshes (the immediate draws), mapped for good
             uint8_t *dynamicMapped = nullptr;
             UINT64 dynamicUsed = 0;
@@ -1159,7 +1176,19 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
             std::vector<Pass> passes;
             // The GS frame buffers the frame draws into, as render targets (by FBP; the picture's is
             // the main one: g.colour / g.depth, descriptor slot 0).
+            // (P3 S3: the frame builder's side - which GS buffer, its GS size; the surfaces behind it are the
+            // device's, named by `id` - see DeviceTarget below and nr_device.h.)
             struct Target
+            {
+                gfx::TargetId id = 0;         // the device's target (0: none - not made, or made in vain)
+                UINT w = 0, h = 0;            // pixels
+                float gsW = 0.0f, gsH = 0.0f; // GS pixels it covers
+                bool main = false;
+            };
+            std::unordered_map<uint32_t, Target> targets;
+            // (P3 S3) The D3D12 device's targets, by gfx::TargetId (entry 0 stays empty: "none"). A deque, so a
+            // reference to one stays good while others are made.
+            struct DeviceTarget
             {
                 ID3D12Resource *colour = nullptr, *depth = nullptr;
                 UINT rtv = 0, srv = 0;
@@ -1169,12 +1198,45 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
                 UINT destSrv = 0;
                 D3D12_RESOURCE_STATES destState = D3D12_RESOURCE_STATE_COPY_DEST;
                 D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-                UINT w = 0, h = 0;          // pixels
-                float gsW = 0.0f, gsH = 0.0f; // GS pixels it covers
                 D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                bool main = false;
+                DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM; // (TargetDesc::colour: the GS targets' BGRA8, the effects' own)
+                bool withDepth = true;                           // (TargetDesc::depth)
+                UINT w = 0, h = 0;
+                bool picture = false; // (the picture's own surfaces, g.colour / g.depth through view place 0)
             };
-            std::unordered_map<uint32_t, Target> targets;
+            std::deque<DeviceTarget> devTargets = std::deque<DeviceTarget>(1);
+            std::vector<gfx::TargetId> freeTargetIds;
+            // (P3 S3) The D3D12 device's meshes, by id (entry 0 empty): a resident mesh's buffer (vertices then indices,
+            // an upload heap) and, TF_NATIVE_MESHVRAM, its video memory copy.
+            struct DeviceMesh
+            {
+                ID3D12Resource *buffer = nullptr, *vram = nullptr;
+                D3D12_VERTEX_BUFFER_VIEW vbv{}, vbvV{};
+                D3D12_INDEX_BUFFER_VIEW ibv{}, ibvV{};
+            };
+            std::deque<DeviceMesh> devMeshes = std::deque<DeviceMesh>(1);
+            std::vector<uint32_t> freeMeshIds;
+            // (P3 S3) The D3D12 device's textures, by gfx::TextureId (entry 0: the white one, slot 0): made on this frame
+            // (uploadTexture, its levels' texels taken once the last level is given) or by the uploader (uploadTextureLater:
+            // made, copied on the copy queue, its view written at a frame's start). `generation` tells a finished upload
+            // from an older one of a reused id.
+            struct DeviceTexture
+            {
+                ID3D12Resource *resource = nullptr;
+                UINT slot = 0;
+                uint32_t width = 0, height = 0, levels = 0;
+                gfx::Format format = gfx::Format::RGBA8;
+                std::vector<const void *> given; // (uploadTexture's levels until the last one)
+                uint64_t bytes = 0;              // (its video memory)
+                uint32_t generation = 0;
+                bool ready = false;
+            };
+            std::deque<DeviceTexture> devTextures = std::deque<DeviceTexture>(1);
+            std::vector<gfx::TextureId> freeTextureIds;
+            // (P3 S3) The rings' places this frame: the constants' byte offset and the instance entries' index in their
+            // buffers (both from the slot's start); the vertices' is dynamicUsed.
+            UINT64 ringConstantsAt = 0;
+            UINT ringInstanceAt = 0;
             UINT rtvSize = 0, dsvSize = 0, nextTarget = 1;
             std::vector<UINT> freeRtvs; // (render-target view places given back: a target that became the picture's)
             UINT scaleX = 2, scaleY = 2; // the targets' pixels a GS pixel
@@ -1751,15 +1813,16 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
             g.uploads.push_back(g.readback);
             g.colour = g.depth = g.readback = nullptr;
             for (auto &t : g.targets)
-                if (t.second.main)
+                if (t.second.main && t.second.id)
                 {
                     // (Told: the state the old code turned into a view of freed memory - a main target
                     // kept across the remake, with a shader view of the old picture written.)
-                    if (t.second.srv && t.second.srvOf)
+                    const State::DeviceTarget &d = g.devTargets[t.second.id];
+                    if (d.srv && d.srvOf)
                         std::fprintf(stderr, "[native render] picture made %ux%u while target %04x held a view of the old one (slot %u)\n",
-                                     width, height, t.first, t.second.srv);
-                    t.second.colour = t.second.depth = nullptr; // (render() makes the entry again)
-                    t.second.srvOf = nullptr;
+                                     width, height, t.first, d.srv);
+                    gfx::device().releaseTarget(t.second.id); // (render() makes the entry again)
+                    t.second.id = 0;
                 }
             D3D12_RESOURCE_DESC td{};
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2572,6 +2635,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 const auto it = g_meshes.find(mesh.id);
                 return it == g_meshes.end() ? nullptr : &it->second;
             }
+            GpuMesh *meshFor(uint64_t id)
+            {
+                const auto it = g_meshes.find(id);
+                return it == g_meshes.end() ? nullptr : &it->second;
+            }
 
             // A ground's blades drawn: its stretch of the frame's blades, by the GPU's arguments - the pass's own instance
             // entry (its matrix: the identity) the view's first.
@@ -2654,16 +2722,21 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (mesh->immediate || mesh->primitive || mesh->ocean || tiny) // (this frame's alone: in the frame's ring - a buffer of its own each frame cost the ocean's patches 12 ms)
             {
                 const UINT64 vb = mesh->vertices.size() * sizeof(Vertex), ib = mesh->indices.size() * sizeof(uint32_t);
-                if (!g.dynamic || vb == 0 || g.dynamicUsed + vb + ib + 16u > (g.slot + 1u) * kDynamicRing)
+                gfx::RingSpan span;
+                if (!g.dynamic || vb == 0 || !gfx::device().ringAlloc(gfx::RingKind::Vertices, static_cast<uint32_t>(vb + ib), 16u, span))
                 {
                     g_ringFull += g.dynamic && vb != 0 ? 1u : 0u; // (TODO 99 check: the frame's ring full - the mesh not drawn)
                     return nullptr;
                 }
-                const UINT64 at = (g.dynamicUsed + 15u) & ~15ull;
-                std::memcpy(g.dynamicMapped + at, mesh->vertices.data(), vb);
-                std::memcpy(g.dynamicMapped + at + vb, mesh->indices.data(), ib);
-                g.dynamicUsed = at + vb + ib;
-                const D3D12_GPU_VIRTUAL_ADDRESS base = g.dynamic->GetGPUVirtualAddress() + at;
+                std::memcpy(span.cpu, mesh->vertices.data(), vb);
+                std::memcpy(static_cast<uint8_t *>(span.cpu) + vb, mesh->indices.data(), ib);
+                const D3D12_GPU_VIRTUAL_ADDRESS base = span.gpu;
+                g.dynamicMesh.ringVertices = span;
+                g.dynamicMesh.ringVertices.size = static_cast<uint32_t>(vb);
+                g.dynamicMesh.ringIndices = span;
+                g.dynamicMesh.ringIndices.cpu = static_cast<uint8_t *>(span.cpu) + vb;
+                g.dynamicMesh.ringIndices.gpu = span.gpu + vb;
+                g.dynamicMesh.ringIndices.size = static_cast<uint32_t>(ib);
                 g.dynamicMesh.vbv = {base, static_cast<UINT>(vb), sizeof(Vertex)};
                 g.dynamicMesh.ibv = {base + vb, static_cast<UINT>(ib), DXGI_FORMAT_R32_UINT};
                 g.dynamicMesh.count = static_cast<UINT>(mesh->indices.size());
@@ -2688,53 +2761,233 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                              static_cast<unsigned long long>(mesh->id), mesh->source, mesh->vertices.size(), mesh->indices.size(), mesh->type,
                              mesh->sprites, mesh->ocean, mesh->prim);
             }
-            const D3D12_HEAP_PROPERTIES up = heap(D3D12_HEAP_TYPE_UPLOAD);
-            const D3D12_RESOURCE_DESC bd = bufferDesc(vertexBytes + indexBytes);
             GpuMesh m;
-            if (FAILED(g.device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                         IID_PPV_ARGS(&m.buffer))))
+            m.meshId = gfx::device().createMesh(mesh->vertices.data(), static_cast<uint32_t>(vertexBytes), mesh->indices.data(),
+                                                static_cast<uint32_t>(indexBytes));
+            if (!m.meshId)
                 return nullptr;
-            void *p = nullptr;
-            const D3D12_RANGE none{0, 0};
-            if (FAILED(m.buffer->Map(0, &none, &p)))
             {
-                release(m.buffer);
-                return nullptr;
+                const State::DeviceMesh &d = g.devMeshes[m.meshId];
+                m.vbv = d.vbv;
+                m.ibv = d.ibv;
+                m.vbvV = d.vbvV;
+                m.ibvV = d.ibvV;
             }
-            std::memcpy(p, mesh->vertices.data(), vertexBytes);
-            std::memcpy(static_cast<uint8_t *>(p) + vertexBytes, mesh->indices.data(), indexBytes);
-            m.buffer->Unmap(0, nullptr);
             m.mesh = mesh;
-            m.vbv = {m.buffer->GetGPUVirtualAddress(), static_cast<UINT>(vertexBytes), sizeof(Vertex)};
-            m.ibv = {m.buffer->GetGPUVirtualAddress() + vertexBytes, static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
             m.count = static_cast<UINT>(mesh->indices.size());
-            // (TODO 94, an experiment, OFF: the mesh copied into video memory - the GPU's frame cost the same at 960 x 540
-            // as at 1920 x 1080 (8.2 ms on the RX 5700 XT), so the vertices read over the bus were a suspect; measured by
-            // turns, no difference (8.14 / 8.08 ms). TF_NATIVE_MESHVRAM=1: on; =alt: by turns, a profile window each.)
-            static const char *meshVramEnv = std::getenv("TF_NATIVE_MESHVRAM");
-            if (meshVramEnv && (*meshVramEnv == '1' || *meshVramEnv == 'a'))
-            {
-                const D3D12_HEAP_PROPERTIES gpu = heap(D3D12_HEAP_TYPE_DEFAULT);
-                if (SUCCEEDED(g.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                                IID_PPV_ARGS(&m.vram))))
-                {
-                    g.list->CopyBufferRegion(m.vram, 0, m.buffer, 0, vertexBytes + indexBytes);
-                    transition(m.vram, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER);
-                    m.vbvV = {m.vram->GetGPUVirtualAddress(), static_cast<UINT>(vertexBytes), sizeof(Vertex)};
-                    m.ibvV = {m.vram->GetGPUVirtualAddress() + vertexBytes, static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
-                    if (!(meshVramEnv && *meshVramEnv == 'a'))
-                    {
-                        // (The upload heap's copy no longer read: let go of with this frame.)
-                        g.uploads.push_back(m.buffer);
-                        m.buffer = nullptr;
-                        m.vbv = m.vbvV;
-                        m.ibv = m.ibvV;
-                    }
-                }
-            }
             boundsOf(*mesh, m);
             m.bounded = true;
             return &g.meshes.emplace(mesh->id, m).first->second;
+        }
+
+        // (TODO 204) The ground's blend layers softened in the mesh: a layer - ALPHA (Cs - Cd) As + Cd, Z not written, a
+        // mesh of the game's - drawn with its vertices' colour (its baked shading; TF_NATIVE_LAYERSOFT_ALPHA=1: the alpha that fades it in too)
+        // smoothed over their neighbours: the straight edges where the shading bent at a triangle's side spread over the
+        // triangles round them. Worked out once per mesh (kept while the mesh lives); the mesh's border - where the next
+        // chunk of ground goes on - left as it is, so the chunks still meet. The textures stay as they are; nothing more
+        // for the GPU. TF_NATIVE_LAYERSOFT=<passes> (default 2; 0: as the PS2 draws them; each pass moves a vertex half way to its
+        // neighbours' mean).
+        namespace layersoft
+        {
+            int passes()
+            {
+                static const int v = [] {
+                    const char *e = std::getenv("TF_NATIVE_LAYERSOFT");
+                    return e && *e ? std::max(0, std::atoi(e)) : 2;
+                }();
+                return v;
+            }
+            // The alpha smoothed too (TF_NATIVE_LAYERSOFT_ALPHA=1), or the colour alone (the default: the layers' alphas are
+            // mostly all or nothing a vertex - smoothed, a layer's small patches fade away).
+            bool alpha()
+            {
+                static const bool v = std::getenv("TF_NATIVE_LAYERSOFT_ALPHA") && *std::getenv("TF_NATIVE_LAYERSOFT_ALPHA") == '1';
+                return v;
+            }
+            // A draw that is one of them.
+            bool isLayer(const Draw &draw)
+            {
+                return passes() > 0 && draw.mesh && !draw.mesh->immediate && !draw.mesh->sprites && !draw.mesh->gpuGrass &&
+                       (draw.mesh->prim & 0x40u) != 0u && draw.mesh->prim2 == 0u && (draw.alpha & 0xFFu) == 0x44u && ((draw.zbuf >> 32) & 1u) != 0u &&
+                       !draw.mesh->vertices.empty() && !draw.mesh->indices.empty();
+            }
+            // The vertices with their colours smoothed: the same positions welded into one point, its neighbours those it
+            // shares a triangle with; a point on an edge only one triangle has (the mesh's border) kept.
+            std::vector<Vertex> smooth(const Mesh &mesh, int passes)
+            {
+                std::vector<Vertex> out = mesh.vertices;
+                const size_t n = mesh.vertices.size();
+                struct Key
+                {
+                    uint32_t x, y, z;
+                    bool operator==(const Key &o) const { return x == o.x && y == o.y && z == o.z; }
+                };
+                struct KeyHash
+                {
+                    size_t operator()(const Key &k) const { return (static_cast<size_t>(k.x) * 73856093u) ^ (static_cast<size_t>(k.y) * 19349663u) ^ (static_cast<size_t>(k.z) * 83492791u); }
+                };
+                std::unordered_map<Key, uint32_t, KeyHash> welded;
+                welded.reserve(n);
+                std::vector<uint32_t> point(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    Key k;
+                    std::memcpy(&k.x, &mesh.vertices[i].x, 4);
+                    std::memcpy(&k.y, &mesh.vertices[i].y, 4);
+                    std::memcpy(&k.z, &mesh.vertices[i].z, 4);
+                    point[i] = welded.emplace(k, static_cast<uint32_t>(welded.size())).first->second;
+                }
+                const size_t points = welded.size();
+                // The edges (by their points), how many triangles each, and each point's neighbours.
+                std::unordered_map<uint64_t, uint32_t> edges;
+                std::vector<std::vector<uint32_t>> adjacent(points);
+                for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3)
+                {
+                    uint32_t c[3];
+                    bool ok = true;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        if (mesh.indices[t + k] >= n)
+                            ok = false;
+                        else
+                            c[k] = point[mesh.indices[t + k]];
+                    }
+                    if (!ok || c[0] == c[1] || c[1] == c[2] || c[0] == c[2])
+                        continue;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const uint32_t a = c[k], b = c[(k + 1) % 3];
+                        const uint64_t e = a < b ? (static_cast<uint64_t>(a) << 32 | b) : (static_cast<uint64_t>(b) << 32 | a);
+                        if (edges[e]++ == 0u)
+                        {
+                            adjacent[a].push_back(b);
+                            adjacent[b].push_back(a);
+                        }
+                    }
+                }
+                std::vector<char> border(points, 0);
+                for (const auto &[e, count] : edges)
+                    if (count == 1u)
+                        border[static_cast<uint32_t>(e >> 32)] = border[static_cast<uint32_t>(e)] = 1;
+                // Each point's colour (its vertices' mean), smoothed; each vertex moved by its point's change.
+                std::vector<std::array<float, 4>> colour(points, {0.0f, 0.0f, 0.0f, 0.0f});
+                std::vector<uint32_t> users(points, 0u);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const uint32_t c = mesh.vertices[i].colour;
+                    for (int k = 0; k < 4; ++k)
+                        colour[point[i]][k] += static_cast<float>((c >> (8 * k)) & 0xFFu);
+                    ++users[point[i]];
+                }
+                for (size_t q = 0; q < points; ++q)
+                    for (int k = 0; k < 4; ++k)
+                        colour[q][k] /= static_cast<float>(std::max(users[q], 1u));
+                std::vector<std::array<float, 4>> now = colour, next(points);
+                for (int pass = 0; pass < passes; ++pass)
+                {
+                    for (size_t q = 0; q < points; ++q)
+                    {
+                        next[q] = now[q];
+                        if (border[q] || adjacent[q].empty())
+                            continue;
+                        std::array<float, 4> mean{0.0f, 0.0f, 0.0f, 0.0f};
+                        for (const uint32_t o : adjacent[q])
+                            for (int k = 0; k < 4; ++k)
+                                mean[k] += now[o][k];
+                        for (int k = 0; k < (alpha() ? 4 : 3); ++k)
+                            next[q][k] = 0.5f * now[q][k] + 0.5f * mean[k] / static_cast<float>(adjacent[q].size());
+                    }
+                    now.swap(next);
+                }
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const uint32_t c = mesh.vertices[i].colour;
+                    uint32_t r = 0u;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const float v = static_cast<float>((c >> (8 * k)) & 0xFFu) + now[point[i]][k] - colour[point[i]][k];
+                        r |= static_cast<uint32_t>(std::clamp(std::lround(v), 0l, 255l)) << (8 * k);
+                    }
+                    out[i].colour = r;
+                }
+                return out;
+            }
+            struct Entry
+            {
+                std::weak_ptr<const Mesh> mesh;
+                std::vector<Vertex> vertices;
+                GpuMesh gpu;
+            };
+            std::unordered_map<uint64_t, Entry> g_cache;
+            uint64_t g_made = 0, g_drawn = 0; // (the profile)
+            // A mesh's softened vertices (worked out the first time it is seen).
+            Entry &entry(const std::shared_ptr<const Mesh> &mesh)
+            {
+                Entry &e = g_cache[mesh->id];
+                if (e.mesh.lock() != mesh)
+                {
+                    if (e.gpu.meshId)
+                        gfx::device().releaseMesh(e.gpu.meshId);
+                    e = Entry{};
+                    e.mesh = mesh;
+                    e.vertices = smooth(*mesh, passes());
+                    ++g_made;
+                }
+                return e;
+            }
+        }
+
+        // A ground layer's mesh with its softened vertices (layersoft): kept on the GPU as upload keeps the game's meshes,
+        // or - one made anew each frame, or small - in the frame's ring.
+        GpuMesh *uploadSoft(const std::shared_ptr<const Mesh> &mesh)
+        {
+            layersoft::Entry &e = layersoft::entry(mesh);
+            ++layersoft::g_drawn;
+            static const bool smallRing = !(std::getenv("TF_NATIVE_SMALLRING") && *std::getenv("TF_NATIVE_SMALLRING") == '0');
+            const bool tiny = smallRing && mesh->vertices.size() <= 256u && g.meshes.find(mesh->id) == g.meshes.end();
+            if (mesh->primitive || mesh->ocean || tiny)
+            {
+                const UINT64 vb = e.vertices.size() * sizeof(Vertex), ib = mesh->indices.size() * sizeof(uint32_t);
+                gfx::RingSpan span;
+                if (!g.dynamic || vb == 0 || !gfx::device().ringAlloc(gfx::RingKind::Vertices, static_cast<uint32_t>(vb + ib), 16u, span))
+                {
+                    g_ringFull += g.dynamic && vb != 0 ? 1u : 0u;
+                    return nullptr;
+                }
+                std::memcpy(span.cpu, e.vertices.data(), vb);
+                std::memcpy(static_cast<uint8_t *>(span.cpu) + vb, mesh->indices.data(), ib);
+                const D3D12_GPU_VIRTUAL_ADDRESS base = span.gpu;
+                g.dynamicMesh.ringVertices = span;
+                g.dynamicMesh.ringVertices.size = static_cast<uint32_t>(vb);
+                g.dynamicMesh.ringIndices = span;
+                g.dynamicMesh.ringIndices.cpu = static_cast<uint8_t *>(span.cpu) + vb;
+                g.dynamicMesh.ringIndices.gpu = span.gpu + vb;
+                g.dynamicMesh.ringIndices.size = static_cast<uint32_t>(ib);
+                g.dynamicMesh.vbv = {base, static_cast<UINT>(vb), sizeof(Vertex)};
+                g.dynamicMesh.ibv = {base + vb, static_cast<UINT>(ib), DXGI_FORMAT_R32_UINT};
+                g.dynamicMesh.count = static_cast<UINT>(mesh->indices.size());
+                g.dynamicMesh.bounded = false;
+                ++g_ringMeshes;
+                return &g.dynamicMesh;
+            }
+            if (!e.gpu.meshId)
+            {
+                const UINT64 vertexBytes = e.vertices.size() * sizeof(Vertex), indexBytes = mesh->indices.size() * sizeof(uint32_t);
+                e.gpu.meshId = gfx::device().createMesh(e.vertices.data(), static_cast<uint32_t>(vertexBytes), mesh->indices.data(),
+                                                        static_cast<uint32_t>(indexBytes));
+                if (!e.gpu.meshId)
+                    return nullptr;
+                const State::DeviceMesh &d = g.devMeshes[e.gpu.meshId];
+                e.gpu.vbv = d.vbv;
+                e.gpu.ibv = d.ibv;
+                e.gpu.vbvV = d.vbvV;
+                e.gpu.ibvV = d.ibvV;
+                e.gpu.mesh = mesh;
+                e.gpu.count = static_cast<UINT>(mesh->indices.size());
+                boundsOf(*mesh, e.gpu);
+                e.gpu.bounded = true;
+            }
+            return &e.gpu;
         }
 
         // The meshes and textures whose owners are gone: let go of once this frame's fence is passed.
@@ -2744,9 +2997,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 if (it->second.texture.expired())
                 {
                     g_largeBytes -= it->second.largeBytes;
-                    g.uploads.push_back(it->second.resource);
-                    it->second.resource = nullptr;
-                    g.slotFreeSlots[g.slot].push_back(it->second.slot);
+                    gfx::device().releaseTexture(it->second.id);
                     it = g.textures.erase(it);
                 }
                 else
@@ -2754,11 +3005,17 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             for (auto it = g.meshes.begin(); it != g.meshes.end();)
                 if (it->second.mesh.expired())
                 {
-                    g.uploads.push_back(it->second.buffer);
-                    if (it->second.vram)
-                        g.uploads.push_back(it->second.vram);
-                    it->second.buffer = it->second.vram = nullptr;
+                    gfx::device().releaseMesh(it->second.meshId);
                     it = g.meshes.erase(it);
+                }
+                else
+                    ++it;
+            for (auto it = layersoft::g_cache.begin(); it != layersoft::g_cache.end();)
+                if (it->second.mesh.expired())
+                {
+                    if (it->second.gpu.meshId)
+                        gfx::device().releaseMesh(it->second.gpu.meshId);
+                    it = layersoft::g_cache.erase(it);
                 }
                 else
                     ++it;
@@ -2861,6 +3118,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 {"IROWB", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 96, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
                 {"IROWB", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 112, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
                 {"IROWB", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 128, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+                {"IROWM", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 144, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+                {"IROWM", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 160, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+                {"IROWM", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 176, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+                {"IROWM", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 192, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
                 {"POSB", 0, DXGI_FORMAT_R32G32B32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 {"COLORB", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 2, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 {"PSIZEB", 0, DXGI_FORMAT_R32_FLOAT, 2, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -3131,6 +3392,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 }
                 for (auto &[key, pso] : got)
                     g.pipelines[key] = pso;
+                g.pipelinesChanged += got.size();
             }
         }
 
@@ -3201,6 +3463,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     std::lock_guard<std::mutex> lock(g_mutex);
                     got.swap(g_warmDone);
                 }
+                g.pipelinesChanged += got.size();
                 for (auto &[key, pso] : got)
                 {
                     auto [it, fresh] = g.pipelines.try_emplace(key, pso);
@@ -3269,6 +3532,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             ID3D12PipelineState *pso = plib::make(pd, key); // (TODO 164: from the pipeline library when it has it)
             nr::g_pipelinesMadeAll.fetch_add(1u, std::memory_order_relaxed);
             g.pipelines[key] = pso;
+            ++g.pipelinesChanged;
             return pso;
         }
 
@@ -3520,21 +3784,15 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // frame line's breakdown, TODO 76.)
         double g_mkMs[5] = {};
         uint64_t g_mkTexels = 0;
-        ID3D12Resource *makeTexture(UINT width, UINT height, const uint32_t *pixels, UINT slot,
-                                    const std::vector<std::vector<uint32_t>> *made = nullptr)
+        // The mip chain (the frame builder's), each level the one before box-filtered (2x2, per channel) - or as made
+        // ahead (the large images: off the game's thread). (The levels read in place: a 4K image is not copied on the
+        // game's thread; `computed` holds the ones made here.)
+        void mipChain(UINT width, UINT height, const uint32_t *pixels, const std::vector<std::vector<uint32_t>> *made,
+                      std::vector<const uint32_t *> &mips, std::vector<std::vector<uint32_t>> &computed)
         {
-            auto mkT = std::chrono::steady_clock::now();
-            auto mkLap = [&mkT](int part) {
-                const auto now = std::chrono::steady_clock::now();
-                g_mkMs[part] += std::chrono::duration<double, std::milli>(now - mkT).count();
-                mkT = now;
-            };
-            g_mkTexels += static_cast<uint64_t>(width) * height;
-            // The mip chain, each level the one before box-filtered (2x2, per channel) - or as made
-            // ahead (the large images: off the game's thread).
-            // (The levels read in place: a 4K image is not copied on the game's thread.)
-            std::vector<const uint32_t *> mips(1, pixels);
-            std::vector<std::vector<uint32_t>> computed;
+            const auto t0 = std::chrono::steady_clock::now();
+            mips.assign(1, pixels);
+            computed.clear();
             computed.reserve(16);
             std::vector<std::pair<UINT, UINT>> sizes(1, {width, height});
             if (made && !made->empty())
@@ -3556,8 +3814,24 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 mips.push_back(computed.back().data());
                 sizes.push_back({w, h});
             }
+            g_mkMs[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+
+        // (The device's) An RGBA8 texture from its levels (each half the one before), copied on this frame's list through
+        // the staging ring, with its view at `slot`.
+        ID3D12Resource *makeTextureLevels(UINT width, UINT height, const std::vector<const uint32_t *> &mips, UINT slot)
+        {
+            auto mkT = std::chrono::steady_clock::now();
+            auto mkLap = [&mkT](int part) {
+                const auto now = std::chrono::steady_clock::now();
+                g_mkMs[part] += std::chrono::duration<double, std::milli>(now - mkT).count();
+                mkT = now;
+            };
+            g_mkTexels += static_cast<uint64_t>(width) * height;
+            std::vector<std::pair<UINT, UINT>> sizes(1, {width, height});
+            while (sizes.size() < mips.size())
+                sizes.push_back({std::max(1u, sizes.back().first / 2u), std::max(1u, sizes.back().second / 2u)});
             const UINT levels = static_cast<UINT>(mips.size());
-            mkLap(0);
             D3D12_RESOURCE_DESC td{};
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             td.Width = width;
@@ -3655,6 +3929,16 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             return resource;
         }
 
+        // The chain made and the texture with it (the white one, slot 0).
+        ID3D12Resource *makeTexture(UINT width, UINT height, const uint32_t *pixels, UINT slot,
+                                    const std::vector<std::vector<uint32_t>> *made = nullptr)
+        {
+            std::vector<const uint32_t *> mips;
+            std::vector<std::vector<uint32_t>> computed;
+            mipChain(width, height, pixels, made, mips, computed);
+            return makeTextureLevels(width, height, mips, slot);
+        }
+
         uint64_t g_made = 0, g_madeTexels = 0, g_refused = 0;
         // The new GPU textures a frame may make (TF_NATIVE_TEXCAP=<textures>[,<Mtexels>], default 128
         // and 96): past them a texture waits for a later frame - its draws left out meanwhile - so that
@@ -3700,15 +3984,18 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             struct Job
             {
                 std::weak_ptr<const Texture> texture;
-                uint64_t id = 0;
+                uint64_t id = 0;     // (P3 S3: the device's texture id)
+                uint32_t generation = 0;
                 bool urgent = false; // (a game texture, not a large image)
             };
             struct Done
             {
                 uint64_t id = 0;
+                uint32_t generation = 0;
                 std::weak_ptr<const Texture> texture;
                 ID3D12Resource *resource = nullptr; // (null: not made - gone before its turn, or failed)
                 UINT levels = 0;
+                bool urgent = false;
             };
             std::mutex mutex;
             std::condition_variable cv;
@@ -3718,8 +4005,6 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             std::atomic<int> state{0}; // 0 not started, 1 running, -1 off (failed or the device lost)
             std::atomic<uint64_t> made{0}, texels{0}, bytes{0}, failed{0};
             std::atomic<double> busyMs{0.0};
-            // (Render thread only: asked and not taken back yet.)
-            std::unordered_set<uint64_t> asked;
             // (The thread's own.)
             ID3D12CommandQueue *queue = nullptr;
             ID3D12CommandAllocator *allocator = nullptr;
@@ -3893,6 +4178,8 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                             break;
                         Done d;
                         d.id = batch[taken].id;
+                        d.generation = batch[taken].generation;
+                        d.urgent = batch[taken].urgent;
                         d.texture = batch[taken].texture;
                         std::shared_ptr<const Texture> t = batch[taken].texture.lock();
                         if (t && (t->format == 1u ? !t->blocks.empty() : !t->pixels.empty() && t->pixels.size() == static_cast<size_t>(t->width) * t->height))
@@ -3955,8 +4242,8 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 }
             }
 
-            // Asked once per texture (render thread). False: no uploader (off, or it could not start).
-            bool ask(const std::shared_ptr<const Texture> &t, bool urgentOne = false)
+            // A device texture's upload asked of it (render thread). False: no uploader (off, or it could not start).
+            bool ask(const std::shared_ptr<const Texture> &t, uint64_t id, uint32_t generation, bool urgentOne)
             {
                 if (!enabled() || state.load() < 0 || g_deviceLost.load(std::memory_order_relaxed))
                     return false;
@@ -3979,13 +4266,38 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     std::thread(work).detach();
                     std::fprintf(stderr, "[native render] uploader: large images uploaded on a copy queue of their own\n");
                 }
-                if (!asked.insert(t->id).second)
-                    return true;
                 std::lock_guard<std::mutex> lock(mutex);
-                (urgentOne ? urgent : jobs).push_back(Job{t, t->id, urgentOne});
+                (urgentOne ? urgent : jobs).push_back(Job{t, id, generation, urgentOne});
                 cv.notify_one();
                 return true;
             }
+        }
+
+        // (P3 S3) The frame builder's textures asked of the device's later upload (uploadTextureLater), by the texture's
+        // id: taken into g.textures once ready (takeLater, the frame's start).
+        struct LaterAsk
+        {
+            gfx::TextureId id = 0;
+            std::weak_ptr<const Texture> texture;
+        };
+        std::unordered_map<uint64_t, LaterAsk> g_laterAsked;
+
+        // Asked once per texture (render thread). False: the device uploads nothing later (off, or it could not start).
+        bool askLater(const std::shared_ptr<const Texture> &t, bool urgentOne = false)
+        {
+            if (g_laterAsked.count(t->id))
+                return true;
+            gfx::Device &dev = gfx::device();
+            const gfx::TextureId id = dev.createTexture(t->width, t->height, t->format == 1u ? gfx::Format::BC7 : gfx::Format::RGBA8, 0u);
+            if (!id)
+                return false;
+            if (!dev.uploadTextureLater(id, t, urgentOne))
+            {
+                dev.releaseTexture(id);
+                return false;
+            }
+            g_laterAsked[t->id] = LaterAsk{id, t};
+            return true;
         }
 
         // A stand-in for a game texture on the uploader's way (g_standIn): its average colour, from at most ~4,096 of
@@ -4037,7 +4349,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (it != g.textures.end())
                 return &it->second;
             // (A large image: made by the uploader, the game's own texture drawn until it is done.)
-            if (texture->upscaled && up::ask(texture))
+            if (texture->upscaled && askLater(texture))
                 return texture->fallback ? textureFor(texture->fallback, standInOk) : nullptr;
             // (A compressed large image needs the uploader - its game texture drawn when it is off.)
             if (texture->format != 0u)
@@ -4045,20 +4357,20 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             // (A game texture already on the uploader's way: its stand-in until it is done - or, with the frame's
             // budget not spent, made here after all: a stand-in lasts a frame or two, not the uploader's queue.
             // The uploader's copy, when it comes, is let go of - takeUploaded.)
-            if (standInOk && !texture->upscaled && up::asked.count(texture->id) && !texture->pixels.empty() &&
+            if (standInOk && !texture->upscaled && g_laterAsked.count(texture->id) && !texture->pixels.empty() &&
                 !(kTexBudgetMs > 0.0 && g_frameMakeMs < kTexBudgetMs))
                 return standInFor(*texture);
             // (Over the frame's creation budget: to the uploader, the stand-in drawn meanwhile.)
             if (standInOk && !texture->upscaled && kTexBudgetMs > 0.0 && g_frameMakeMs >= kTexBudgetMs &&
                 texture->pixels.size() == static_cast<size_t>(texture->width) * texture->height && !texture->pixels.empty() &&
-                up::ask(texture, true))
+                askLater(texture, true))
                 return standInFor(*texture);
             // (A game texture is made here, when first drawn with: it has nothing to stand in for it, and
             // a draw left out while its texture was on the uploader's way dropped whole models for a frame
             // - the HQ's Autobots gone at every menu change, TODO 71. TF_NATIVE_UPLOADGAME=1: on the
             // uploader, its draws left out the frame or two the copy takes - for tests only.)
             static const bool gameOn = std::getenv("TF_NATIVE_UPLOADGAME") && *std::getenv("TF_NATIVE_UPLOADGAME") == '1';
-            if (gameOn && !texture->upscaled && texture->pixels.size() > 256u && up::ask(texture, true))
+            if (gameOn && !texture->upscaled && texture->pixels.size() > 256u && askLater(texture, true))
                 return nullptr;
             if (g.freeSlots.empty() || texture->pixels.size() != static_cast<size_t>(texture->width) * texture->height)
             {
@@ -4081,18 +4393,33 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                              g.freeSlots.size());
             }
             GpuTexture t;
-            t.slot = g.freeSlots.back();
             const auto makeStart = std::chrono::steady_clock::now();
-            t.resource = makeTexture(texture->width, texture->height, texture->pixels.data(), t.slot, &texture->mips);
+            gfx::Device &dev = gfx::device();
+            {
+                std::vector<const uint32_t *> mips;
+                std::vector<std::vector<uint32_t>> computed;
+                mipChain(texture->width, texture->height, texture->pixels.data(), &texture->mips, mips, computed);
+                t.id = dev.createTexture(texture->width, texture->height, gfx::Format::RGBA8, static_cast<uint32_t>(mips.size()));
+                bool made = t.id != 0;
+                for (size_t l = 0; made && l < mips.size(); ++l)
+                    made = dev.uploadTexture(t.id, static_cast<uint32_t>(l), mips[l], std::max(1u, texture->width >> l) * 4u);
+                if (made)
+                    made = dev.textureReady(t.id);
+                if (!made && t.id)
+                {
+                    dev.releaseTexture(t.id);
+                    t.id = 0;
+                }
+            }
             g_frameMakeMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - makeStart).count();
-            if (!t.resource)
+            if (!t.id)
             {
                 ++g_refused; // (its upload failed: refused, not made)
                 return nullptr;
             }
             ++g_made;
             g_madeTexels += texture->pixels.size();
-            g.freeSlots.pop_back();
+            t.slot = g.devTextures[t.id].slot;
             t.texture = texture;
             // A large image's texels let go of once on the GPU (2026-10-28, TODO 50): kept, a level's
             // thousand 2K images held ~20 GB of RAM for good. Nothing reads them after the upload (the
@@ -4100,8 +4427,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             // alone by now (the loader handed it over; the game's side never reads an upscaled one).
             if (texture->upscaled)
             {
-                const D3D12_RESOURCE_DESC rd = t.resource->GetDesc();
-                t.largeBytes = g.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+                t.largeBytes = g.devTextures[t.id].bytes;
                 g_largeBytes += t.largeBytes;
                 Texture &own = const_cast<Texture &>(*texture);
                 std::vector<uint32_t>().swap(own.pixels);
@@ -4110,8 +4436,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             return &g.textures.emplace(texture->id, t).first->second;
         }
 
-        // The uploader's finished large images (once a frame, render thread): each given a descriptor
-        // slot and taken into the GPU textures; the game's texture it stood in for let go of.
+        // (The device's) The uploader's finished uploads (once a frame, render thread): each given a descriptor slot and its
+        // view; one whose texture is gone, or whose id was let go of meanwhile, released. A failed one is asked again while
+        // its texture lives.
         void takeUploaded()
         {
             std::vector<up::Done> ready;
@@ -4120,13 +4447,17 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 ready.swap(up::done);
             }
             std::vector<up::Done> later;
+            std::vector<up::Job> again;
             for (up::Done &d : ready)
             {
+                State::DeviceTexture *r = d.id < g.devTextures.size() ? &g.devTextures[d.id] : nullptr;
+                const bool current = r && r->generation == d.generation && !r->ready;
                 std::shared_ptr<const Texture> t = d.texture.lock();
-                if (!d.resource || !t || g.textures.count(d.id))
+                if (!d.resource || !t || !current)
                 {
-                    up::asked.erase(d.id); // (asked again if still wanted: a failed one goes the render thread's way once the uploader is off)
-                    release(d.resource);   // (never used by this queue: released at once)
+                    release(d.resource); // (never used by this queue: released at once)
+                    if (current && t)
+                        again.push_back(up::Job{t, d.id, d.generation, d.urgent}); // (failed: asked again)
                     continue;
                 }
                 if (g.freeSlots.empty())
@@ -4134,37 +4465,69 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     later.push_back(d);
                     continue;
                 }
-                GpuTexture gt;
-                gt.slot = g.freeSlots.back();
+                r->slot = g.freeSlots.back();
                 g.freeSlots.pop_back();
-                gt.resource = d.resource;
-                gt.texture = t;
+                r->resource = d.resource;
+                r->levels = d.levels;
                 const D3D12_RESOURCE_DESC rd = d.resource->GetDesc();
-                if (t->upscaled)
-                {
-                    gt.largeBytes = g.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
-                    g_largeBytes += gt.largeBytes;
-                }
+                r->bytes = g.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
                 D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = rd.Format; // (RGBA8, or a large image's BC7)
                 sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 sd.Texture2D.MipLevels = d.levels;
                 D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
-                h.ptr += static_cast<SIZE_T>(gt.slot) * g.srvSize;
-                srvWritten(gt.slot, "an uploaded image's");
+                h.ptr += static_cast<SIZE_T>(r->slot) * g.srvSize;
+                srvWritten(r->slot, "an uploaded image's");
                 g.device->CreateShaderResourceView(d.resource, &sd, h);
-                g.textures.emplace(d.id, gt);
-                up::asked.erase(d.id);
-                g_averages.erase(d.id);
-                ++g_made;
-                // (The game's texture no longer stands in: let go of - render thread only reads it.)
-                const_cast<Texture &>(*t).fallback.reset();
+                r->ready = true;
             }
-            if (!later.empty())
+            if (!later.empty() || !again.empty())
             {
                 std::lock_guard<std::mutex> lock(up::mutex);
                 up::done.insert(up::done.end(), later.begin(), later.end());
+                for (up::Job &j : again)
+                    (j.urgent ? up::urgent : up::jobs).push_back(std::move(j));
+                if (!again.empty())
+                    up::cv.notify_one();
+            }
+        }
+
+        // (The frame builder's) The textures asked of the device's later upload that are ready: taken into the GPU
+        // textures, the game's texture each stood in for let go of; one whose texture is gone, or made on this thread
+        // meanwhile, let go of.
+        void takeLater()
+        {
+            gfx::Device &dev = gfx::device();
+            for (auto it = g_laterAsked.begin(); it != g_laterAsked.end();)
+            {
+                std::shared_ptr<const Texture> t = it->second.texture.lock();
+                if (!t || g.textures.count(it->first))
+                {
+                    dev.releaseTexture(it->second.id);
+                    it = g_laterAsked.erase(it);
+                    continue;
+                }
+                if (!dev.textureReady(it->second.id))
+                {
+                    ++it;
+                    continue;
+                }
+                GpuTexture gt;
+                gt.id = it->second.id;
+                gt.slot = g.devTextures[gt.id].slot;
+                gt.texture = t;
+                if (t->upscaled)
+                {
+                    gt.largeBytes = g.devTextures[gt.id].bytes;
+                    g_largeBytes += gt.largeBytes;
+                }
+                g.textures.emplace(it->first, gt);
+                g_averages.erase(it->first);
+                ++g_made;
+                // (The game's texture no longer stands in: let go of - render thread only reads it.)
+                const_cast<Texture &>(*t).fallback.reset();
+                it = g_laterAsked.erase(it);
             }
         }
 
@@ -5624,7 +5987,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             return h;
         }
 
-        void srvFor(State::Target &t)
+        // ---- (P3 S3) The D3D12 device's targets: their surfaces, views and states (nr_device.h's targets part) ----
+        State::DeviceTarget &dt(gfx::TargetId id) { return g.devTargets[id]; }
+        State::DeviceTarget &dt(const State::Target &t) { return g.devTargets[t.id]; }
+
+        void srvFor(State::DeviceTarget &t)
         {
             if (!t.srv)
             {
@@ -5650,27 +6017,21 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             g.device->CreateShaderResourceView(t.colour, &sd, h);
         }
 
-        // A render target for a GS frame buffer (twice its GS size), cleared to transparent black.
-        bool makeTarget(State::Target &t, float gsW, float gsH, UINT sx = 0u, UINT sy = 0u)
+        // A render target's surfaces (BGRA colour and a readable depth), cleared to transparent black: new, or a
+        // grown one's again (same views' places).
+        bool makeSurfaces(State::DeviceTarget &t, UINT w, UINT h)
         {
-            ++g_targetsMade;
-            sx = sx ? sx : g.scaleX;
-            sy = sy ? sy : g.scaleY;
-            if (std::getenv("TF_NATIVE_TARGETLOG"))
-                std::fprintf(stderr, "[native render] target made %gx%g at %ux%u\n", gsW, gsH, sx, sy);
             if (!t.rtv && g.freeRtvs.empty() && g.nextTarget >= 64u)
                 return false;
-            t.gsW = gsW;
-            t.gsH = gsH;
-            t.w = static_cast<UINT>(gsW) * sx;
-            t.h = static_cast<UINT>(gsH) * sy;
+            t.w = w;
+            t.h = h;
             D3D12_RESOURCE_DESC td{};
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             td.Width = t.w;
             td.Height = t.h;
             td.DepthOrArraySize = 1;
             td.MipLevels = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.Format = t.format;
             td.SampleDesc.Count = 1;
             td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             D3D12_CLEAR_VALUE clear{};
@@ -5680,22 +6041,26 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (FAILED(g.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
                                                          IID_PPV_ARGS(&t.colour))))
                 return false;
-            // (Typeless, so the depth fog can read it: a depth view to draw with, a read-only one and
-            // a shader view for the fog's pass.)
-            td.Format = DXGI_FORMAT_R32_TYPELESS;
-            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-            D3D12_CLEAR_VALUE depthClear{};
-            depthClear.Format = DXGI_FORMAT_D32_FLOAT;
-            if (FAILED(g.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
-                                                         IID_PPV_ARGS(&t.depth))))
+            t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (t.withDepth)
             {
-                // (Not drawn into at all: with its colour alone, its depth views - a grown target's -
-                // would still name the old depth, released with this frame.)
-                release(t.colour);
-                t.depth = nullptr;
-                return false;
+                // (Typeless, so the depth fog can read it: a depth view to draw with, a read-only one and
+                // a shader view for the fog's pass.)
+                td.Format = DXGI_FORMAT_R32_TYPELESS;
+                td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                D3D12_CLEAR_VALUE depthClear{};
+                depthClear.Format = DXGI_FORMAT_D32_FLOAT;
+                if (FAILED(g.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
+                                                             IID_PPV_ARGS(&t.depth))))
+                {
+                    // (Not drawn into at all: with its colour alone, its depth views - a grown target's -
+                    // would still name the old depth, released with this frame.)
+                    release(t.colour);
+                    t.depth = nullptr;
+                    return false;
+                }
+                t.depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             }
-            t.depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             if (!t.rtv)
             {
                 // (A grown target keeps its views' places. The views are CPU descriptors, read when a
@@ -5709,42 +6074,44 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     t.rtv = g.nextTarget++;
             }
             g.device->CreateRenderTargetView(t.colour, nullptr, rtvAt(t.rtv));
-            D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
-            dv.Format = DXGI_FORMAT_D32_FLOAT;
-            dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-            g.device->CreateDepthStencilView(t.depth, &dv, dsvAt(t.rtv));
-            dv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
-            g.device->CreateDepthStencilView(t.depth, &dv, dsvAt(t.rtv + 64u));
-            if (!t.depthSrv && !g.freeSlots.empty())
+            if (t.withDepth)
             {
-                t.depthSrv = g.freeSlots.back();
-                g.freeSlots.pop_back();
-            }
-            if (t.depthSrv)
-            {
-                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-                sd.Format = DXGI_FORMAT_R32_FLOAT;
-                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                sd.Texture2D.MipLevels = 1;
-                D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
-                h.ptr += static_cast<SIZE_T>(t.depthSrv) * g.srvSize;
-                srvWritten(t.depthSrv, "a target's depth");
-                g.device->CreateShaderResourceView(t.depth, &sd, h);
+                D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+                dv.Format = DXGI_FORMAT_D32_FLOAT;
+                dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                g.device->CreateDepthStencilView(t.depth, &dv, dsvAt(t.rtv));
+                dv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+                g.device->CreateDepthStencilView(t.depth, &dv, dsvAt(t.rtv + 64u));
+                if (!t.depthSrv && !g.freeSlots.empty())
+                {
+                    t.depthSrv = g.freeSlots.back();
+                    g.freeSlots.pop_back();
+                }
+                if (t.depthSrv)
+                {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+                    sd.Format = DXGI_FORMAT_R32_FLOAT;
+                    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    sd.Texture2D.MipLevels = 1;
+                    D3D12_CPU_DESCRIPTOR_HANDLE h = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    h.ptr += static_cast<SIZE_T>(t.depthSrv) * g.srvSize;
+                    srvWritten(t.depthSrv, "a target's depth");
+                    g.device->CreateShaderResourceView(t.depth, &sd, h);
+                }
             }
             const float black[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             g.list->ClearRenderTargetView(rtvAt(t.rtv), black, 0, nullptr);
-            g.list->ClearDepthStencilView(dsvAt(t.rtv), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+            // (Only a target with depth: one made without has no depth view - its place may still name the depth of a
+            // target released before, freed once the GPU is done with it; clearing through that crashed in AMD's
+            // driver, amdxc64.dll, when the HQ's picture size changed and the anti-aliasing's copy was made again.)
+            if (t.withDepth && t.depth)
+                g.list->ClearDepthStencilView(dsvAt(t.rtv), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
             t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             return true;
         }
 
-        // A frame buffer's identity: its base and width (the same pages are another buffer at
-        // another width - the 3D field and, later in the frame, the glare's small buffers).
-        uint32_t targetKey(uint32_t frame) { return (frame & 0x1FFu) | ((frame >> 16) & 0x3Fu) << 9; }
-        bool depthFormat(uint32_t frame) { return ((frame >> 24) & 0x30u) == 0x30u; } // (PSMZ*: a depth buffer written as colour)
-
-        void depthStateOf(State::Target &t, D3D12_RESOURCE_STATES to)
+        void depthStateOf(State::DeviceTarget &t, D3D12_RESOURCE_STATES to)
         {
             if (!t.depth || t.depthState == to)
                 return;
@@ -5752,7 +6119,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             t.depthState = to;
         }
 
-        void stateOf(State::Target &t, D3D12_RESOURCE_STATES to)
+        void stateOf(State::DeviceTarget &t, D3D12_RESOURCE_STATES to)
         {
             if (t.state != to)
             {
@@ -5763,7 +6130,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
 
         // TEST's DATE (the GS's destination alpha test): the target's colour as it is now, copied for
         // the draw to read its alpha (a target cannot be read while drawn into). Its view's slot, or 0.
-        UINT destCopyOf(State::Target &t)
+        UINT destCopyOf(State::DeviceTarget &t)
         {
             if (!t.colour)
                 return 0u;
@@ -5808,6 +6175,650 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             stateOf(t, was);
             return t.destSrv;
         }
+
+        D3D12_RESOURCE_STATES stateFor(gfx::UseFor how)
+        {
+            switch (how)
+            {
+            case gfx::UseFor::Draw: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+            case gfx::UseFor::Sample: return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            case gfx::UseFor::CopySource: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+            case gfx::UseFor::CopyDest: return D3D12_RESOURCE_STATE_COPY_DEST;
+            }
+            return D3D12_RESOURCE_STATE_COMMON;
+        }
+
+        // (P3 S3) The D3D12 implementation of nr::gfx::Device. Sub-step 1: the targets; the rest of the interface is
+        // still called directly in render() and is routed through here in the next sub-steps (its calls here are
+        // placeholders, not used yet).
+        bool smaaLookups(); // (below: SMAA's tables uploaded once)
+
+        // A target's colour format.
+        DXGI_FORMAT formatOf(gfx::Format f)
+        {
+            switch (f)
+            {
+            case gfx::Format::RGBA8: return DXGI_FORMAT_R8G8B8A8_UNORM;
+            case gfx::Format::RG8: return DXGI_FORMAT_R8G8_UNORM;
+            case gfx::Format::R8: return DXGI_FORMAT_R8_UNORM;
+            case gfx::Format::R32Float: return DXGI_FORMAT_R32_FLOAT;
+            default: return DXGI_FORMAT_B8G8R8A8_UNORM;
+            }
+        }
+
+        class D3d12Device final : public gfx::Device
+        {
+        public:
+            // --- targets ---
+            gfx::TargetId createTarget(const gfx::TargetDesc &d) override
+            {
+                gfx::TargetId id;
+                if (!g.freeTargetIds.empty())
+                {
+                    id = g.freeTargetIds.back();
+                    g.freeTargetIds.pop_back();
+                }
+                else
+                {
+                    id = static_cast<gfx::TargetId>(g.devTargets.size());
+                    g.devTargets.emplace_back();
+                }
+                State::DeviceTarget &t = g.devTargets[id];
+                t = State::DeviceTarget{};
+                if (d.shared)
+                {
+                    // The picture: its own surfaces (made with the window's size, makeTargets), view place 0.
+                    t.picture = true;
+                    t.colour = g.colour;
+                    t.depth = g.depth;
+                    t.rtv = 0;
+                    t.w = d.width;
+                    t.h = d.height;
+                    return id;
+                }
+                t.format = formatOf(d.colour);
+                t.withDepth = d.depth;
+                if (!makeSurfaces(t, d.width, d.height))
+                {
+                    t = State::DeviceTarget{};
+                    g.freeTargetIds.push_back(id);
+                    return 0;
+                }
+                return id;
+            }
+
+            bool resizeTarget(gfx::TargetId id, const gfx::TargetDesc &d) override
+            {
+                State::DeviceTarget &t = dt(id);
+                if (t.colour)
+                {
+                    waitIdle(); // (its views are rewritten: no frame may be reading them)
+                    g.uploads.push_back(t.colour); // (released once the GPU is done)
+                    g.uploads.push_back(t.depth);
+                    t.colour = t.depth = nullptr;
+                }
+                t.format = formatOf(d.colour);
+                t.withDepth = d.depth;
+                return makeSurfaces(t, d.width, d.height);
+            }
+
+            void releaseTarget(gfx::TargetId id) override
+            {
+                if (!id)
+                    return;
+                State::DeviceTarget &t = dt(id);
+                if (!t.picture)
+                {
+                    if (t.colour)
+                        g.uploads.push_back(t.colour); // (a buffer of its own: released once the GPU is done)
+                    if (t.depth)
+                        g.uploads.push_back(t.depth);
+                    if (t.rtv)
+                        g.freeRtvs.push_back(t.rtv);
+                }
+                // (Its views' slots given back once this frame's fence has passed - the frame before
+                // may still read them - and its copy for DATE with them; given back at once, a texture
+                // made this frame rewrote the slot under the frame in flight.)
+                for (const UINT s : {t.srv, t.depthSrv, t.destSrv})
+                    if (s)
+                        g.slotFreeSlots[g.slot].push_back(s);
+                if (t.destCopy)
+                    g.uploads.push_back(t.destCopy);
+                t = State::DeviceTarget{};
+                g.freeTargetIds.push_back(id);
+            }
+
+            void clearColour(gfx::TargetId id, const float rgba[4]) override { g.list->ClearRenderTargetView(rtvAt(dt(id).rtv), rgba, 0, nullptr); }
+            void clearDepth(gfx::TargetId id, float value) override
+            {
+                const State::DeviceTarget &t = dt(id);
+                if (t.depth) // (a target made without depth: none to clear)
+                    g.list->ClearDepthStencilView(dsvAt(t.rtv), D3D12_CLEAR_FLAG_DEPTH, value, 0, 0, nullptr);
+            }
+            void use(gfx::TargetId id, gfx::UseFor how) override { stateOf(dt(id), stateFor(how)); }
+            void useDepth(gfx::TargetId id, gfx::DepthUse how) override
+            {
+                depthStateOf(dt(id), how == gfx::DepthUse::Write ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                                                  : D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            // (A target's view or snapshot as a TextureId: its descriptor slot with kViewBit - the textures' ids are their table's.)
+            static constexpr gfx::TextureId kViewBit = 0x80000000u;
+            static gfx::TextureId asView(UINT slot) { return slot ? (slot | kViewBit) : 0u; }
+            static UINT slotOf(gfx::TextureId id) { return (id & kViewBit) ? (id & ~kViewBit) : g.devTextures[id].slot; }
+            gfx::TextureId view(gfx::TargetId id, bool depth) override
+            {
+                State::DeviceTarget &t = dt(id);
+                if (depth)
+                    return asView(t.depthSrv);
+                if (t.colour)
+                    srvFor(t);
+                return asView(t.srv);
+            }
+            gfx::TextureId snapshot(gfx::TargetId id) override { return asView(destCopyOf(dt(id))); }
+
+            // --- textures (0: the white one, slot 0) ---
+            gfx::TextureId createTexture(uint32_t width, uint32_t height, gfx::Format format, uint32_t levels) override
+            {
+                gfx::TextureId id;
+                if (!g.freeTextureIds.empty())
+                {
+                    id = g.freeTextureIds.back();
+                    g.freeTextureIds.pop_back();
+                }
+                else
+                {
+                    id = static_cast<gfx::TextureId>(g.devTextures.size());
+                    g.devTextures.emplace_back();
+                }
+                State::DeviceTexture &t = g.devTextures[id];
+                const uint32_t generation = t.generation + 1u;
+                t = State::DeviceTexture{};
+                t.generation = generation;
+                t.width = width;
+                t.height = height;
+                t.levels = levels;
+                t.format = format;
+                return id;
+            }
+
+            // A level's texels (RGBA8 rows of rowBytes; this frame's list). The texture is made once its last level is given:
+            // the levels' texels must stay where they are until then.
+            bool uploadTexture(gfx::TextureId id, uint32_t level, const void *texels, uint32_t rowBytes) override
+            {
+                State::DeviceTexture &t = g.devTextures[id];
+                if (t.ready || t.format != gfx::Format::RGBA8 || level >= t.levels || rowBytes != std::max(1u, t.width >> level) * 4u)
+                    return false;
+                if (t.given.size() < t.levels)
+                    t.given.resize(t.levels, nullptr);
+                t.given[level] = texels;
+                for (const void *p : t.given)
+                    if (!p)
+                        return true; // (more levels to come)
+                std::vector<const uint32_t *> mips;
+                for (const void *p : t.given)
+                    mips.push_back(static_cast<const uint32_t *>(p));
+                std::vector<const void *>().swap(t.given);
+                if (g.freeSlots.empty())
+                    return false;
+                const UINT slot = g.freeSlots.back();
+                t.resource = makeTextureLevels(t.width, t.height, mips, slot);
+                if (!t.resource)
+                    return false;
+                g.freeSlots.pop_back();
+                t.slot = slot;
+                const D3D12_RESOURCE_DESC rd = t.resource->GetDesc();
+                t.bytes = g.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+                t.ready = true;
+                return true;
+            }
+
+            bool uploadTextureLater(gfx::TextureId id, std::weak_ptr<const Texture> source, bool urgent) override
+            {
+                std::shared_ptr<const Texture> t = source.lock();
+                return t && up::ask(t, id, g.devTextures[id].generation, urgent);
+            }
+
+            bool textureReady(gfx::TextureId id) override { return id == 0 || g.devTextures[id].ready; }
+
+            void releaseTexture(gfx::TextureId id) override
+            {
+                if (!id)
+                    return;
+                State::DeviceTexture &t = g.devTextures[id];
+                if (t.resource)
+                    g.uploads.push_back(t.resource); // (let go of once this frame's fence is passed)
+                if (t.slot)
+                    g.slotFreeSlots[g.slot].push_back(t.slot);
+                const uint32_t generation = t.generation + 1u; // (an upload still on its way finds another generation)
+                t = State::DeviceTexture{};
+                t.generation = generation;
+                g.freeTextureIds.push_back(id);
+            }
+
+            // --- meshes ---
+            uint32_t createMesh(const void *vertices, uint32_t vertexBytes, const void *indices, uint32_t indexBytes) override
+            {
+                const D3D12_HEAP_PROPERTIES up = heap(D3D12_HEAP_TYPE_UPLOAD);
+                const D3D12_RESOURCE_DESC bd = bufferDesc(static_cast<UINT64>(vertexBytes) + indexBytes);
+                State::DeviceMesh m;
+                if (FAILED(g.device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&m.buffer))))
+                    return 0;
+                void *p = nullptr;
+                const D3D12_RANGE none{0, 0};
+                if (FAILED(m.buffer->Map(0, &none, &p)))
+                {
+                    release(m.buffer);
+                    return 0;
+                }
+                std::memcpy(p, vertices, vertexBytes);
+                std::memcpy(static_cast<uint8_t *>(p) + vertexBytes, indices, indexBytes);
+                m.buffer->Unmap(0, nullptr);
+                m.vbv = {m.buffer->GetGPUVirtualAddress(), vertexBytes, sizeof(Vertex)};
+                m.ibv = {m.buffer->GetGPUVirtualAddress() + vertexBytes, indexBytes, DXGI_FORMAT_R32_UINT};
+                // (TODO 94, an experiment, OFF: the mesh copied into video memory - the GPU's frame cost the same at 960 x 540
+                // as at 1920 x 1080 (8.2 ms on the RX 5700 XT), so the vertices read over the bus were a suspect; measured by
+                // turns, no difference (8.14 / 8.08 ms). TF_NATIVE_MESHVRAM=1: on; =alt: by turns, a profile window each.)
+                static const char *meshVramEnv = std::getenv("TF_NATIVE_MESHVRAM");
+                if (meshVramEnv && (*meshVramEnv == '1' || *meshVramEnv == 'a'))
+                {
+                    const D3D12_HEAP_PROPERTIES gpu = heap(D3D12_HEAP_TYPE_DEFAULT);
+                    if (SUCCEEDED(g.device->CreateCommittedResource(&gpu, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                    IID_PPV_ARGS(&m.vram))))
+                    {
+                        g.list->CopyBufferRegion(m.vram, 0, m.buffer, 0, static_cast<UINT64>(vertexBytes) + indexBytes);
+                        transition(m.vram, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+                        m.vbvV = {m.vram->GetGPUVirtualAddress(), vertexBytes, sizeof(Vertex)};
+                        m.ibvV = {m.vram->GetGPUVirtualAddress() + vertexBytes, indexBytes, DXGI_FORMAT_R32_UINT};
+                        if (!(meshVramEnv && *meshVramEnv == 'a'))
+                        {
+                            // (The upload heap's copy no longer read: let go of with this frame.)
+                            g.uploads.push_back(m.buffer);
+                            m.buffer = nullptr;
+                            m.vbv = m.vbvV;
+                            m.ibv = m.ibvV;
+                        }
+                    }
+                }
+                uint32_t id;
+                if (!g.freeMeshIds.empty())
+                {
+                    id = g.freeMeshIds.back();
+                    g.freeMeshIds.pop_back();
+                }
+                else
+                {
+                    id = static_cast<uint32_t>(g.devMeshes.size());
+                    g.devMeshes.emplace_back();
+                }
+                g.devMeshes[id] = m;
+                return id;
+            }
+
+            void releaseMesh(uint32_t id) override
+            {
+                if (!id)
+                    return;
+                State::DeviceMesh &m = g.devMeshes[id];
+                g.uploads.push_back(m.buffer); // (let go of once this frame's fence is passed)
+                if (m.vram)
+                    g.uploads.push_back(m.vram);
+                m = State::DeviceMesh{};
+                g.freeMeshIds.push_back(id);
+            }
+
+            // --- the rings (a frame slot's part each; begun again by beginRings) ---
+            bool ringAlloc(gfx::RingKind kind, uint32_t size, uint32_t align, gfx::RingSpan &out) override
+            {
+                align = std::max(align, 1u);
+                switch (kind)
+                {
+                case gfx::RingKind::Constants:
+                {
+                    const UINT64 at = (g.ringConstantsAt + align - 1u) / align * align;
+                    if (!g.constants || at + size > (g.slot + 1ull) * kConstantRing)
+                        return false;
+                    out.cpu = g.constantsMapped + at;
+                    out.gpu = cbBase() + at;
+                    out.size = size;
+                    out.first = 0;
+                    g.ringConstantsAt = at + size;
+                    return true;
+                }
+                case gfx::RingKind::Instances:
+                {
+                    // (Entries of kInstanceStride bytes: `first` is the entry's index, the instance stream's.)
+                    const UINT entries = (size + kInstanceStride - 1u) / kInstanceStride;
+                    if (!g.instances || g.ringInstanceAt + entries > (g.slot + 1u) * kInstanceRing)
+                        return false;
+                    out.cpu = g.instancesMapped + static_cast<size_t>(g.ringInstanceAt) * kInstanceStride;
+                    out.gpu = g.instances->GetGPUVirtualAddress() + static_cast<UINT64>(g.ringInstanceAt) * kInstanceStride;
+                    out.size = entries * kInstanceStride;
+                    out.first = g.ringInstanceAt;
+                    g.ringInstanceAt += entries;
+                    return true;
+                }
+                case gfx::RingKind::Vertices:
+                {
+                    const UINT64 at = (g.dynamicUsed + align - 1u) / align * align;
+                    if (!g.dynamic || at + size + 16u > (g.slot + 1ull) * kDynamicRing)
+                        return false;
+                    out.cpu = g.dynamicMapped + at;
+                    out.gpu = g.dynamic->GetGPUVirtualAddress() + at;
+                    out.size = size;
+                    out.first = 0;
+                    g.dynamicUsed = at + size;
+                    return true;
+                }
+                }
+                return false;
+            }
+
+            // (The frame's start: the slot's part of each ring from its beginning. Into beginFrame in sub-step 3.)
+            void beginRings()
+            {
+                g.ringConstantsAt = static_cast<UINT64>(g.slot) * kConstantRing;
+                g.ringInstanceAt = g.slot * kInstanceRing;
+                g.dynamicUsed = static_cast<UINT64>(g.slot) * kDynamicRing;
+            }
+
+            // --- the rest: routed in sub-steps 2-6 (placeholders until then) ---
+            double waitFrameSlot() override { return 0.0; }
+            bool beginFrame(uint64_t) override { return false; }
+            void beginExtraPictures() override {}
+            void endFrame(uint32_t) override {}
+            // --- state (the redundant sets left out: TF_NATIVE_STATEFILTER, TODO 94 - on AMD each is a context register) ---
+            // (The draws' start of a frame: the palette's and the depth's tables at the white slot, every filter forgotten.)
+            void beginDraws(bool stateFilter)
+            {
+                filter = stateFilter;
+                stripsSet = false; // (the frame's start set triangle lists)
+                g.list->SetGraphicsRootDescriptorTable(2, slotHandle(0u));
+                g.list->SetGraphicsRootDescriptorTable(3, slotHandle(0u));
+                forget();
+                bound[1] = bound[2] = 0u;
+            }
+            // (Anything recorded around the device - the anti-aliasing, the probe, the sparks - sets its own state: a target
+            // bound again forgets what was set.)
+            void forget()
+            {
+                lastPso = nullptr;
+                scissorKnown = false;
+                lastFactor = -1.0f;
+                bound[0] = bound[1] = bound[2] = kUnknown;
+                iaDirty = true;
+            }
+
+            void setTarget(gfx::TargetId id, bool withDepth) override
+            {
+                State::DeviceTarget &t = dt(id);
+                const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvAt(t.rtv);
+                // (Depth read by the shader - the fog's pass: the read-only view.)
+                const bool readOnly = t.depthState == (D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvAt(readOnly ? t.rtv + 64u : t.rtv);
+                // (A target made without depth: drawn with none, whatever is asked - its depth view's place is not its own.)
+                g.list->OMSetRenderTargets(1, &rtv, FALSE, withDepth && t.depth ? &dsv : nullptr);
+                forget();
+            }
+            void setViewport(float x, float y, float w, float h) override
+            {
+                const D3D12_VIEWPORT vp{x, y, w, h, 0.0f, 1.0f};
+                g.list->RSSetViewports(1, &vp);
+            }
+            void setScissor(const gfx::Rect &r) override
+            {
+                const D3D12_RECT d{r.x0, r.y0, r.x1, r.y1};
+                if (!filter || !scissorKnown || d.left != lastScissor.left || d.top != lastScissor.top || d.right != lastScissor.right ||
+                    d.bottom != lastScissor.bottom)
+                {
+                    g.list->RSSetScissorRects(1, &d);
+                    ++g_cntScissors;
+                    lastScissor = d;
+                    scissorKnown = true;
+                }
+            }
+            bool setPipeline(const gfx::PipelineDesc &p) override
+            {
+                const bool strips = p.effect == gfx::Effect::Cloud;
+                if (strips != stripsSet)
+                {
+                    g.list->IASetPrimitiveTopology(strips ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    stripsSet = strips;
+                }
+                if (p.effect != gfx::Effect::None)
+                {
+                    ID3D12PipelineState *pso = nullptr;
+                    switch (p.effect)
+                    {
+                    case gfx::Effect::Fxaa: pso = g.aaPipeline; break;
+                    case gfx::Effect::SmaaEdges: pso = g.smaaEdgePipe; break;
+                    case gfx::Effect::SmaaWeights: pso = smaaLookups() ? g.smaaWeightPipe : nullptr; break;
+                    case gfx::Effect::SmaaBlend: pso = g.smaaBlendPipe; break;
+                    case gfx::Effect::Cloud: pso = g.cloudPipeline; break;
+                    default: break;
+                    }
+                    if (!pso)
+                        return false;
+                    if (!filter || pso != lastPso)
+                    {
+                        g.list->SetPipelineState(pso);
+                        lastPso = pso;
+                    }
+                    if (p.effect == gfx::Effect::SmaaWeights)
+                    {
+                        // (Its own tables: SMAA's area and search textures.)
+                        g.list->SetGraphicsRootDescriptorTable(2, slotHandle(g.smaaAreaSlot));
+                        g.list->SetGraphicsRootDescriptorTable(3, slotHandle(g.smaaSearchSlot));
+                        bound[1] = bound[2] = kUnknown;
+                    }
+                    lastDesc = p;
+                    lastPipelines = g.pipelinesChanged;
+                    return true;
+                }
+                // (The same description as the last one asked, and no pipeline made since: that one, still set.)
+                if (filter && lastPso && lastPipelines == g.pipelinesChanged && sameDesc(p, lastDesc))
+                    return true;
+                BlendKey k;
+                k.src = blendOf(p.blend.src);
+                k.dst = blendOf(p.blend.dst);
+                k.op = p.blend.op == gfx::BlendOp::RevSubtract ? D3D12_BLEND_OP_REV_SUBTRACT
+                       : p.blend.op == gfx::BlendOp::Subtract  ? D3D12_BLEND_OP_SUBTRACT
+                                                              : D3D12_BLEND_OP_ADD;
+                k.enabled = p.blend.enabled;
+                k.premultiply = p.blend.premultiply;
+                ID3D12PipelineState *pso = pipelineFor(k, p.depthTest, compareOf(p.depthFunc), p.depthWrite, p.writeMask, p.picture, p.clip,
+                                                       p.variant, p.alphaTest);
+                if (!pso)
+                    return false;
+                if (!filter || pso != lastPso)
+                {
+                    g.list->SetPipelineState(pso);
+                    lastPso = pso;
+                }
+                lastDesc = p;
+                lastPipelines = g.pipelinesChanged;
+                return true;
+            }
+            void setBlendFactor(const float rgba[4]) override
+            {
+                if (!filter || rgba[0] != lastFactor)
+                {
+                    g.list->OMSetBlendFactor(rgba);
+                    ++g_cntFactors;
+                    lastFactor = rgba[0];
+                }
+            }
+            // (t0 the draw's texture, set every draw; t1 the palette / the target's copy, t2 the depth: set when they change.)
+            void bindTextures(gfx::TextureId t0, gfx::TextureId t1, gfx::TextureId t2) override
+            {
+                g.list->SetGraphicsRootDescriptorTable(1, slotHandle(slotOf(t0)));
+                bound[0] = t0;
+                if (t1 != gfx::kKeepTexture && t1 != bound[1])
+                {
+                    g.list->SetGraphicsRootDescriptorTable(2, slotHandle(slotOf(t1)));
+                    bound[1] = t1;
+                }
+                if (t2 != gfx::kKeepTexture && t2 != bound[2])
+                {
+                    g.list->SetGraphicsRootDescriptorTable(3, slotHandle(slotOf(t2)));
+                    bound[2] = t2;
+                }
+            }
+            void bindDrawConstants(const gfx::RingSpan &c) override { g.list->SetGraphicsRootConstantBufferView(0, c.gpu); }
+            void bindPictureConstants(const gfx::RingSpan &) override {}
+
+            // --- geometry: stream 0 (a mesh, or ring vertices), the instance stream (1, the Instances ring), the frame
+            // before's vertices (2), the indices - set on the list at the next draw ---
+            void setVertices(const gfx::RingSpan &v, uint32_t stride) override
+            {
+                vb = {v.gpu, v.size, stride};
+                iaDirty = true;
+            }
+            void setIndices(const gfx::RingSpan &i) override
+            {
+                ib = {i.gpu, i.size, DXGI_FORMAT_R32_UINT};
+                iaDirty = true;
+            }
+            void setMesh(uint32_t meshId) override
+            {
+                const State::DeviceMesh &m = g.devMeshes[meshId];
+                // (TF_NATIVE_MESHVRAM=alt: the upload heap's copy in every other profile window.)
+                const bool upHeap = m.buffer && m.vram && (g_profWindow & 1u);
+                vb = upHeap ? m.vbv : (m.vbvV.SizeInBytes ? m.vbvV : m.vbv);
+                ib = upHeap ? m.ibv : (m.ibvV.SizeInBytes ? m.ibvV : m.ibv);
+                iaDirty = true;
+            }
+            void setPreviousVertices(const gfx::RingSpan &v) override
+            {
+                // (none: a zero stride's one entry at the ring's start - read by nothing, pose.y off)
+                vbB = v.size ? D3D12_VERTEX_BUFFER_VIEW{v.gpu, v.size, kVertexBStride}
+                             : D3D12_VERTEX_BUFFER_VIEW{g.dynamic ? g.dynamic->GetGPUVirtualAddress() + static_cast<UINT64>(g.slot) * kDynamicRing : 0ull,
+                                                        kVertexBStride, 0u};
+                iaDirty = true;
+            }
+            void draw(uint32_t vertices, uint32_t first, uint32_t instances, uint32_t firstInstance) override
+            {
+                flushIa();
+                g.list->DrawInstanced(vertices, instances, first, firstInstance);
+            }
+            void drawIndexed(uint32_t indices, uint32_t first, uint32_t instances, uint32_t firstInstance) override
+            {
+                flushIa();
+                g.list->DrawIndexedInstanced(indices, instances, first, 0, firstInstance);
+            }
+            void drawIndirect(uint64_t groundMeshId, uint32_t firstInstance) override
+            {
+                GpuMesh *m = grassgpu::meshFor(groundMeshId);
+                if (!m)
+                    return;
+                vb = m->vbvV.SizeInBytes ? m->vbvV : m->vbv;
+                ib = m->ibvV.SizeInBytes ? m->ibvV : m->ibv;
+                iaDirty = true;
+                flushIa();
+                grassgpu::draw(*m, instanceView(), firstInstance); // (grassgpu: its count the GPU's)
+                iaDirty = true; // (its instance stream moved to the pass's entry)
+            }
+            void dispatchGrass(const gfx::RingSpan &, uint32_t) override {}
+            void copy(gfx::TargetId, const gfx::Rect &, gfx::TargetId, const gfx::Rect &) override {}
+            void copyWhole(gfx::TargetId dst, gfx::TargetId src) override
+            {
+                State::DeviceTarget &d = dt(dst), &s = dt(src);
+                if (!d.colour || !s.colour)
+                    return;
+                stateOf(s, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                stateOf(d, D3D12_RESOURCE_STATE_COPY_DEST);
+                g.list->CopyResource(d.colour, s.colour);
+                ++g_cntCopies;
+            }
+            gfx::QueryId timestamp() override { return 0; }
+            void beginOcclusion(gfx::QueryId) override {}
+            void endOcclusion(gfx::QueryId) override {}
+            void predicate(gfx::QueryId, bool) override {}
+            bool readQueries(uint64_t, double &) override { return false; }
+            void publish(gfx::TargetId, uint32_t, uint32_t) override {}
+
+        private:
+            static bool sameDesc(const gfx::PipelineDesc &a, const gfx::PipelineDesc &b)
+            {
+                return a.blend.src == b.blend.src && a.blend.dst == b.blend.dst && a.blend.op == b.blend.op && a.blend.enabled == b.blend.enabled &&
+                       a.blend.premultiply == b.blend.premultiply && a.depthTest == b.depthTest && a.depthFunc == b.depthFunc &&
+                       a.depthWrite == b.depthWrite && a.writeMask == b.writeMask && a.picture == b.picture && a.clip == b.clip &&
+                       a.variant == b.variant && a.alphaTest == b.alphaTest && a.effect == b.effect;
+            }
+            static D3D12_VERTEX_BUFFER_VIEW instanceView()
+            {
+                return {g.instances->GetGPUVirtualAddress(), kInstanceRing * kInstanceStride * State::kFrames, kInstanceStride};
+            }
+            void flushIa()
+            {
+                if (!iaDirty)
+                    return;
+                const D3D12_VERTEX_BUFFER_VIEW views[3] = {vb, instanceView(), vbB};
+                g.list->IASetVertexBuffers(0, 3, views);
+                g.list->IASetIndexBuffer(&ib);
+                iaDirty = false;
+            }
+            bool filter = true;
+            ID3D12PipelineState *lastPso = nullptr;
+            gfx::PipelineDesc lastDesc;
+            uint64_t lastPipelines = 0;
+            bool scissorKnown = false;
+            D3D12_RECT lastScissor{};
+            float lastFactor = -1.0f;
+            static constexpr gfx::TextureId kUnknown = ~1u; // (set around the device: bound again at the next ask)
+            gfx::TextureId bound[3] = {kUnknown, kUnknown, kUnknown};
+            D3D12_VERTEX_BUFFER_VIEW vb{}, vbB{};
+            D3D12_INDEX_BUFFER_VIEW ib{};
+            bool iaDirty = true;
+            bool stripsSet = false; // (the sparks' triangle strips set, not lists)
+        };
+
+        D3d12Device &d3d12Device()
+        {
+            static D3d12Device d;
+            return d;
+        }
+
+        // ---- The frame builder's side (nr_frame.cpp from sub-step 3) ----
+        // A render target for a GS frame buffer (twice its GS size), cleared to transparent black; a grown one
+        // keeps its device target (new surfaces, the same views' places).
+        bool makeTarget(State::Target &t, float gsW, float gsH, UINT sx = 0u, UINT sy = 0u)
+        {
+            ++g_targetsMade;
+            sx = sx ? sx : g.scaleX;
+            sy = sy ? sy : g.scaleY;
+            if (std::getenv("TF_NATIVE_TARGETLOG"))
+                std::fprintf(stderr, "[native render] target made %gx%g at %ux%u\n", gsW, gsH, sx, sy);
+            gfx::TargetDesc d;
+            d.width = static_cast<uint32_t>(gsW) * sx;
+            d.height = static_cast<uint32_t>(gsH) * sy;
+            d.colour = gfx::Format::BGRA8;
+            gfx::Device &dev = gfx::device();
+            bool made;
+            if (t.id)
+            {
+                made = dev.resizeTarget(t.id, d);
+                if (!made)
+                {
+                    dev.releaseTarget(t.id);
+                    t.id = 0;
+                }
+            }
+            else
+                made = (t.id = dev.createTarget(d)) != 0;
+            if (!made)
+                return false;
+            t.gsW = gsW;
+            t.gsH = gsH;
+            t.w = d.width;
+            t.h = d.height;
+            return true;
+        }
+
+        // A frame buffer's identity: its base and width (the same pages are another buffer at
+        // another width - the 3D field and, later in the frame, the glare's small buffers).
+        uint32_t targetKey(uint32_t frame) { return (frame & 0x1FFu) | ((frame >> 16) & 0x3Fu) << 9; }
+        bool depthFormat(uint32_t frame) { return ((frame >> 24) & 0x30u) == 0x30u; } // (PSMZ*: a depth buffer written as colour)
 
         // The anti-aliasing pass's copy of the picture (made again when the picture's size changes:
         // makeTargets has waited for the frames in flight then, so its view's slot is free to rewrite).
@@ -5955,63 +6966,113 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // picture bound as the render target without its depth, the pass's pipeline and its texture tables (SMAA's:
         // the palette's and the depth's set back to slot 0, as at the frame's start): the caller binds its own
         // again. False: not run.
-        bool runAa(State::Target &picture, UINT64 &ring, UINT64 ringEnd)
+        // (The frame builder's) The anti-aliasing pass's targets: the picture's copy it reads, and SMAA's edges and blend
+        // weights - the picture's size, made again when it changes.
+        namespace aa
         {
-            if (!g.aaPipeline || !picture.colour || ring + kConstantStride > ringEnd || !aaSourceFor())
+            gfx::TargetId source = 0, edges = 0, weights = 0;
+            bool ensure(gfx::TargetId &t, uint32_t w, uint32_t h, gfx::Format f)
+            {
+                gfx::Device &dev = gfx::device();
+                gfx::TargetDesc d;
+                d.width = w;
+                d.height = h;
+                d.colour = f;
+                d.depth = false;
+                if (t && !dev.resizeTarget(t, d))
+                {
+                    dev.releaseTarget(t);
+                    t = 0;
+                }
+                if (!t)
+                    t = dev.createTarget(d);
+                return t != 0;
+            }
+            uint32_t sourceW = 0, sourceH = 0, smaaW = 0, smaaH = 0;
+            bool sourceFor(uint32_t w, uint32_t h)
+            {
+                if (source && sourceW == w && sourceH == h)
+                    return true;
+                sourceW = sourceH = 0;
+                if (!ensure(source, w, h, gfx::Format::RGBA8))
+                    return false;
+                sourceW = w;
+                sourceH = h;
+                return true;
+            }
+            bool smaaFor(uint32_t w, uint32_t h)
+            {
+                if (edges && weights && smaaW == w && smaaH == h)
+                    return true;
+                smaaW = smaaH = 0;
+                if (!ensure(edges, w, h, gfx::Format::RG8) || !ensure(weights, w, h, gfx::Format::RGBA8))
+                    return false;
+                smaaW = w;
+                smaaH = h;
+                return true;
+            }
+        }
+
+        bool runAa(State::Target &picture)
+        {
+            gfx::Device &dev = gfx::device();
+            gfx::RingSpan cs; // (its constants: one entry, whichever pass runs)
+            if (!g.aaPipeline || !picture.id || !dt(picture).colour || !aa::sourceFor(g.width, g.height) ||
+                !dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, cs))
                 return false;
-            const bool smaa = aaMode() == 2 && smaaTargetsFor() && smaaLookups();
+            g.aaW = g.width;
+            g.aaH = g.height;
+            gfx::PipelineDesc smaaWeights;
+            smaaWeights.effect = gfx::Effect::SmaaWeights;
+            const bool smaa = aaMode() == 2 && g.smaaEdgePipe && g.smaaBlendPipe && aa::smaaFor(g.aaW, g.aaH) && dev.setPipeline(smaaWeights);
             static const bool profiling = std::getenv("TF_NATIVE_PROFILE") != nullptr;
             const bool timed = profiling && g.aaQueries && g.aaTimes;
             if (timed)
                 g.list->EndQuery(g.aaQueries, D3D12_QUERY_TYPE_TIMESTAMP, g.slot * 2u);
-            stateOf(picture, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            if (g.aaState != D3D12_RESOURCE_STATE_COPY_DEST)
-                transition(g.aaSource, g.aaState, D3D12_RESOURCE_STATE_COPY_DEST);
-            g.list->CopyResource(g.aaSource, picture.colour);
-            transition(g.aaSource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            g.aaState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            stateOf(picture, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvAt(picture.rtv);
-            const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(g.aaW), static_cast<float>(g.aaH), 0.0f, 1.0f};
-            g.list->RSSetViewports(1, &vp);
-            const D3D12_RECT all{0, 0, static_cast<LONG>(g.aaW), static_cast<LONG>(g.aaH)};
-            g.list->RSSetScissorRects(1, &all);
+            dev.copyWhole(aa::source, picture.id);
+            dev.use(aa::source, gfx::UseFor::Sample);
+            dev.use(picture.id, gfx::UseFor::Draw);
+            const gfx::TextureId sourceView = dev.view(aa::source);
+            const gfx::Rect all{0, 0, static_cast<int32_t>(g.aaW), static_cast<int32_t>(g.aaH)};
+            auto into = [&](gfx::TargetId t) {
+                dev.setTarget(t, false);
+                dev.setViewport(0.0f, 0.0f, static_cast<float>(g.aaW), static_cast<float>(g.aaH));
+                dev.setScissor(all);
+            };
             if (smaa)
             {
                 // (b0: 1 / width, 1 / height, width, height - SMAA_RT_METRICS.)
                 const float m[4] = {1.0f / static_cast<float>(g.aaW), 1.0f / static_cast<float>(g.aaH), static_cast<float>(g.aaW),
                                     static_cast<float>(g.aaH)};
-                std::memcpy(g.constantsMapped + ring, m, sizeof(m));
-                g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-                ring += kConstantStride;
-                g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                std::memcpy(cs.cpu, m, sizeof(m));
+                gfx::PipelineDesc pd;
                 // 1. Luma edges (the pixels without an edge discarded: the target cleared first).
-                transition(g.smaaEdges, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                const D3D12_CPU_DESCRIPTOR_HANDLE edgesRtv = rtvAt(g.smaaEdgesRtv), weightsRtv = rtvAt(g.smaaWeightsRtv);
+                dev.use(aa::edges, gfx::UseFor::Draw);
                 const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                g.list->ClearRenderTargetView(edgesRtv, zero, 0, nullptr);
-                g.list->OMSetRenderTargets(1, &edgesRtv, FALSE, nullptr);
-                g.list->SetPipelineState(g.smaaEdgePipe);
-                g.list->SetGraphicsRootDescriptorTable(1, slotHandle(g.aaSlot));
-                g.list->DrawInstanced(3, 1, 0, 0);
+                dev.clearColour(aa::edges, zero);
+                into(aa::edges);
+                pd.effect = gfx::Effect::SmaaEdges;
+                dev.setPipeline(pd);
+                dev.bindDrawConstants(cs);
+                dev.bindTextures(sourceView, gfx::kKeepTexture, gfx::kKeepTexture);
+                dev.draw(3u, 0u);
                 // 2. The blend weights (every pixel written).
-                transition(g.smaaEdges, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                transition(g.smaaWeights, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                g.list->OMSetRenderTargets(1, &weightsRtv, FALSE, nullptr);
-                g.list->SetPipelineState(g.smaaWeightPipe);
-                g.list->SetGraphicsRootDescriptorTable(1, slotHandle(g.smaaEdgesSlot));
-                g.list->SetGraphicsRootDescriptorTable(2, slotHandle(g.smaaAreaSlot));
-                g.list->SetGraphicsRootDescriptorTable(3, slotHandle(g.smaaSearchSlot));
-                g.list->DrawInstanced(3, 1, 0, 0);
-                // 3. The picture blended with its neighbours, back into it.
-                transition(g.smaaWeights, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-                g.list->SetPipelineState(g.smaaBlendPipe);
-                g.list->SetGraphicsRootDescriptorTable(1, slotHandle(g.aaSlot));
-                g.list->SetGraphicsRootDescriptorTable(2, slotHandle(g.smaaWeightsSlot));
-                g.list->DrawInstanced(3, 1, 0, 0);
-                g.list->SetGraphicsRootDescriptorTable(2, slotHandle(0u));
-                g.list->SetGraphicsRootDescriptorTable(3, slotHandle(0u));
+                dev.use(aa::edges, gfx::UseFor::Sample);
+                dev.use(aa::weights, gfx::UseFor::Draw);
+                into(aa::weights);
+                dev.setPipeline(smaaWeights);
+                dev.bindDrawConstants(cs);
+                dev.bindTextures(dev.view(aa::edges), gfx::kKeepTexture, gfx::kKeepTexture);
+                dev.draw(3u, 0u);
+                // 3. The picture blended with its neighbours, back into it; the tables bound as at the frame's start.
+                dev.use(aa::weights, gfx::UseFor::Sample);
+                into(picture.id);
+                pd.effect = gfx::Effect::SmaaBlend;
+                dev.setPipeline(pd);
+                dev.bindDrawConstants(cs);
+                dev.bindTextures(sourceView, dev.view(aa::weights), gfx::kKeepTexture);
+                dev.draw(3u, 0u);
+                dev.bindTextures(sourceView, 0u, 0u);
                 ++g_smaaFrames;
                 if (timed)
                 {
@@ -6021,8 +7082,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 }
                 return true;
             }
-            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            g.list->SetPipelineState(g.aaPipeline);
+            into(picture.id);
+            gfx::PipelineDesc pd;
+            pd.effect = gfx::Effect::Fxaa;
+            dev.setPipeline(pd);
             // (Tuning, for tests: the sub-pixel amount - FXAA's own default 0.75 blurs fine texture
             // detail; 0.25 (TODO 64, 2026-11-03: was 0.5) keeps the grass and leaves sharper with the edges as
             // smooth - the edge threshold and its minimum.)
@@ -6032,12 +7095,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 std::getenv("TF_NATIVE_AA_EDGEMIN") ? static_cast<float>(std::atof(std::getenv("TF_NATIVE_AA_EDGEMIN"))) : 0.0625f};
             const float k[8] = {1.0f / static_cast<float>(g.aaW), 1.0f / static_cast<float>(g.aaH), static_cast<float>(g.aaW),
                                 static_cast<float>(g.aaH), tune[0], tune[1], tune[2], 0.0f};
-            std::memcpy(g.constantsMapped + ring, k, sizeof(k));
-            g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-            ring += kConstantStride;
-            g.list->SetGraphicsRootDescriptorTable(1, slotHandle(g.aaSlot));
-            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g.list->DrawInstanced(3, 1, 0, 0);
+            std::memcpy(cs.cpu, k, sizeof(k));
+            dev.bindDrawConstants(cs);
+            dev.bindTextures(sourceView, gfx::kKeepTexture, gfx::kKeepTexture);
+            dev.draw(3u, 0u);
             if (timed)
             {
                 g.list->EndQuery(g.aaQueries, D3D12_QUERY_TYPE_TIMESTAMP, g.slot * 2u + 1u);
@@ -6054,11 +7115,15 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // over `rect` (its GS pixels: x0, y0, x1, y1) point-sampled into the 64 x 64 probe target and copied into the
         // slot's readback (finishSlot hands it to nr_occlusion). Leaves the probe target bound and the scene's depth
         // readable: the caller binds its own again. False: not run.
-        bool runProbe(State::Target &scene, const float rect[4], uint64_t tick, UINT64 &ring, UINT64 ringEnd)
+        bool runProbe(State::Target &scene, const float rect[4], uint64_t tick)
         {
-            if (!g.probePipeline || !scene.depth || !scene.depthSrv || scene.gsW <= 0.0f || scene.gsH <= 0.0f || ring + kConstantStride > ringEnd)
+            gfx::Device &dev = gfx::device();
+            const gfx::TextureId sceneDepth = scene.id ? dev.view(scene.id, true) : 0u;
+            gfx::RingSpan cs;
+            if (!g.probePipeline || !scene.id || !sceneDepth || scene.gsW <= 0.0f || scene.gsH <= 0.0f ||
+                !dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, cs))
                 return false;
-            depthStateOf(scene, D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            dev.useDepth(scene.id, gfx::DepthUse::ReadSample);
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = g.rtvHeap->GetCPUDescriptorHandleForHeapStart();
             rtv.ptr += static_cast<SIZE_T>(g.probeRtv) * g.rtvSize;
             g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -6070,10 +7135,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             const float sx = static_cast<float>(scene.w) / scene.gsW, sy = static_cast<float>(scene.h) / scene.gsH;
             const float k[8] = {rect[0] * sx, rect[1] * sy, (rect[2] - rect[0]) * sx / 64.0f, (rect[3] - rect[1]) * sy / 64.0f,
                                 static_cast<float>(scene.w), static_cast<float>(scene.h), 0.0f, 0.0f};
-            std::memcpy(g.constantsMapped + ring, k, sizeof(k));
-            g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-            ring += kConstantStride;
-            g.list->SetGraphicsRootDescriptorTable(3, slotHandle(scene.depthSrv));
+            std::memcpy(cs.cpu, k, sizeof(k));
+            g.list->SetGraphicsRootConstantBufferView(0, cs.gpu);
+            g.list->SetGraphicsRootDescriptorTable(3, slotHandle(D3d12Device::slotOf(sceneDepth)));
             g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g.list->DrawInstanced(3, 1, 0, 0);
             transition(g.probeTarget, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -6100,24 +7164,25 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // 224 down - a line of the 224-line field the tunnel draws, two of the shown frame's), its centre at 1 / (2 pi sigma^2)
         // of the colour: a dot adds what the PS2's one-pixel point added, spread smooth. Leaves the target bound without depth
         // and the topology a list: the caller binds its own again. False: not drawn (no pipeline, nothing to draw, the ring full).
-        bool drawCloud(const Draw &draw, State::Target &tg, UINT64 &ring, UINT64 ringEnd)
+        bool drawCloud(const Draw &draw, State::Target &tg)
         {
-            if (!g.cloudPipeline || !draw.cloud || !tg.colour || tg.gsW <= 0.0f || tg.gsH <= 0.0f)
+            if (!g.cloudPipeline || !draw.cloud || !tg.id || tg.gsW <= 0.0f || tg.gsH <= 0.0f)
                 return false;
             const PointCloud &pc = *draw.cloud;
-            stateOf(tg, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvAt(tg.rtv);
-            g.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(tg.w), static_cast<float>(tg.h), 0.0f, 1.0f};
-            g.list->RSSetViewports(1, &vp);
+            gfx::Device &dev = gfx::device();
+            dev.use(tg.id, gfx::UseFor::Draw);
+            dev.setTarget(tg.id, false);
+            dev.setViewport(0.0f, 0.0f, static_cast<float>(tg.w), static_cast<float>(tg.h));
             const float sx = static_cast<float>(tg.w) / tg.gsW, sy = static_cast<float>(tg.h) / tg.gsH;
-            D3D12_RECT r{static_cast<LONG>(draw.scissor[0] * sx), static_cast<LONG>(draw.scissor[1] * sy),
-                         static_cast<LONG>((draw.scissor[2] + 1.0f) * sx), static_cast<LONG>((draw.scissor[3] + 1.0f) * sy)};
-            r.right = std::min<LONG>(r.right, static_cast<LONG>(tg.w));
-            r.bottom = std::min<LONG>(r.bottom, static_cast<LONG>(tg.h));
-            g.list->RSSetScissorRects(1, &r);
-            g.list->SetPipelineState(g.cloudPipeline);
-            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            gfx::Rect r{static_cast<int32_t>(draw.scissor[0] * sx), static_cast<int32_t>(draw.scissor[1] * sy),
+                        static_cast<int32_t>((draw.scissor[2] + 1.0f) * sx), static_cast<int32_t>((draw.scissor[3] + 1.0f) * sy)};
+            r.x1 = std::min<int32_t>(r.x1, static_cast<int32_t>(tg.w));
+            r.y1 = std::min<int32_t>(r.y1, static_cast<int32_t>(tg.h));
+            dev.setScissor(r);
+            gfx::PipelineDesc pd;
+            pd.effect = gfx::Effect::Cloud;
+            if (!dev.setPipeline(pd))
+                return false;
             const float h = static_cast<float>(tg.h);
             const float sigmaUnit = std::max(0.05f, pc.sigma);
             const float sigma = sigmaUnit * std::sqrt((h / 480.0f) * (h / 224.0f)); // (in the picture's pixels)
@@ -6125,10 +7190,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             bool drawn = false;
             for (const PointCloud::Set &set : pc.sets)
             {
-                if (!set.points || set.count == 0u || ring + kConstantStride > ringEnd)
+                if (!set.points || set.count == 0u)
                     continue;
                 GpuMesh *m = upload(set.points);
-                if (!m)
+                gfx::RingSpan cs;
+                if (!m || !gfx::device().ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, cs))
                     continue;
                 float k[28] = {};
                 std::memcpy(k, set.rows, sizeof(set.rows));
@@ -6142,17 +7208,17 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 k[25] = 3.0f * sigma * 2.0f / h;
                 k[26] = pc.squeeze;
                 k[27] = 2048.0f;
-                std::memcpy(g.constantsMapped + ring, k, sizeof(k));
-                g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-                ring += kConstantStride;
-                const D3D12_VERTEX_BUFFER_VIEW view = m->vbvV.SizeInBytes ? m->vbvV : m->vbv;
-                g.list->IASetVertexBuffers(0, 1, &view);
+                std::memcpy(cs.cpu, k, sizeof(k));
+                dev.bindDrawConstants(cs);
+                if (m->meshId)
+                    dev.setMesh(m->meshId);
+                else
+                    dev.setVertices(m->ringVertices, sizeof(Vertex));
                 const UINT count = std::min<UINT>(set.count, static_cast<UINT>(set.points->vertices.size()));
-                g.list->DrawInstanced(4, count, 0, 0);
+                dev.draw(4u, 0u, count, 0u);
                 drawn = true;
             }
-            g.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            return drawn;
+            return drawn; // (the triangle lists set again with the next pipeline)
         }
     }
 
@@ -6581,7 +7647,13 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             return v && *v ? std::atoi(v) : 0;
         }();
         const int window = g_windowLines.load(std::memory_order_relaxed);
-        const UINT linesWanted = static_cast<UINT>(std::clamp(linesFixed > 0 ? linesFixed : window > 0 ? window : 1080, 240, 4320));
+        // (TODO 255) A movie shown as a band of the picture's rows (ps2_host_display::setPictureBand): the picture as
+        // many lines taller as the band is short of it, so the band itself still has the window's lines.
+        float bandTop = 0.0f, bandBottom = 1.0f;
+        ps2_host_display::pictureBand(bandTop, bandBottom);
+        const float bandLines = linesFixed > 0 ? 1.0f : 1.0f / std::max(0.25f, bandBottom - bandTop);
+        const UINT linesWanted = static_cast<UINT>(
+            std::clamp(static_cast<int>(std::lround((linesFixed > 0 ? linesFixed : window > 0 ? window : 1080) * bandLines)), 240, 4320));
         const float shape = input.displayAspect > 0.5f ? input.displayAspect : 4.0f / 3.0f;
         const UINT height = linesWanted, width = (static_cast<UINT>(std::lround(linesWanted * shape)) + 7u) & ~7u;
         // The GS buffers' targets at a scale to match (the 3D field is copied into the picture:
@@ -6628,6 +7700,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         g_texRingAt = 0; // (the slot's part of the staging ring: its last frame finished)
         prune();
         takeUploaded();
+        takeLater();
         {
             // (preUpload's textures to the uploader - none drawn yet, so nothing waits for them.)
             std::vector<std::weak_ptr<const Texture>> pre;
@@ -6637,7 +7710,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             }
             for (const auto &w : pre)
                 if (auto t = w.lock(); t && !g.textures.count(t->id) && t->pixels.size() == static_cast<size_t>(t->width) * t->height)
-                    up::ask(t);
+                    askLater(t);
         }
         g.allocators[g.slot]->Reset();
         g.picAllocators[g.slot]->Reset();
@@ -6677,42 +7750,32 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         g.passNotes[g.slot].clear();
         passMark(255u);
         // The main target: the picture's resources.
+        gfx::Device &dev = gfx::device();
         for (auto it = g.targets.begin(); it != g.targets.end();)
             if (it->second.main && it->first != mainFbp)
             {
-                if (it->second.srv)
-                    g.slotFreeSlots[g.slot].push_back(it->second.srv); // (the double buffer flips every frame: its view's slot goes back)
+                dev.releaseTarget(it->second.id); // (the double buffer flips every frame: its view's slot goes back)
                 it = g.targets.erase(it);
             }
             else
                 ++it;
         {
             State::Target &m = g.targets[mainFbp];
-            if (!m.main || m.colour != g.colour)
+            if (!m.main || !m.id)
             {
-                if (!m.main && m.colour)
-                {
-                    g.uploads.push_back(m.colour); // (a buffer of its own until now: released once the GPU is done)
-                    g.uploads.push_back(m.depth);
-                }
-                // (Its views' slots given back once this frame's fence has passed - the frame before
-                // may still read them - and its copy for DATE with them; given back at once, a texture
-                // made this frame rewrote the slot under the frame in flight.)
-                for (const UINT s : {m.srv, m.depthSrv, m.destSrv})
-                    if (s)
-                        g.slotFreeSlots[g.slot].push_back(s);
-                if (m.destCopy)
-                    g.uploads.push_back(m.destCopy);
-                if (!m.main && m.rtv)
-                    g.freeRtvs.push_back(m.rtv); // (its render-target views' place: the picture draws through place 0)
+                // (A buffer of its own until now - or the picture before a remake: let go of, its views' slots given
+                // back once this frame's fence has passed; the picture draws through the device's picture target.)
+                dev.releaseTarget(m.id);
                 m = State::Target{};
                 m.main = true;
-                m.colour = g.colour;
-                m.depth = g.depth;
-                m.rtv = 0;
+                gfx::TargetDesc pd;
+                pd.width = width;
+                pd.height = height;
+                pd.colour = gfx::Format::RGBA8;
+                pd.shared = true;
+                m.id = dev.createTarget(pd);
                 m.w = width;
                 m.h = height;
-                m.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             }
             m.gsW = mainW;
             m.gsH = mainH;
@@ -6798,32 +7861,25 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 const bool unit = (ef != effect.end() && ef->second > 0) ||
                                   (topRead.count(e.first) && e.second.first <= 256.0f && e.second.second <= 256.0f);
                 const UINT sx = unit ? 1u : g.scaleX, sy = unit ? 1u : fieldRead.count(e.first) ? g.scaleYField : g.scaleY;
-                if (t.colour && t.gsW >= e.second.first && t.gsH >= e.second.second && t.w == static_cast<UINT>(t.gsW) * sx &&
+                if (t.id && t.gsW >= e.second.first && t.gsH >= e.second.second && t.w == static_cast<UINT>(t.gsW) * sx &&
                     t.h == static_cast<UINT>(t.gsH) * sy)
                     continue;
-                if (t.colour)
-                {
-                    waitIdle(); // (its views are rewritten: no frame may be reading them)
-                    g.uploads.push_back(t.colour); // (released once the GPU is done)
-                    g.uploads.push_back(t.depth);
-                    t.colour = t.depth = nullptr;
-                }
                 makeTarget(t, std::max(e.second.first, t.gsW), std::max(e.second.second, t.gsH), sx, sy);
             }
         }
         // Depth starts each frame cleared (the game clears it with a draw into the depth buffer's
         // pages as a colour target - a PSMZ frame - which the native targets have no need of).
         for (auto &t : g.targets)
-            if (t.second.depth && !t.second.main)
+            if (t.second.id && !t.second.main)
             {
-                depthStateOf(t.second, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-                g.list->ClearDepthStencilView(dsvAt(t.second.rtv), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+                dev.useDepth(t.second.id, gfx::DepthUse::Write);
+                dev.clearDepth(t.second.id, 0.0f);
             }
         State::Target &picture = g.targets[mainFbp];
-        stateOf(picture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        dev.use(picture.id, gfx::UseFor::Draw);
         const float clear[4] = {0.05f, 0.05f, 0.08f, 1.0f};
-        g.list->ClearRenderTargetView(rtvAt(0), clear, 0, nullptr);
-        g.list->ClearDepthStencilView(dsvAt(0), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+        dev.clearColour(picture.id, clear);
+        dev.clearDepth(picture.id, 0.0f);
         g.list->SetGraphicsRootSignature(g.root);
         g.list->SetGraphicsRootConstantBufferView(4, g.pictureCB->GetGPUVirtualAddress() + 256ull * g.slot); // (N9 stage 3: the picture's)
         g.list->SetDescriptorHeaps(1, &g.srvHeap);
@@ -7661,16 +8717,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 before = std::move(out);
             }
         }
-        UINT64 ring = g.slot * kConstantRing;
         {
             static const bool cbAlt = std::getenv("TF_NATIVE_CBVRAM") && *std::getenv("TF_NATIVE_CBVRAM") == 'a';
             g_cbVram = g.constantsV && g.preList && !(cbAlt && (g_profWindow & 1u));
         }
-        const UINT64 ringEnd = ring + kConstantRing;
-        UINT instAt = g.slot * kInstanceRing;
-        const UINT instEnd = instAt + kInstanceRing;
-        const D3D12_VERTEX_BUFFER_VIEW instView{g.instances->GetGPUVirtualAddress(), kInstanceRing * kInstanceStride * State::kFrames, kInstanceStride};
-        g.dynamicUsed = g.slot * kDynamicRing;
+        d3d12Device().beginRings();
         State::Target *current = nullptr;
         // (TODO 94: the draw state last set in the list - a scissor, blend factor or pipeline the same as the draw
         // before's is not set again. On AMD each is a context register: set, it starts a new context for the draws
@@ -7678,17 +8729,6 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // every draw sets them, as before; =alt: by turns.)
         static const char *stateFilterEnv = std::getenv("TF_NATIVE_STATEFILTER");
         const bool stateFilter = speedupOn(stateFilterEnv);
-        D3D12_RECT lastScissor{};
-        bool scissorKnown = false;
-        float lastFactor = -1.0f;
-        ID3D12PipelineState *lastSetPso = nullptr;
-        auto setPso = [&](ID3D12PipelineState *p) {
-            if (!stateFilter || p != lastSetPso)
-            {
-                g.list->SetPipelineState(p);
-                lastSetPso = p;
-            }
-        };
         bool currentFog = false;
         // The anti-aliasing pass (TF_NATIVE_AA): run once the picture holds the frame's 3D - drawn
         // into it, or copied in from a target holding it (the scene buffer's field copies, the glow
@@ -7710,7 +8750,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (!probeWanted || probeDone || !probeScene)
                 return;
             probeDone = true;
-            const bool ran = runProbe(*probeScene, probeRect, input.tick, ring, ringEnd);
+            const bool ran = runProbe(*probeScene, probeRect, input.tick);
             current = nullptr; // (the next draw's target, depth, viewport and pipeline bound again)
             static int told = 8;
             if (probeLog && told > 0)
@@ -7718,12 +8758,11 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 --told;
                 std::fprintf(stderr, "[native render] occlusion probe of frame %llu %s: rect %.1f,%.1f-%.1f,%.1f of a %.0fx%.0f target (%ux%u pixels, depth view %u)%s\n",
                              static_cast<unsigned long long>(input.tick), atCopy ? "at its copy" : "at the frame's end", probeRect[0], probeRect[1],
-                             probeRect[2], probeRect[3], probeScene->gsW, probeScene->gsH, probeScene->w, probeScene->h, probeScene->depthSrv,
+                             probeRect[2], probeRect[3], probeScene->gsW, probeScene->gsH, probeScene->w, probeScene->h, gfx::device().view(probeScene->id, true),
                              ran ? "" : " - not run");
             }
         };
-        g.list->SetGraphicsRootDescriptorTable(2, slotHandle(0u));
-        g.list->SetGraphicsRootDescriptorTable(3, slotHandle(0u));
+        d3d12Device().beginDraws(stateFilter);
         size_t drawn = 0, fromTargets = 0, left = 0, topReads = 0;
         struct AfterSave
         {
@@ -7886,43 +8925,42 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                              static_cast<size_t>(&draw - input.draws.data()), draw.target, draw.mesh->prim, draw.mesh->immediate,
                              draw.mesh->vertices.size(), draw.texture != nullptr, static_cast<unsigned long long>(draw.alpha));
             auto found = g.targets.find(targetKey(draw.target));
-            if (found == g.targets.end() || !found->second.colour)
+            if (found == g.targets.end() || !found->second.id)
                 continue;
             State::Target &tg = found->second;
             if (draw.cloud)
             {
                 // (TODO 27: the warp tunnel's sparks - their own pipeline; the next draw binds its target, state and
                 // pipeline again)
-                drawCloud(draw, tg, ring, ringEnd);
-                current = nullptr;
-                scissorKnown = false;
-                lastFactor = -1.0f;
-                lastSetPso = nullptr;
+                drawCloud(draw, tg);
+                current = nullptr; // (its own pipeline and state: the next draw binds its target, and with it all, again)
                 continue;
             }
             prof::record += prof::since(profT);
-            GpuMesh *m = draw.mesh ? upload(draw.mesh) : nullptr;
+            // (TODO 204: a ground blend layer with its colours softened - layersoft.)
+            const bool softLayer = layersoft::isLayer(draw);
+            GpuMesh *m = draw.mesh ? (softLayer ? uploadSoft(draw.mesh) : upload(draw.mesh)) : nullptr;
             // (N9 stage 3: the frame before's vertices of a mesh made anew each frame, a stream of their own - place, colour,
             // size - in the frame's ring; the rest read a zero stride's one entry)
-            D3D12_VERTEX_BUFFER_VIEW vertexB{g.dynamic ? g.dynamic->GetGPUVirtualAddress() + static_cast<UINT64>(g.slot) * kDynamicRing : 0ull, kVertexBStride, 0u};
+            gfx::RingSpan vertexB; // (empty: none)
             bool hasVertexB = false;
             if (m && draw.meshB && draw.meshB->vertices.size() == draw.mesh->vertices.size() && g.dynamic)
             {
                 const UINT64 bytes = draw.meshB->vertices.size() * kVertexBStride;
-                const UINT64 at = (g.dynamicUsed + 15u) & ~15ull;
-                if (at + bytes + 16u <= (g.slot + 1ull) * kDynamicRing)
+                gfx::RingSpan vbSpan;
+                if (dev.ringAlloc(gfx::RingKind::Vertices, static_cast<uint32_t>(bytes), 16u, vbSpan))
                 {
                     std::vector<uint8_t> packed(static_cast<size_t>(bytes));
-                    for (size_t k = 0; k < draw.meshB->vertices.size(); ++k)
+                    const std::vector<Vertex> &verticesB = softLayer ? layersoft::entry(draw.meshB).vertices : draw.meshB->vertices;
+                    for (size_t k = 0; k < verticesB.size(); ++k)
                     {
-                        const Vertex &v = draw.meshB->vertices[k];
+                        const Vertex &v = verticesB[k];
                         std::memcpy(packed.data() + k * kVertexBStride, &v.x, 12u);
                         std::memcpy(packed.data() + k * kVertexBStride + 12u, &v.colour, 4u);
                         std::memcpy(packed.data() + k * kVertexBStride + 16u, &v.size, 4u);
                     }
-                    std::memcpy(g.dynamicMapped + at, packed.data(), packed.size());
-                    g.dynamicUsed = at + bytes;
-                    vertexB = {g.dynamic->GetGPUVirtualAddress() + at, static_cast<UINT>(bytes), kVertexBStride};
+                    std::memcpy(vbSpan.cpu, packed.data(), packed.size());
+                    vertexB = vbSpan;
                     hasVertexB = true;
                 }
             }
@@ -7937,11 +8975,6 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 const Pass &pass = g.passes[passIndex];
                 if (passIndex < passesDone)
                     continue;
-                if (ring + kConstantStride > ringEnd || instAt + g.passes.size() > instEnd)
-                {
-                    ++g_ringFull;
-                    break;
-                }
                 // The texture: the game's, else a render target this frame drew (its pages), else
                 // none (a 2D draw sampling memory nobody drew is left out).
                 prof::record += prof::since(profT);
@@ -7955,12 +8988,13 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 static const bool selfReadOff = std::getenv("TF_NATIVE_SELFREAD") && *std::getenv("TF_NATIVE_SELFREAD") == '0'; // (debug: left out, as before)
                 const bool tme = (pass.prim & 0x10u) != 0u;
                 // The depth fog (its palette and the target's own depth; not on the picture itself).
-                const bool fog = pass.fogPalette && !tg.main && tg.depthSrv;
+                const gfx::TextureId tgDepth = dev.view(tg.id, true); // (the target's depth as a texture; 0: none - the picture's)
+                const bool fog = pass.fogPalette && !tg.main && tgDepth;
                 GpuTexture *fogPalette = fog ? textureFor(pass.fogPalette) : nullptr;
                 static const bool fogLog = std::getenv("TF_NATIVE_FOGLOG") != nullptr;
                 if (fogLog && !shotPath.empty() && pass.fogPalette)
                     std::fprintf(stderr, "[native render] fog pass of draw %zu into %04x: fog %d (main %d, depth view %u), palette %d, test %llx zbuf %llx\n",
-                                 static_cast<size_t>(&draw - input.draws.data()), found->first, fog ? 1 : 0, tg.main ? 1 : 0, tg.depthSrv,
+                                 static_cast<size_t>(&draw - input.draws.data()), found->first, fog ? 1 : 0, tg.main ? 1 : 0, tgDepth,
                                  fogPalette != nullptr, static_cast<unsigned long long>(pass.test), static_cast<unsigned long long>(pass.zbuf));
                 if (pass.fogPalette && !fogPalette)
                 {
@@ -7976,7 +9010,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     const uint32_t tbp = static_cast<uint32_t>(pass.tex0) & 0x3FFFu, tbw = static_cast<uint32_t>(pass.tex0 >> 14) & 0x3Fu;
                     const uint32_t key = (tbp / 32u) | tbw << 9;
                     auto rt = (tbp % 32u) == 0u && drawnTargets.count(key) ? g.targets.find(key) : g.targets.end();
-                    if (rt != g.targets.end() && rt->second.colour && &rt->second != &tg)
+                    if (rt != g.targets.end() && rt->second.id && &rt->second != &tg)
                         if ((topPalette = textureFor(pass.topPalette)) != nullptr)
                         {
                             topSource = source = &rt->second;
@@ -7996,8 +9030,8 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     // target as it is now. (Left to the converted GS memory, the grade read a stale
                     // picture's green: Antarctica bluer and brighter than the GS draws it.)
                     static const bool selfTopOff = std::getenv("TF_NATIVE_LENSFILTER") && *std::getenv("TF_NATIVE_LENSFILTER") == '0';
-                    if (!topSource && !selfTopOff && !selfReadOff && rt != g.targets.end() && &rt->second == &tg && tg.colour && !tg.main)
-                        if ((topPalette = textureFor(pass.topPalette)) != nullptr && (selfSlot = destCopyOf(tg)) != 0u)
+                    if (!topSource && !selfTopOff && !selfReadOff && rt != g.targets.end() && &rt->second == &tg && tg.id && !tg.main)
+                        if ((topPalette = textureFor(pass.topPalette)) != nullptr && (selfSlot = dev.snapshot(tg.id)) != 0u)
                         {
                             topSource = source = &tg;
                             t = nullptr;
@@ -8027,10 +9061,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 {
                     const uint32_t tbp = static_cast<uint32_t>(pass.tex0) & 0x3FFFu, tbw = static_cast<uint32_t>(pass.tex0 >> 14) & 0x3Fu;
                     auto rt = (tbp % 32u) == 0u ? g.targets.find((tbp / 32u) | tbw << 9) : g.targets.end();
-                    if (rt != g.targets.end() && rt->second.colour && &rt->second != &tg)
+                    if (rt != g.targets.end() && rt->second.id && &rt->second != &tg)
                         source = &rt->second;
-                    else if (rt != g.targets.end() && rt->second.colour && !tg.main && !selfReadOff && ((draw.target >> 24) & 0x3Fu) <= 1u &&
-                             ((pass.tex0 >> 20) & 0x3Fu) == ((draw.target >> 24) & 0x3Fu) && (selfSlot = destCopyOf(tg)) != 0u)
+                    else if (rt != g.targets.end() && rt->second.id && !tg.main && !selfReadOff && ((draw.target >> 24) & 0x3Fu) <= 1u &&
+                             ((pass.tex0 >> 20) & 0x3Fu) == ((draw.target >> 24) & 0x3Fu) && (selfSlot = dev.snapshot(tg.id)) != 0u)
                         source = &tg; // (the target read while drawn into - the glow's channel shifts: from a copy of it as it is now)
                     else if (draw.mesh->immediate || draw.mesh->primitive)
                     {
@@ -8055,7 +9089,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     if (aaWanted && !aaDone && tg.main && picture3D && !carries3D)
                     {
                         auto aaT = prof::clock::now();
-                        if (runAa(tg, ring, ringEnd))
+                        if (runAa(tg))
                         {
                             aaAt = static_cast<size_t>(&draw - input.draws.data());
                             current = nullptr; // (the draw's target, depth and viewport bound again)
@@ -8069,50 +9103,37 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                         holds3D.insert(&tg);
                         picture3D = picture3D || tg.main;
                     }
-                    if (!draw.mesh->immediate && tg.depthSrv && (!probeScene || tg.gsW * tg.gsH > probeScene->gsW * probeScene->gsH))
+                    if (!draw.mesh->immediate && tgDepth && (!probeScene || tg.gsW * tg.gsH > probeScene->gsW * probeScene->gsH))
                         probeScene = &tg;
                 }
                 if (&tg != current || fog != currentFog)
                 {
-                    stateOf(tg, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    dev.use(tg.id, gfx::UseFor::Draw);
                     // (The depth read by the fog's pass: its read-only view, the shader's state too.)
                     if (!tg.main)
-                        depthStateOf(tg, fog ? D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                                             : D3D12_RESOURCE_STATE_DEPTH_WRITE);
-                    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvAt(tg.rtv), dsv = dsvAt(fog ? tg.rtv + 64u : tg.rtv);
-                    g.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                        dev.useDepth(tg.id, fog ? gfx::DepthUse::ReadSample : gfx::DepthUse::Write);
+                    // (Anything run between draws - the anti-aliasing - sets its own: all set again after a target change.)
+                    dev.setTarget(tg.id, true);
                     ++g_cntTargets;
-                    const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(tg.w), static_cast<float>(tg.h), 0.0f, 1.0f};
-                    g.list->RSSetViewports(1, &vp);
+                    dev.setViewport(0.0f, 0.0f, static_cast<float>(tg.w), static_cast<float>(tg.h));
                     current = &tg;
                     currentFog = fog;
-                    // (Anything run between draws - the anti-aliasing - sets its own: all set again after a target change.)
-                    scissorKnown = false;
-                    lastFactor = -1.0f;
-                    lastSetPso = nullptr;
                 }
                 {
                     // The draw's scissor, in the target's pixels.
                     const float sx = static_cast<float>(tg.w) / tg.gsW, sy = static_cast<float>(tg.h) / tg.gsH;
-                    D3D12_RECT r{static_cast<LONG>(draw.scissor[0] * sx), static_cast<LONG>(draw.scissor[1] * sy),
-                                 static_cast<LONG>((draw.scissor[2] + 1.0f) * sx), static_cast<LONG>((draw.scissor[3] + 1.0f) * sy)};
-                    r.right = std::min<LONG>(r.right, static_cast<LONG>(tg.w));
-                    r.bottom = std::min<LONG>(r.bottom, static_cast<LONG>(tg.h));
+                    gfx::Rect r{static_cast<int32_t>(draw.scissor[0] * sx), static_cast<int32_t>(draw.scissor[1] * sy),
+                                static_cast<int32_t>((draw.scissor[2] + 1.0f) * sx), static_cast<int32_t>((draw.scissor[3] + 1.0f) * sy)};
+                    r.x1 = std::min<int32_t>(r.x1, static_cast<int32_t>(tg.w));
+                    r.y1 = std::min<int32_t>(r.y1, static_cast<int32_t>(tg.h));
                     if (const auto sq = squeezes.find(&draw); sq != squeezes.end() && sq->second.clipRight > sq->second.clipLeft)
                     {
                         // (TODO 123: a text page's draw held to where the 4:3 picture lands)
-                        r.left = std::max<LONG>(r.left, static_cast<LONG>(std::floor(sq->second.clipLeft * sx)));
-                        r.right = std::min<LONG>(r.right, static_cast<LONG>(std::ceil(sq->second.clipRight * sx)));
-                        r.right = std::max(r.right, r.left);
+                        r.x0 = std::max<int32_t>(r.x0, static_cast<int32_t>(std::floor(sq->second.clipLeft * sx)));
+                        r.x1 = std::min<int32_t>(r.x1, static_cast<int32_t>(std::ceil(sq->second.clipRight * sx)));
+                        r.x1 = std::max(r.x1, r.x0);
                     }
-                    if (!stateFilter || !scissorKnown || r.left != lastScissor.left || r.top != lastScissor.top || r.right != lastScissor.right ||
-                        r.bottom != lastScissor.bottom)
-                    {
-                        g.list->RSSetScissorRects(1, &r);
-                        ++g_cntScissors;
-                        lastScissor = r;
-                        scissorKnown = true;
-                    }
+                    dev.setScissor(r);
                 }
                 static const bool copyLog = std::getenv("TF_NATIVE_COPYLOG") != nullptr;
                 if (copyLog && !shotPath.empty() && tg.main && !draw.mesh->vertices.empty())
@@ -8157,12 +9178,13 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                         continue; // (the field this copy weaves in was not drawn)
                     }
                 }
+                gfx::TextureId sourceSlot = 0u;
                 if (source && !selfSlot)
                 {
                     if (source->main)
                         ++g_pictureReads; // (TF_NATIVE_PROFILE: passes reading the picture itself)
-                    srvFor(*source);
-                    stateOf(*source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    sourceSlot = dev.view(source->id);
+                    dev.use(source->id, gfx::UseFor::Sample);
                 }
                 if (source)
                     ++fromTargets;
@@ -8381,7 +9403,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                         m->bounded = true;
                     }
                     // (N9 stage 3: inside in this frame's pose and the frame before's - the pictures between lie between)
-                    clips = !boxInside(*m, pass.clip) || !boxInside(*m, pass.clipB);
+                    clips = !boxInside(*m, pass.clip) || !boxInside(*m, pass.clipB) || !boxInside(*m, pass.clipM);
                 }
                 if (pass.turned)
                     c.pose[0] = 1.0f; // (N9 stage 3: the camera's turn of each picture)
@@ -8391,6 +9413,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 {
                     std::memcpy(c.clipRows, pass.clip, sizeof(c.clipRows));
                     std::memcpy(c.clipRowsB, pass.clipB, sizeof(c.clipRowsB));
+                    std::memcpy(c.clipRowsM, pass.clipM, sizeof(c.clipRowsM));
                     c.clipOn[0] = 1.0f;
                     // (The clipping shader's early way out for triangles wholly inside / outside; TF_NATIVE_CLIPFAST=0: off;
                     // =alt: on and off by turns, a profile window (TF_NATIVE_PROFILE, 300 frames) each - an A/B in one run.)
@@ -8407,13 +9430,13 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 // TEST's DATE: the frame's alpha read from a copy of the target taken now (DATM: which
                 // side of 0x80 passes).
                 c.dest[0] = c.dest[1] = c.dest[2] = c.dest[3] = 0.0f;
-                UINT destSlot = 0u;
-                if (((pass.test >> 14) & 1u) != 0u && !tg.main && !fog && !topSource && (destSlot = destCopyOf(tg)) != 0u)
+                gfx::TextureId destSlot = 0u;
+                if (((pass.test >> 14) & 1u) != 0u && !tg.main && !fog && !topSource && (destSlot = dev.snapshot(tg.id)) != 0u)
                     c.dest[0] = ((pass.test >> 15) & 1u) != 0u ? 2.0f : 1.0f;
                 // Depth: TEST's ZTE / ZTST (0 never, 1 always, 2 GEQUAL, 3 GREATER), ZBUF's ZMSK.
                 const bool zte = ((pass.test >> 16) & 1u) != 0u && !(fogDebug && fog);
                 const uint32_t ztst = static_cast<uint32_t>(pass.test >> 17) & 3u;
-                const D3D12_COMPARISON_FUNC func = compareOf(draw::compareOfZtst(ztst));
+                const gfx::Compare func = draw::compareOfZtst(ztst);
                 const bool zwrite = ((pass.zbuf >> 32) & 1u) == 0u;
                 {
                     // (TODO 100: the depth-equal passes a little nearer - the shader's pose.z, a share of the depth: 1e-4, a ten-
@@ -8423,7 +9446,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     if (zNudge != 0.0f && zte && ztst == 2u && !zwrite)
                         c.pose[2] = zNudge;
                 }
-                const BlendKey blend = blendOf(pass.alpha, (pass.prim & 0x40u) != 0u);
+                const gfx::BlendState blend = draw::blendOf(pass.alpha, (pass.prim & 0x40u) != 0u);
                 c.dest[1] = static_cast<float>(blend.premultiply);
                 c.dest[2] = static_cast<float>((pass.alpha >> 32) & 0xFFu) / 128.0f;
                 // (The GS-exact untextured colour: the glow's threshold - a constant subtracted from the
@@ -8440,7 +9463,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     // it was the last mesh's alpha there and the grass came out dark.
                     const uint32_t fpsm = (draw.target >> 24) & 0x3Fu;
                     if (fpsm == 0x01u || fpsm == 0x31u)
-                        writeMask &= ~static_cast<uint32_t>(D3D12_COLOR_WRITE_ENABLE_ALPHA);
+                        writeMask &= ~static_cast<uint32_t>(gfx::kWriteA);
                 }
                 // (Nothing written: the draw only touches what is masked - unless it writes depth. An
                 // opened warp gate's portal is a disc drawn with FBMSK ffffffff and Z written (TEST ZTE,
@@ -8456,7 +9479,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 // failing ones without alpha. (The shadow receivers write the shadow's strength into
                 // the frame's alpha where it passes; elsewhere the alpha the receivers before left.)
                 static const bool afailOff = std::getenv("TF_NATIVE_AFAIL") && *std::getenv("TF_NATIVE_AFAIL") == '0'; // (debug: as before)
-                const bool rgbOnlyFail = !afailOff && c.test[0] > 0.5f && c.test[3] == 3.0f && (writeMask & D3D12_COLOR_WRITE_ENABLE_ALPHA) != 0u;
+                const bool rgbOnlyFail = !afailOff && c.test[0] > 0.5f && c.test[3] == 3.0f && (writeMask & gfx::kWriteA) != 0u;
                 if (rgbOnlyFail)
                     c.test[3] = 0.0f;
                 // (TF_NATIVE_CLIPGS=0: the GPU's clipper with the planes; =alt: by turns, a profile window each.)
@@ -8510,15 +9533,26 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 if ((zwMode & 512u) && psVar)
                     psVar &= ~(1u << 5); // (TF_NATIVE_ZWALT 512, a measuring aid: the alpha test left out - what it costs)
                 const uint32_t psAid = (zwMode & 128u) ? 1u : (zwMode & 256u) ? 2u : 0u;
-                ID3D12PipelineState *pso = pass.test || pass.alpha || writeMask != D3D12_COLOR_WRITE_ENABLE_ALL || tg.main || clipGs || zwriteNow != zwrite ||
-                                                   psVar || psAid
-                                               ? pipelineFor(blend, zte, func, zwriteNow, writeMask, tg.main, clipGs && !psAid, psVar, psAid)
-                                               : g.pipeline;
-                if (!pso)
-                {
-                    ++left; // (no pipeline: the draw is left out, not drawn with the last one's state and format)
-                    continue;
-                }
+                // (The pipeline: the draw's state - or, a draw with none of its own, the default one: blend off, depth test
+                // GEQUAL and written, all channels.)
+                auto pipeOf = [](const gfx::BlendState &b, bool depthTest, gfx::Compare f, bool depthWrite, uint32_t mask, bool picture, bool clip,
+                                 uint32_t variant = 0u, uint32_t aid = 0u) {
+                    gfx::PipelineDesc p;
+                    p.blend = b;
+                    p.depthTest = depthTest;
+                    p.depthFunc = f;
+                    p.depthWrite = depthWrite;
+                    p.writeMask = mask;
+                    p.picture = picture;
+                    p.clip = clip;
+                    p.variant = variant;
+                    p.alphaTest = aid;
+                    return p;
+                };
+                const gfx::PipelineDesc defaultPipe = pipeOf(gfx::BlendState{}, true, gfx::Compare::GreaterEqual, true, gfx::kWriteAll, false, false);
+                gfx::PipelineDesc pipe = pass.test || pass.alpha || writeMask != gfx::kWriteAll || tg.main || clipGs || zwriteNow != zwrite || psVar || psAid
+                                             ? pipeOf(blend, zte, func, zwriteNow, writeMask, tg.main, clipGs && !psAid, psVar, psAid)
+                                             : defaultPipe;
                 {
                     // (TODO 94, a measuring aid: TF_NATIVE_ONEPSO=alt - every draw on the default pipeline in every other
                     // profile window, its own blend/depth/clipping state ignored: what the pipeline changes cost.)
@@ -8527,99 +9561,123 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     {
                         // (=b: the blend alone made the same (src alpha), =z: the depth state alone (test GEQUAL, write),
                         // =g: the clipping shader alone left out; else one pipeline for all.)
-                        BlendKey bk = blend;
-                        bk.enabled = true, bk.src = D3D12_BLEND_SRC_ALPHA, bk.dst = D3D12_BLEND_INV_SRC_ALPHA, bk.op = D3D12_BLEND_OP_ADD;
+                        gfx::BlendState bk = blend;
+                        bk.enabled = true, bk.src = gfx::Blend::SrcAlpha, bk.dst = gfx::Blend::InvSrcAlpha, bk.op = gfx::BlendOp::Add;
+                        const gfx::Compare ge = gfx::Compare::GreaterEqual;
                         if (*onePso == 'O')
-                            pso = pipelineFor(blend, zte, func, false, writeMask, false, false);
+                            pipe = pipeOf(blend, zte, func, false, writeMask, false, false);
                         else if (*onePso == 'W')
-                            pso = pipelineFor(blend, zte, func, true, writeMask, false, false);
+                            pipe = pipeOf(blend, zte, func, true, writeMask, false, false);
                         else if (*onePso == 'F')
-                            pso = pipelineFor(blend, true, D3D12_COMPARISON_FUNC_GREATER_EQUAL, zwrite, writeMask, false, false);
+                            pipe = pipeOf(blend, true, ge, zwrite, writeMask, false, false);
                         else if (*onePso == 'B')
-                            pso = pipelineFor(bk, zte, func, zwrite, writeMask, false, false);
+                            pipe = pipeOf(bk, zte, func, zwrite, writeMask, false, false);
                         else if (*onePso == 'Z')
-                            pso = pipelineFor(blend, true, D3D12_COMPARISON_FUNC_GREATER_EQUAL, true, writeMask, false, false);
+                            pipe = pipeOf(blend, true, ge, true, writeMask, false, false);
                         else if (*onePso == 'm')
-                            pso = pipelineFor(blend, zte, func, zwrite, D3D12_COLOR_WRITE_ENABLE_ALL, false, clipGs);
+                            pipe = pipeOf(blend, zte, func, zwrite, gfx::kWriteAll, false, clipGs);
                         else if (*onePso == 'y')
-                            pso = pipelineFor(bk, true, D3D12_COMPARISON_FUNC_GREATER_EQUAL, true, writeMask, false, false);
+                            pipe = pipeOf(bk, true, ge, true, writeMask, false, false);
                         else if (*onePso == 'n')
-                            pso = pipelineFor(BlendKey{}, zte, func, zwrite, writeMask, false, clipGs);
+                            pipe = pipeOf(gfx::BlendState{}, zte, func, zwrite, writeMask, false, clipGs);
                         else if (*onePso == 'x')
-                            pso = pipelineFor(bk, true, D3D12_COMPARISON_FUNC_GREATER_EQUAL, true, writeMask, false, clipGs);
+                            pipe = pipeOf(bk, true, ge, true, writeMask, false, clipGs);
                         else if (*onePso == 'b')
-                            pso = pipelineFor(bk, zte, func, zwrite, writeMask, false, clipGs);
+                            pipe = pipeOf(bk, zte, func, zwrite, writeMask, false, clipGs);
                         else if (*onePso == 'z')
-                            pso = pipelineFor(blend, true, D3D12_COMPARISON_FUNC_GREATER_EQUAL, true, writeMask, false, clipGs);
+                            pipe = pipeOf(blend, true, ge, true, writeMask, false, clipGs);
                         else if (*onePso == 'g')
-                            pso = pipelineFor(blend, zte, func, zwrite, writeMask, false, false);
+                            pipe = pipeOf(blend, zte, func, zwrite, writeMask, false, false);
                         else
-                            pso = g.pipeline;
-                        if (!pso)
-                            pso = g.pipeline;
+                            pipe = defaultPipe;
                     }
                 }
-                setPso(pso);
+                if (!dev.setPipeline(pipe))
+                {
+                    static const char *onePsoOn = std::getenv("TF_NATIVE_ONEPSO");
+                    if (!(onePsoOn && (g_profWindow & 1u) && !tg.main) || !dev.setPipeline(defaultPipe))
+                    {
+                        ++left; // (no pipeline: the draw is left out, not drawn with the last one's state and format)
+                        continue;
+                    }
+                }
                 // (TODO 94, a measuring aid: TF_NATIVE_PSOLOG=1 - on a saved frame, each draw's pipeline and what made it.)
                 if (!shotPath.empty() && std::getenv("TF_NATIVE_PSOLOG"))
-                    std::fprintf(stderr, "[native render] pso %u: %p blend %d %d %d %d z %d %d %d mask %x main %d clip %d mesh %llu passes %zu tgt %p imm %d\n",
-                                 static_cast<unsigned>(&draw - input.draws.data()), static_cast<void *>(pso), blend.enabled ? 1 : 0, static_cast<int>(blend.src),
+                    std::fprintf(stderr, "[native render] pso %u: variant %x blend %d %d %d %d z %d %d %d mask %x main %d clip %d mesh %llu passes %zu tgt %p imm %d\n",
+                                 static_cast<unsigned>(&draw - input.draws.data()), pipe.variant, blend.enabled ? 1 : 0, static_cast<int>(blend.src),
                                  static_cast<int>(blend.dst), static_cast<int>(blend.op), zte ? 1 : 0, static_cast<int>(func), zwrite ? 1 : 0, writeMask,
                                  tg.main ? 1 : 0, clipGs ? 1 : 0, draw.mesh ? static_cast<unsigned long long>(draw.mesh->id) : 0ull, g.passes.size(),
                                  static_cast<void *>(&tg), draw.mesh && draw.mesh->immediate ? 1 : 0);
                 {
-                    static ID3D12PipelineState *lastPso = nullptr;
+                    static gfx::PipelineDesc lastPipe;
                     static bool lastGs = false;
-                    g_cntPso += pso != lastPso ? 1u : 0u;
+                    const bool samePipe = lastPipe.blend.src == pipe.blend.src && lastPipe.blend.dst == pipe.blend.dst && lastPipe.blend.op == pipe.blend.op &&
+                                          lastPipe.blend.enabled == pipe.blend.enabled && lastPipe.depthTest == pipe.depthTest &&
+                                          lastPipe.depthFunc == pipe.depthFunc && lastPipe.depthWrite == pipe.depthWrite && lastPipe.writeMask == pipe.writeMask &&
+                                          lastPipe.picture == pipe.picture && lastPipe.clip == pipe.clip && lastPipe.variant == pipe.variant &&
+                                          lastPipe.alphaTest == pipe.alphaTest;
+                    g_cntPso += samePipe ? 0u : 1u;
                     g_cntGsSwitch += clipGs != lastGs ? 1u : 0u;
-                    lastPso = pso;
+                    lastPipe = pipe;
                     lastGs = clipGs;
                     ++g_cntDraws;
                 }
                 const float fix = static_cast<float>((pass.alpha >> 32) & 0xFFu) / 128.0f;
-                if (!stateFilter || fix != lastFactor)
                 {
                     const float factor[4] = {fix, fix, fix, fix};
-                    g.list->OMSetBlendFactor(factor);
-                    ++g_cntFactors;
-                    lastFactor = fix;
+                    dev.setBlendFactor(factor);
                 }
-                g.list->SetGraphicsRootDescriptorTable(1, slotHandle(selfSlot ? selfSlot : source ? source->srv : t ? t->slot : 0u));
-                if (topSource)
-                    g.list->SetGraphicsRootDescriptorTable(2, slotHandle(topPalette->slot));
-                if (destSlot)
-                    g.list->SetGraphicsRootDescriptorTable(2, slotHandle(destSlot));
-                if (fog)
+                // (t0 the draw's texture; t1 the fog's palette, else TEST's DATE copy, else the top-byte read's palette; t2 the
+                // fog's depth. Unused, t1 and t2 are left at what they were bound to: the shader reads them only for those.)
+                dev.bindTextures(selfSlot ? selfSlot : source ? sourceSlot : t ? t->id : 0u,
+                                 fog ? fogPalette->id : destSlot ? destSlot : topSource ? topPalette->id : gfx::kKeepTexture,
+                                 fog ? tgDepth : gfx::kKeepTexture);
+                // (The rings: the pass's constants, then its instance entries. Full - the frame's ring room spent - the
+                // draw's passes from here are left out, as the check at a pass's start left them before.)
+                gfx::RingSpan cSpan;
+                if (!dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, cSpan))
                 {
-                    g.list->SetGraphicsRootDescriptorTable(2, slotHandle(fogPalette->slot));
-                    g.list->SetGraphicsRootDescriptorTable(3, slotHandle(tg.depthSrv));
+                    ++g_ringFull;
+                    break;
                 }
-                std::memcpy(g.constantsMapped + ring, &c, sizeof(c));
-                g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-                ring += kConstantStride;
+                std::memcpy(cSpan.cpu, &c, sizeof(c));
+                dev.bindDrawConstants(cSpan);
                 // The pass's matrix and q0 into the instance stream - and, for an instanced draw (TODO 94: the forest's,
                 // 6-10 passes of one mesh each, a third of a level's draws), every following instance pass's, drawn as one
                 // draw: the same mesh, constants, texture and state, the instances in their order (the GPU keeps it).
                 // TF_NATIVE_INSTANCING=0: a draw each, as before; =alt: by turns.
-                const UINT firstInst = instAt;
+                UINT firstInst = 0u;
                 UINT instCount = 1u;
                 {
-                    auto entry = [&](const float *rows, const float *rowsB, const float *q0) {
+                    bool haveFirst = false;
+                    auto entry = [&](const float *rows, const float *rowsB, const float *rowsM, const float *q0) {
                         // (one write of the whole entry: the ring is write-combined)
-                        float e[36];
+                        float e[52];
                         std::memcpy(e, rows, 64u);
                         std::memcpy(e + 16, q0, 16u);
                         std::memcpy(e + 20, rowsB, 64u);
-                        std::memcpy(g.instancesMapped + static_cast<size_t>(instAt) * kInstanceStride, e, sizeof(e));
-                        ++instAt;
+                        std::memcpy(e + 36, rowsM, 64u);
+                        gfx::RingSpan iSpan;
+                        if (!dev.ringAlloc(gfx::RingKind::Instances, kInstanceStride, 16u, iSpan))
+                            return false;
+                        std::memcpy(iSpan.cpu, e, sizeof(e));
+                        if (!haveFirst)
+                            firstInst = iSpan.first; // (the instance stream's entry: draw's first instance)
+                        haveFirst = true;
+                        return true;
                     };
-                    entry(c.rows, pass.matrixB, c.p[0]);
+                    if (!entry(c.rows, pass.matrixB, pass.matrixM, c.p[0]))
+                    {
+                        ++g_ringFull;
+                        break;
+                    }
                     static const char *instEnv = std::getenv("TF_NATIVE_INSTANCING");
                     const bool instOn = speedupOn(instEnv);
                     if (instOn && pass.mode[0] == 9.0f && !rgbOnlyFail && !clipGs)
                         for (size_t k = passIndex + 1; k < g.passes.size() && g.passes[k].mode[0] == 9.0f; ++k)
                         {
-                            entry(g.passes[k].matrix, g.passes[k].matrixB, g.passes[k].p[0]);
+                            if (!entry(g.passes[k].matrix, g.passes[k].matrixB, g.passes[k].matrixM, g.passes[k].p[0]))
+                                break;
                             ++instCount;
                             passesDone = k + 1;
                         }
@@ -8633,7 +9691,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 UINT drawCount = m->count;
                 int cullKept = -1; // (TODO 99 check: -1 the CPU cull not tried, else the triangles it kept)
                 bool keptView = false;
-                D3D12_INDEX_BUFFER_VIEW keptIbv{};
+                gfx::RingSpan keptSpan;
                 {
                     static const bool clipCullOff = !(std::getenv("TF_NATIVE_CLIPCULL") && *std::getenv("TF_NATIVE_CLIPCULL") == '1');
                     // (TF_NATIVE_BEHINDCULL=1, a test with it: a draw the core does not clip - its triangles with a corner at or
@@ -8653,14 +9711,14 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                         for (size_t v = 0; v < vx.size() && !clipping; ++v)
                         {
                             uint8_t behind = 0u;
-                            for (const float *rows : {static_cast<const float *>(c.rows), static_cast<const float *>(pass.matrixB)})
+                            for (const float *rows : {static_cast<const float *>(c.rows), static_cast<const float *>(pass.matrixB), static_cast<const float *>(pass.matrixM)})
                                 behind |= rows[3] * vx[v].x + rows[7] * vx[v].y + rows[11] * vx[v].z + rows[15] <= 0.0f ? 0x40u : 0u;
                             outside[v] = behind;
                         }
                         for (size_t v = 0; v < vx.size() && clipping; ++v)
                         {
                             uint8_t both = 0x3Fu;
-                            for (const float *rows : {c.clipRows, c.clipRowsB})
+                            for (const float *rows : {c.clipRows, c.clipRowsB, c.clipRowsM})
                             {
                                 float k[4];
                                 for (int r = 0; r < 4; ++r)
@@ -8695,12 +9753,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                                 continue; // (the whole pass outside: nothing to draw)
                             }
                             const UINT64 bytes = kept.size() * sizeof(uint32_t);
-                            const UINT64 at = (g.dynamicUsed + 15u) & ~15ull;
-                            if (at + bytes + 16u <= (g.slot + 1ull) * kDynamicRing)
+                            if (dev.ringAlloc(gfx::RingKind::Vertices, static_cast<uint32_t>(bytes), 16u, keptSpan))
                             {
-                                std::memcpy(g.dynamicMapped + at, kept.data(), static_cast<size_t>(bytes));
-                                g.dynamicUsed = at + bytes;
-                                keptIbv = {g.dynamic->GetGPUVirtualAddress() + at, static_cast<UINT>(bytes), DXGI_FORMAT_R32_UINT};
+                                std::memcpy(keptSpan.cpu, kept.data(), static_cast<size_t>(bytes));
                                 keptView = true;
                                 drawCount = static_cast<UINT>(kept.size());
                                 g_clipCulled[0] += (ix.size() - kept.size()) / 3u;
@@ -8708,13 +9763,18 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                         }
                     }
                 }
+                // The geometry: the mesh (a resident one, or the frame's own in the ring; the grass's at its draw), the
+                // clipped draw's kept triangles in place of its indices, the frame before's vertices.
+                if (m->meshId)
+                    dev.setMesh(m->meshId);
+                else if (!m->indirect)
                 {
-                    // (TF_NATIVE_MESHVRAM=alt: the upload heap's copy in every other profile window.)
-                    const bool upHeap = m->buffer && m->vram && (g_profWindow & 1u);
-                    const D3D12_VERTEX_BUFFER_VIEW views[3] = {upHeap ? m->vbv : (m->vbvV.SizeInBytes ? m->vbvV : m->vbv), instView, vertexB};
-                    g.list->IASetVertexBuffers(0, 3, views);
-                    g.list->IASetIndexBuffer(keptView ? &keptIbv : upHeap ? &m->ibv : (m->ibvV.SizeInBytes ? &m->ibvV : &m->ibv));
+                    dev.setVertices(m->ringVertices, sizeof(Vertex));
+                    dev.setIndices(m->ringIndices);
                 }
+                if (keptView)
+                    dev.setIndices(keptSpan);
+                dev.setPreviousVertices(vertexB);
                 // (TODO 62, an experiment, OFF: a clipping draw's triangles wholly inside its planes drawn
                 // without the clipping shader, in runs that keep the mesh's order. Measured by turns in one
                 // run on the RX 5700 XT it made the frame 4.5 ms SLOWER (14.9 vs 10.4 ms: ~77 switches a
@@ -8723,11 +9783,12 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 static const char *clipSplit = std::getenv("TF_NATIVE_CLIPSPLIT");
                 const bool splitOn = clipSplit && (*clipSplit == '1' || (*clipSplit == 'a' && !(g_profWindow & 1u)));
                 static thread_local std::vector<ClipRun> runs;
-                ID3D12PipelineState *psoInside = nullptr;
+                gfx::RingSpan insideSpan; // (the split's constants for the runs wholly inside)
                 bool split = clipGs && splitOn && !keptView && !rgbOnlyFail && pass.mode[2] < 0.5f && pass.mode[3] < 0.5f && draw.mesh &&
-                             draw.mesh->indices.size() == m->count && ring + kConstantStride <= ringEnd;
-                if (split)
-                    split = (psoInside = pipelineFor(blend, zte, func, zwrite, writeMask, tg.main, false, psVar)) != nullptr && clipRunsOf(*draw.mesh, pass.clip, runs);
+                             draw.mesh->indices.size() == m->count && dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, insideSpan);
+                const gfx::PipelineDesc pipeInside = pipeOf(blend, zte, func, zwrite, writeMask, tg.main, false, psVar);
+                if (split) // (the inside runs' pipeline made now - and the draw's own set again)
+                    split = dev.setPipeline(pipeInside) && dev.setPipeline(pipe) && clipRunsOf(*draw.mesh, pass.clip, runs);
                 // (TODO 94, a measuring aid: TF_NATIVE_SKIPKIND=<kind>|all[a] - the draws of that kind (the pass
                 // profile's numbers: 0 opaque, 1 blended, 2 grass, 3 2D, 4 small targets, 5 fog, 8 upscaled, 9
                 // clipping) not drawn, their state still set; with 'a' in every other profile window: their
@@ -8767,16 +9828,16 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                             for (const Vertex &v : draw.mesh->vertices)
                                 vs += v.x * 1.0 + v.y * 3.0 + v.z * 7.0 + v.u * 11.0 + v.v * 13.0 + (v.colour & 0xFFFFu);
                             const char *stale = "";
-                            if (m != &g.dynamicMesh && m->buffer && !draw.mesh->immediate)
+                            if (m != &g.dynamicMesh && g.devMeshes[m->meshId].buffer && !draw.mesh->immediate)
                             {
                                 void *mp = nullptr;
                                 const D3D12_RANGE rr{0, draw.mesh->vertices.size() * sizeof(Vertex)};
-                                if (SUCCEEDED(m->buffer->Map(0, &rr, &mp)))
+                                if (SUCCEEDED(g.devMeshes[m->meshId].buffer->Map(0, &rr, &mp)))
                                 {
                                     if (std::memcmp(mp, draw.mesh->vertices.data(), rr.End) != 0 || m->count != draw.mesh->indices.size())
                                         stale = " STALE";
                                     const D3D12_RANGE none{0, 0};
-                                    m->buffer->Unmap(0, &none);
+                                    g.devMeshes[m->meshId].buffer->Unmap(0, &none);
                                 }
                             }
                             // (where its vertices land: GS x, y and the depth, at the pass's matrix - the first instance's)
@@ -8920,9 +9981,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     {
                         predicate(skipDraw);
                         if (m->indirect)
-                            grassgpu::draw(*m, instView, firstInst); // (grassgpu: its count the GPU's)
+                            dev.drawIndirect(draw.mesh->id, firstInst); // (grassgpu: its count the GPU's)
                         else
-                            g.list->DrawIndexedInstanced(drawCount, instCount, 0, 0, firstInst);
+                            dev.drawIndexed(drawCount, 0u, instCount, firstInst);
                         predicate(false);
                     }
                 }
@@ -8930,10 +9991,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 {
                     Constants ci = c;
                     ci.clipOn[2] = 2.0f;
-                    const UINT64 insideAt = ring;
-                    std::memcpy(g.constantsMapped + insideAt, &ci, sizeof(ci));
-                    ring += kConstantStride;
-                    const UINT64 crossAt = ring - 2u * kConstantStride; // (c's, written above)
+                    std::memcpy(insideSpan.cpu, &ci, sizeof(ci));
                     int bound = 1; // (the pipeline and constants set: the clipping shader's)
                     for (const ClipRun &r : runs)
                     {
@@ -8941,34 +9999,33 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                             continue;
                         if (r.kind != bound)
                         {
-                            setPso(r.kind == 0 ? psoInside : pso);
-                            g.list->SetGraphicsRootConstantBufferView(0, cbBase() + (r.kind == 0 ? insideAt : crossAt));
+                            dev.setPipeline(r.kind == 0 ? pipeInside : pipe);
+                            dev.bindDrawConstants(r.kind == 0 ? insideSpan : cSpan); // (the crossing runs: c's, written above)
                             bound = r.kind;
                         }
                         predicate(skipDraw);
-                        g.list->DrawIndexedInstanced(r.count, 1, r.first, 0, firstInst);
+                        dev.drawIndexed(r.count, r.first, 1u, firstInst);
                         predicate(false);
                         ++g_clipRuns[r.kind];
                     }
                 }
-                if (rgbOnlyFail && ring + kConstantStride <= ringEnd &&
-                    (writeMask & ~static_cast<uint32_t>(D3D12_COLOR_WRITE_ENABLE_ALPHA)) != 0u)
+                if (rgbOnlyFail && (writeMask & ~static_cast<uint32_t>(gfx::kWriteA)) != 0u)
                 {
                     Constants c2 = c;
                     c2.test[3] = 4.0f; // (the failing pixels only)
-                    std::memcpy(g.constantsMapped + ring, &c2, sizeof(c2));
-                    if (ID3D12PipelineState *pso2 = pipelineFor(blend, zte, func, false, writeMask & ~static_cast<uint32_t>(D3D12_COLOR_WRITE_ENABLE_ALPHA), tg.main, clipGs, psVar))
+                    gfx::RingSpan c2Span;
+                    if (dev.setPipeline(pipeOf(blend, zte, func, false, writeMask & ~static_cast<uint32_t>(gfx::kWriteA), tg.main, clipGs, psVar)) &&
+                        dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, c2Span))
                     {
-                        setPso(pso2);
-                        g.list->SetGraphicsRootConstantBufferView(0, cbBase() + ring);
-                        ring += kConstantStride;
+                        std::memcpy(c2Span.cpu, &c2, sizeof(c2));
+                        dev.bindDrawConstants(c2Span);
                         if (!skipThis)
                         {
                             predicate(skipDraw);
                             if (m->indirect)
-                                grassgpu::draw(*m, instView, firstInst);
+                                dev.drawIndirect(draw.mesh->id, firstInst);
                             else
-                                g.list->DrawIndexedInstanced(drawCount, instCount, 0, 0, firstInst);
+                                dev.drawIndexed(drawCount, 0u, instCount, firstInst);
                             predicate(false);
                         }
                     }
@@ -9056,7 +10113,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 sv.w = tg.w;
                 sv.h = tg.h;
                 sv.split = true;
-                D3D12_RESOURCE_DESC td = tg.colour->GetDesc();
+                D3D12_RESOURCE_DESC td = dt(tg).colour->GetDesc();
                 UINT64 total = 0;
                 g.device->GetCopyableFootprints(&td, 0, 1, 0, &sv.fp, nullptr, nullptr, &total);
                 const D3D12_HEAP_PROPERTIES back = heap(D3D12_HEAP_TYPE_READBACK);
@@ -9064,16 +10121,16 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 if (SUCCEEDED(g.device->CreateCommittedResource(&back, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                                 IID_PPV_ARGS(&sv.readback))))
                 {
-                    const D3D12_RESOURCE_STATES was = tg.state;
-                    stateOf(tg, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    const D3D12_RESOURCE_STATES was = dt(tg).state;
+                    stateOf(dt(tg), D3D12_RESOURCE_STATE_COPY_SOURCE);
                     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                     dst.pResource = sv.readback;
                     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     dst.PlacedFootprint = sv.fp;
-                    src.pResource = tg.colour;
+                    src.pResource = dt(tg).colour;
                     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                    stateOf(tg, was);
+                    stateOf(dt(tg), was);
                     afterSaves.push_back(sv);
                 }
             }
@@ -9087,7 +10144,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     s.index = index;
                     s.w = tg.w;
                     s.h = tg.h;
-                    D3D12_RESOURCE_DESC td = tg.colour->GetDesc();
+                    D3D12_RESOURCE_DESC td = dt(tg).colour->GetDesc();
                     UINT64 total = 0;
                     g.device->GetCopyableFootprints(&td, 0, 1, 0, &s.fp, nullptr, nullptr, &total);
                     const D3D12_HEAP_PROPERTIES back = heap(D3D12_HEAP_TYPE_READBACK);
@@ -9095,16 +10152,16 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     if (SUCCEEDED(g.device->CreateCommittedResource(&back, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                                     IID_PPV_ARGS(&s.readback))))
                     {
-                        const D3D12_RESOURCE_STATES was = tg.state;
-                        stateOf(tg, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        const D3D12_RESOURCE_STATES was = dt(tg).state;
+                        stateOf(dt(tg), D3D12_RESOURCE_STATE_COPY_SOURCE);
                         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                         dst.pResource = s.readback;
                         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                         dst.PlacedFootprint = s.fp;
-                        src.pResource = tg.colour;
+                        src.pResource = dt(tg).colour;
                         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                         g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                        stateOf(tg, was);
+                        stateOf(dt(tg), was);
                         afterSaves.push_back(s);
                     }
                 }
@@ -9130,10 +10187,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     it = g.targets.find(want);
                 k = *end == ',' ? end + 1 : end;
             }
-            if (it != g.targets.end() && it->second.colour && !it->second.main)
+            if (it != g.targets.end() && it->second.id && !it->second.main)
             {
                 saved = &it->second;
-                D3D12_RESOURCE_DESC td = saved->colour->GetDesc();
+                D3D12_RESOURCE_DESC td = dt(*saved).colour->GetDesc();
                 UINT64 total = 0;
                 g.device->GetCopyableFootprints(&td, 0, 1, 0, &savedFp, nullptr, nullptr, &total);
                 const D3D12_HEAP_PROPERTIES back = heap(D3D12_HEAP_TYPE_READBACK);
@@ -9141,12 +10198,12 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 if (SUCCEEDED(g.device->CreateCommittedResource(&back, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                                 IID_PPV_ARGS(&savedReadback))))
                 {
-                    stateOf(*saved, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    dev.use(saved->id, gfx::UseFor::CopySource);
                     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                     dst.pResource = savedReadback;
                     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     dst.PlacedFootprint = savedFp;
-                    src.pResource = saved->colour;
+                    src.pResource = dt(*saved).colour;
                     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 }
@@ -9159,8 +10216,8 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             // (TODO 99 check: the frame's rings - used of their room - what was left out for want of room so far, and the
             // views rewritten under a frame's use so far)
             std::fprintf(stderr, "[native render] rings: constants %llu of %llu, instances %u of %u, vertices %llu of %llu KB; slot %u; full %llu, views rewritten %llu; clipping triangles left out %llu, passes %llu\n",
-                         static_cast<unsigned long long>((ring - g.slot * kConstantRing) / kConstantStride),
-                         static_cast<unsigned long long>(kConstantRing / kConstantStride), instAt - g.slot * kInstanceRing, kInstanceRing,
+                         static_cast<unsigned long long>((g.ringConstantsAt - g.slot * kConstantRing) / kConstantStride),
+                         static_cast<unsigned long long>(kConstantRing / kConstantStride), g.ringInstanceAt - g.slot * kInstanceRing, kInstanceRing,
                          static_cast<unsigned long long>((g.dynamicUsed - g.slot * kDynamicRing) >> 10),
                          static_cast<unsigned long long>(kDynamicRing >> 10), g.slot, static_cast<unsigned long long>(g_ringFull),
                          static_cast<unsigned long long>(g_srvRewrites), static_cast<unsigned long long>(g_clipCulled[0]),
@@ -9170,7 +10227,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         {
             // (No 2D over the 3D this frame: the anti-aliasing pass over the whole picture now.)
             auto aaT = prof::clock::now();
-            if (runAa(picture, ring, ringEnd))
+            if (runAa(picture))
                 aaAt = input.draws.size();
             aaDone = true;
             g_aaCpu += prof::since(aaT);
@@ -9189,9 +10246,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // <shot>_noaa.bmp, without the 2D drawn after it.)
         ID3D12Resource *aaReadback = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT aaFp{};
-        if (aaDone && aaAt && !shotPath.empty() && std::getenv("TF_NATIVE_AASAVE") && g.aaSource)
+        if (aaDone && aaAt && !shotPath.empty() && std::getenv("TF_NATIVE_AASAVE") && aa::source)
         {
-            D3D12_RESOURCE_DESC td = g.aaSource->GetDesc();
+            State::DeviceTarget &aaSrc = dt(aa::source);
+            D3D12_RESOURCE_DESC td = aaSrc.colour->GetDesc();
             UINT64 total = 0;
             g.device->GetCopyableFootprints(&td, 0, 1, 0, &aaFp, nullptr, nullptr, &total);
             const D3D12_HEAP_PROPERTIES back = heap(D3D12_HEAP_TYPE_READBACK);
@@ -9199,18 +10257,19 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (SUCCEEDED(g.device->CreateCommittedResource(&back, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                             IID_PPV_ARGS(&aaReadback))))
             {
-                transition(g.aaSource, g.aaState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                const D3D12_RESOURCE_STATES was = aaSrc.state;
+                stateOf(aaSrc, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
                 dst.pResource = aaReadback;
                 dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 dst.PlacedFootprint = aaFp;
-                src.pResource = g.aaSource;
+                src.pResource = aaSrc.colour;
                 src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                transition(g.aaSource, D3D12_RESOURCE_STATE_COPY_SOURCE, g.aaState);
+                stateOf(aaSrc, was);
             }
         }
-        stateOf(picture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        dev.use(picture.id, gfx::UseFor::Draw);
         passMark(6u);
         if (g.passQueries && !g.passKinds[g.slot].empty())
             g.list->ResolveQueryData(g.passQueries, D3D12_QUERY_TYPE_TIMESTAMP, g.slot * State::kPassMarks, static_cast<UINT>(g.passKinds[g.slot].size()),
@@ -9512,8 +10571,8 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 g.preList->Reset(g.preAllocators[g.slot], nullptr);
                 barrier(g.preList, g.constantsV, g.constantsVReadable ? D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER : D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_DEST);
-                if (ring > from)
-                    g.preList->CopyBufferRegion(g.constantsV, from, g.constants, from, ring - from);
+                if (g.ringConstantsAt > from)
+                    g.preList->CopyBufferRegion(g.constantsV, from, g.constants, from, g.ringConstantsAt - from);
                 barrier(g.preList, g.constantsV, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 g.constantsVReadable = true;
                 g.preList->Close();
@@ -9714,7 +10773,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 for (auto &[key, tg] : g.targets)
                 {
                     UINT64 b = 0;
-                    for (ID3D12Resource *r : {tg.colour, tg.depth, tg.destCopy})
+                    for (ID3D12Resource *r : {dt(tg).colour, dt(tg).depth, dt(tg).destCopy})
                         if (r)
                         {
                             const D3D12_RESOURCE_DESC rd = r->GetDesc();
@@ -10042,4 +11101,10 @@ namespace nr
         static D3d12Backend b;
         return b;
     }
+}
+
+namespace nr::gfx
+{
+    // (P3 S3) The device in use: Direct3D 12 today.
+    Device &device() { return nr::d3d::d3d12Device(); }
 }

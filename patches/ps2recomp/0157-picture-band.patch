@@ -1,0 +1,87 @@
+Subject: [PATCH] A band of the picture shown at its own shape (movies letterboxed inside the frame, as large as the window allows)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_display.h b/ps2xRuntime/include/runtime/ps2_host_display.h
+index a41f5fb..5ef4bb0 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_display.h
++++ b/ps2xRuntime/include/runtime/ps2_host_display.h
+@@ -89,6 +89,11 @@ namespace ps2_host_display
+     void setGameAspect(float widthOverHeight); // 0: the game says nothing (4:3)
+     // The shape to show the picture in (width / height), or 0 for square pixels.
+     float displayAspect();
++    // A band of the picture's rows to show instead of all of it (fractions of its height, top < bottom), filling the
++    // window at the band's own shape (displayAspect / (bottom - top)): a movie drawn letterboxed inside the frame shown
++    // as large as the window allows. 0, 1 (the default): the whole picture.
++    void setPictureBand(float top, float bottom);
++    void pictureBand(float &top, float &bottom);
+     // PS2X_WIDESCREEN=1: the console's TV setting is 16:9 (what GetOsdConfigParam reports),
+     // so that a game with a widescreen mode starts in it.
+     bool widescreenTv();
+diff --git a/ps2xRuntime/src/lib/ps2_host_display.cpp b/ps2xRuntime/src/lib/ps2_host_display.cpp
+index a4b888a..bbed1c0 100644
+--- a/ps2xRuntime/src/lib/ps2_host_display.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_display.cpp
+@@ -626,6 +626,25 @@ namespace ps2_host_display
+         g_gameAspect.store(widthOverHeight, std::memory_order_relaxed);
+     }
+ 
++    namespace
++    {
++        std::atomic<float> g_bandTop{0.0f}, g_bandBottom{1.0f};
++    }
++
++    void setPictureBand(float top, float bottom)
++    {
++        if (!(top >= 0.0f && bottom <= 1.0f && bottom - top > 0.05f))
++            top = 0.0f, bottom = 1.0f;
++        g_bandTop.store(top, std::memory_order_relaxed);
++        g_bandBottom.store(bottom, std::memory_order_relaxed);
++    }
++
++    void pictureBand(float &top, float &bottom)
++    {
++        top = g_bandTop.load(std::memory_order_relaxed);
++        bottom = g_bandBottom.load(std::memory_order_relaxed);
++    }
++
+     float displayAspect()
+     {
+         // PS2X_ASPECT: -1 = not given.
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 89262ae..edd6bee 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3646,10 +3646,14 @@ void PS2Runtime::run()
+             // for pixel: 4:3, or 16:9 while the game draws for a widescreen TV
+             // (ps2_host_display::displayAspect).
+             const float displayAspect = ps2_host_display::displayAspect();
+-            const float aspect = displayAspect > 0.0f ? displayAspect : srcWidth / srcHeight;
++            // (ps2_host_display::setPictureBand) Only a band of the picture's rows, at its own shape.
++            float bandTop = 0.0f, bandBottom = 1.0f;
++            ps2_host_display::pictureBand(bandTop, bandBottom);
++            const float band = bandBottom - bandTop;
++            const float aspect = (displayAspect > 0.0f ? displayAspect : srcWidth / srcHeight) / band;
+             const float dstWidth = std::min(screenWidth, screenHeight * aspect);
+             const float dstHeight = dstWidth / aspect;
+-            const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
++            const Rectangle srcRect{0.0f, bandTop * srcHeight, srcWidth, band * srcHeight};
+             const Rectangle dstRect{
+                 (screenWidth - dstWidth) * 0.5f,
+                 (screenHeight - dstHeight) * 0.5f,
+@@ -3665,7 +3669,7 @@ void PS2Runtime::run()
+             {
+                 // The game's own renderer's picture (ps2_host_display::setPictureProvider).
+                 const Texture2D provided{providedTexture, providedWidth, providedHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                const Rectangle providedSource{0.0f, 0.0f, static_cast<float>(providedWidth), static_cast<float>(providedHeight)};
++                const Rectangle providedSource{0.0f, bandTop * static_cast<float>(providedHeight), static_cast<float>(providedWidth), band * static_cast<float>(providedHeight)};
+                 DrawTexturePro(provided, providedSource, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+             }
+             else if (ps2_gpu::viewActive() &&
+@@ -3673,7 +3677,7 @@ void PS2Runtime::run()
+             {
+                 // The GPU renderer's picture (PS2X_GPU=1, F7): a texture of its shared context.
+                 const Texture2D gpuTexture{gpuPicture.texture, gpuPicture.textureWidth, gpuPicture.textureHeight, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                const Rectangle gpuSource{0.0f, 0.0f, static_cast<float>(gpuPicture.width), static_cast<float>(gpuPicture.height)};
++                const Rectangle gpuSource{0.0f, bandTop * static_cast<float>(gpuPicture.height), static_cast<float>(gpuPicture.width), band * static_cast<float>(gpuPicture.height)};
+                 DrawTexturePro(gpuTexture, gpuSource, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+             }
+             else

@@ -69,6 +69,7 @@ namespace nr::draw
         float clipRowsB[16]; // (N9 stage 3: clipRows in the frame before's pose)
         float pose[4];       // (N9 stage 3: x the camera's turn applies, y the vertices' frame-before stream)
         float lightsB[12];   // (N9 stage 3: p[8..10] of 0x21f0 in the frame before's pose)
+        float clipRowsM[16]; // (TODO 101 a: clipRows halfway between the two poses, along the turn - nr_passes.cpp midPose)
     };
     // (N9 stage 3) The picture's constants (the shaders' b1): where it lies between the frame before's pose and this
     // frame's, the camera's turn.

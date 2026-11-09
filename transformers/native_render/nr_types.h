@@ -509,6 +509,7 @@ namespace nr
     {
         float matrix[16] = {};
         float matrixB[16] = {}; // (N9 stage 3: the frame before's pose of `matrix` - the same when the draw does not move)
+        float matrixM[16] = {}; // (TODO 101 a: the pose halfway between them along its turn, midPose - the GPU's curve runs through it)
         std::shared_ptr<const Texture> texture;
         std::shared_ptr<const Texture> fogPalette; // (the depth fog: nr_types Draw::fogPalette)
         std::shared_ptr<const Texture> topPalette; // (a T8H read of a render target: Draw::topPalette)
@@ -524,10 +525,16 @@ namespace nr
         bool clips = false;
         float clip[4][4] = {};
         float clipB[4][4] = {}; // (N9 stage 3: the frame before's pose of it)
+        float clipM[4][4] = {}; // (TODO 101 a: halfway, as matrixM)
         float lightsB[3][4] = {}; // (N9 stage 3: p[8..10] - the lights and eye in the mesh's space, 0x21f0 - in that pose)
         bool turned = false;    // (N9 stage 3: the camera's turn of each picture applies - Draw::turned)
     };
     void buildPasses(const Draw &draw, std::vector<Pass> &out);
+    // (TODO 101 a) The pose halfway between a draw's two (16 floats, rows: the images of the model's axes and its origin):
+    // the axes turned by half the turn between them - not their average, which shortens an axis that turns - the origin
+    // halfway. False when the turn is over 60 degrees in a frame: no pose of the same thing (a part snapped round), to be
+    // drawn as it is now. Degenerate rows (an axis scaled away) give the average.
+    bool midPose(const float *b, const float *a, float *m);
 
     // The grass the ground's second draw grows (nr_grass.cpp): blades as screen-space sprites.
     std::shared_ptr<Mesh> grassBlades(const Mesh &ground, const Qword *block, uint64_t id);

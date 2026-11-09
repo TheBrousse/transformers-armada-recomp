@@ -58,6 +58,23 @@ namespace revisit_music
         constexpr float kCliff[3] = {336.888f, 1157.54f, -16.0233f};
 
         PS2Runtime::RecompiledFunction g_strip = nullptr, g_filter = nullptr, g_waiting = nullptr;
+        // (TF_EVENT_TRACE=1, a test aid - TODO 199: every named game event as it fires, taEvent::Fire 0x2B5C50,
+        // with its caller: which cutscenes and level events a stretch of play set off)
+        constexpr uint32_t kFire = 0x002B5C50u;
+        PS2Runtime::RecompiledFunction g_fire = nullptr;
+        // (with it, TODO 199: Starscream's hits and his slot 20, which marks him dead and fires CS_DefeatedStarscream)
+        constexpr uint32_t kTakeDamage = 0x00297C70u, kStarscreamDead = 0x0048A1A0u, kStarscreamVtable = 0x006C07F0u;
+        PS2Runtime::RecompiledFunction g_takeDamage = nullptr, g_starscreamDead = nullptr;
+        // (TF_HIT_STARSCREAM=<damage>, with TF_EVENT_TRACE: when his intro ends (TA_AUTOSAVE) Starscream takes one hit of
+        // that much through his own hit slot 7 (0x48A880), as a player's shot lands - the one-hit-kills test without aiming)
+        constexpr uint32_t kStarscreamHit = 0x0048A880u;
+        PS2Runtime::RecompiledFunction g_starscreamHit = nullptr;
+        uint32_t g_starscream = 0u;
+        float g_hitAmount = 0.0f;
+        uint64_t g_hitDelay = 0u, g_autosaveTick = 0u; // (amount@ticks: the hit that many VBlanks after the intro's end)
+        constexpr uint32_t kStarscreamUpdate = 0x0048D7D0u;
+        PS2Runtime::RecompiledFunction g_starscreamUpdate = nullptr;
+        uint32_t g_lastFlags = 0u; float g_lastHealth = -2.0f; int g_flagLines = 0;
         bool g_on = true;
         bool g_fixLevel = false; // this level: a finished Antarctica, the fix on
         bool g_trim = false;     // trigger 201 kept: its voice event still to be taken out
@@ -186,6 +203,114 @@ namespace revisit_music
             g_waiting(rdram, ctx, runtime);
         }
 
+        float health(const uint8_t *rdram, uint32_t actor)
+        {
+            const uint32_t creature = word(rdram, actor + 8u);
+            return creature ? fword(rdram, creature + 0x28u) : -1.0f;
+        }
+
+        // One hit on Starscream through his hit slot 7: the damage details on the guest's stack below its sp
+        // (taDamageDetails' defaults: direction +x, kind 1, type -1, the amount at +0x54, scale 1 at +0x58), the
+        // registers put back after.
+        void testHit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (g_hitAmount <= 0.0f || !g_starscream || !g_starscreamHit)
+                return;
+            const R5900Context saved = *ctx;
+            const uint32_t details = (getRegU32(ctx, 29) - 0x200u) & ~0xFu;
+            if (uint8_t *d = getMemPtr(rdram, details))
+            {
+                std::memset(d, 0, 0x60u);
+                const float one = 1.0f, amount = g_hitAmount;
+                const uint32_t kind = 1u, type = 0xFFFFFFFFu;
+                std::memcpy(d + 0x20u, &one, 4u);
+                std::memcpy(d + 0x40u, &kind, 4u);
+                std::memcpy(d + 0x44u, &type, 4u);
+                std::memcpy(d + 0x54u, &amount, 4u);
+                std::memcpy(d + 0x58u, &one, 4u);
+                SET_GPR_U32(ctx, 29, details - 0x80u);
+                SET_GPR_U32(ctx, 4, g_starscream);
+                SET_GPR_U32(ctx, 5, details);
+                const uint32_t creature = word(rdram, g_starscream + 8u);
+                std::fprintf(stderr, "[event] Starscream (actor %08x, creature %08x, flags %08x) given a test hit of %.1f\n", g_starscream, creature, creature ? word(rdram, creature + 0xD8u) : 0u, amount);
+                g_starscreamHit(rdram, ctx, runtime);
+            }
+            *ctx = saved;
+            g_hitAmount = 0.0f;
+        }
+
+        void fire(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc == kFire)
+            {
+                const uint32_t event = getRegU32(ctx, 4);
+                std::fprintf(stderr, "[event] tick %llu: %s fired (from %08x)\n",
+                             static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed)),
+                             stdString(rdram, event + 4u).c_str(), getRegU32(ctx, 31));
+            }
+            const bool autosave = ctx->pc == kFire && g_starscream && stdString(rdram, getRegU32(ctx, 4) + 4u) == "TA_AUTOSAVE";
+            g_fire(rdram, ctx, runtime);
+            if (autosave)
+            {
+                g_autosaveTick = runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed);
+                if (g_hitDelay == 0u)
+                    testHit(rdram, ctx, runtime);
+            }
+        }
+
+        void takeDamage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t actor = getRegU32(ctx, 4), details = getRegU32(ctx, 5);
+            const bool his = ctx->pc == kTakeDamage && word(rdram, actor) == kStarscreamVtable;
+            const float before = his ? health(rdram, actor) : 0.0f;
+            const uint64_t tick = runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed);
+            const uint32_t ra = getRegU32(ctx, 31);
+            g_takeDamage(rdram, ctx, runtime);
+            if (his)
+                std::fprintf(stderr, "[event] tick %llu: Starscream hit: %.1f damage, kind %u type %d, health %.1f -> %.1f (from %08x)\n",
+                             static_cast<unsigned long long>(tick), fword(rdram, details + 0x54u), word(rdram, details + 0x40u),
+                             static_cast<int>(word(rdram, details + 0x44u)), before, health(rdram, actor), ra);
+        }
+
+        void starscreamDead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc == kStarscreamDead)
+            {
+                const uint32_t actor = getRegU32(ctx, 4);
+                g_starscream = actor;
+                std::fprintf(stderr, "[event] tick %llu: Starscream slot 20 (%u), marked %u, health %.1f (from %08x)\n",
+                             static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed)),
+                             getRegU32(ctx, 5) & 0xFFu, rdram[actor + 0x10u], health(rdram, actor), getRegU32(ctx, 31));
+            }
+            g_starscreamDead(rdram, ctx, runtime);
+        }
+
+        // Starscream's frame (Update 0x48D7D0): his creature's state flags (+0xD8; 0x800 robot) and health when they
+        // change, and the delayed test hit
+        void starscreamUpdate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc == kStarscreamUpdate)
+            {
+                const uint32_t actor = getRegU32(ctx, 4), creature = word(rdram, actor + 8u);
+                const uint64_t tick = runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed);
+                const uint32_t flags = creature ? word(rdram, creature + 0xD8u) : 0u;
+                const float hp = health(rdram, actor);
+                if ((flags != g_lastFlags || hp != g_lastHealth) && g_flagLines < 300)
+                {
+                    ++g_flagLines;
+                    std::fprintf(stderr, "[event] tick %llu: Starscream flags %08x health %.1f marked %u\n", static_cast<unsigned long long>(tick), flags, hp, rdram[actor + 0x10u]);
+                    g_lastFlags = flags, g_lastHealth = hp;
+                }
+                if (g_hitDelay && g_autosaveTick && tick >= g_autosaveTick + g_hitDelay)
+                {
+                    g_hitDelay = 0u;
+                    g_starscream = actor;
+                    testHit(rdram, ctx, runtime);
+                }
+            }
+            g_starscreamUpdate(rdram, ctx, runtime);
+        }
+
         void hook(PS2Runtime &runtime, uint32_t address, PS2Runtime::RecompiledFunction &original, PS2Runtime::RecompiledFunction fn)
         {
             if ((original = runtime.lookupFunction(address)) != nullptr)
@@ -202,5 +327,19 @@ namespace revisit_music
         hook(runtime, kStrip, g_strip, strip);
         hook(runtime, kFilter, g_filter, filter);
         hook(runtime, kWaiting, g_waiting, waiting);
+        if (const char *e = std::getenv("TF_EVENT_TRACE"); e && *e == '1')
+        {
+            hook(runtime, kFire, g_fire, fire);
+            hook(runtime, kTakeDamage, g_takeDamage, takeDamage);
+            hook(runtime, kStarscreamDead, g_starscreamDead, starscreamDead);
+            g_starscreamHit = runtime.lookupFunction(kStarscreamHit);
+            hook(runtime, kStarscreamUpdate, g_starscreamUpdate, starscreamUpdate);
+            if (const char *h = std::getenv("TF_HIT_STARSCREAM"))
+            {
+                g_hitAmount = static_cast<float>(std::atof(h));
+                if (const char *at = std::strchr(h, '@'))
+                    g_hitDelay = std::strtoull(at + 1, nullptr, 10);
+            }
+        }
     }
 }

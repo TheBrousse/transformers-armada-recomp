@@ -299,6 +299,7 @@ namespace nr::warp
             bool active = false;       // a tunnel shown natively
             bool ending = false;       // (the game's own frames came back)
             uint32_t number = 0u;      // tunnels so far
+            uint32_t declinedTold = 0u; // (TODO 185 b: the tunnel whose run left to VU1 was logged)
             int64_t startNs = 0, lastRunNs = 0;
             uint64_t runs = 0u;
             float seed = 0.0f;
@@ -853,15 +854,29 @@ namespace nr::warp
         static const uint32_t first = 0x09030014u; // (ILW.x vi03, 20(vi00) - the program's first pair's lower)
         uint32_t lower = 0u;
         std::memcpy(&lower, run.code, 4u);
-        if (lower != first || hashBytes(run.code, kCodeBytes) != kCodeHash)
+        // (TODO 185 b) A run of the program left to the microcode while a tunnel is drawn natively: the program then
+        // runs on data memory the native steps never kept (only qw20 and 1022 are), so its packets are not its own.
+        // Logged once a tunnel, with why, so a freeze in a tunnel names its cause.
+        const auto declined = [&](const char *why) {
+            std::lock_guard<std::mutex> lock(g_s.mutex);
+            if (g_s.active && g_s.declinedTold != g_s.number)
+            {
+                g_s.declinedTold = g_s.number;
+                std::fprintf(stderr, "[native warp] tunnel %u: a run of its program left to VU1 (%s)\n", g_s.number, why);
+            }
             return false;
+        };
+        if (lower != first)
+            return false;
+        if (hashBytes(run.code, kCodeBytes) != kCodeHash)
+            return declined("its code changed");
         if (checking())
         {
             check(run.data);
             return false;
         }
         if (ps2_host_display::emulatedDrawing() || !d3d::drawsPictures())
-            return false; // (the GS draws: the program's packets are its pictures)
+            return declined("the GS draws"); // (the GS draws: the program's packets are its pictures)
         uint8_t *data = run.data;
         auto word = [&](uint32_t q, uint32_t l) {
             uint32_t v;

@@ -43,7 +43,10 @@ struct ExtendedLimit {
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const JOB_OBJECT_BASIC_PROCESS_ID_LIST: i32 = 3;
 const SYNCHRONIZE: u32 = 0x0010_0000;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+const INFINITE: u32 = 0xFFFF_FFFF;
 const PROCESS_TERMINATE: u32 = 0x0000_0001;
 const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
 const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
@@ -59,6 +62,9 @@ unsafe extern "system" {
     fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
     fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     fn CloseHandle(handle: Handle) -> i32;
+    fn QueryInformationJobObject(job: Handle, class: i32, info: *mut c_void, length: u32, returned: *mut u32) -> i32;
+    fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
+    fn QueryFullProcessImageNameW(process: Handle, flags: u32, name: *mut u16, size: *mut u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -120,6 +126,25 @@ impl ProcessTree {
         }
     }
 
+    /// The processes in the job now (empty when it is not a job): what the first one started and did not let leave
+    /// the job - the game started again by itself, a setting's or a mod's restart.
+    pub fn processes(&self) -> Vec<u32> {
+        if self.job.is_null() {
+            return Vec::new();
+        }
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids (ULONG_PTR each)
+        let mut buffer = vec![0usize; 2 + 64];
+        unsafe {
+            let ok = QueryInformationJobObject(self.job, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buffer.as_mut_ptr().cast(),
+                                               (buffer.len() * std::mem::size_of::<usize>()) as u32, std::ptr::null_mut()) != 0;
+            if !ok {
+                return Vec::new();
+            }
+            let listed = (*(buffer.as_ptr().cast::<u32>().add(1))) as usize;
+            buffer[1..1 + listed.min(64)].iter().map(|&pid| pid as u32).collect()
+        }
+    }
+
     /// Ends the process and everything it started (or only the process, when it is not in a job).
     pub fn terminate(&self) {
         unsafe {
@@ -141,6 +166,36 @@ impl Drop for ProcessTree {
         if !self.job.is_null() {
             unsafe { CloseHandle(self.job) };
         }
+    }
+}
+
+/// Waits for a process to end and gives its exit code (None when it cannot be opened: already gone).
+pub fn wait_for_exit(pid: u32) -> Option<i32> {
+    unsafe {
+        let process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        WaitForSingleObject(process, INFINITE);
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(process, &mut code) != 0;
+        CloseHandle(process);
+        ok.then_some(code as i32)
+    }
+}
+
+/// Whether a process is the console host Windows starts for a console program (it ends with the last one).
+pub fn is_console_host(pid: u32) -> bool {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut name = vec![0u16; 1024];
+        let mut size = name.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut size) != 0;
+        CloseHandle(process);
+        ok && String::from_utf16_lossy(&name[..size as usize]).to_ascii_lowercase().ends_with("\\conhost.exe")
     }
 }
 

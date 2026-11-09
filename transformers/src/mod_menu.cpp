@@ -8,6 +8,7 @@
 #include "menu_style.h"
 #include "menu_mouse.h"
 #include "small_crosshair.h"
+#include "boss_cheat.h"
 #include "distance_meter.h"
 #include "port_ext.h"
 #include "dev_tree.h"
@@ -2463,6 +2464,7 @@ namespace mod_menu
         updates::addSettings(); // About: checking for updates automatically (updates.h)
         menu_mouse::addSettings(); // Controls: the mouse in the pause menu (menu_mouse.h)
         distance_meter::addSettings(); // Mods & cheats: the prototype's distance meter (distance_meter.h)
+        boss_cheat::addSettings(); // Mods & cheats: one-hit kills on bosses (boss_cheat.h, TODO 199)
         speedrun_timer::addSettings(); // Display, On screen: the speedrun timer (speedrun_timer.h)
         start_screens::addSettings();  // Gameplay: what the game shows from boot to its main menu (start_screens.h, TODO 110)
         {

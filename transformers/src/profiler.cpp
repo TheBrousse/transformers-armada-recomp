@@ -880,7 +880,9 @@ namespace
     // VBlank period), every host thread's stack, a minidump (stacks and the memory they point at)
     // and the guest's RAM go to runs\hang_<n>_* - once a freeze, and when the frames come back it
     // says after how long. TF_WATCHDOG=0 turns it off. A crash writes runs\crash_<time>.dmp too.
+    // While a level loads (0x6CD324 set) it waits kLoadHangSeconds instead (TODO 185 b).
     constexpr int kHangSeconds = 6;
+    constexpr int kLoadHangSeconds = 20; // (the longest load seen: ~5 s; a fast load ~1 s)
     std::atomic<uint64_t> g_gameFrames{0};
 
     std::filesystem::path runsDir()
@@ -965,13 +967,18 @@ namespace
             }
             if (frozen || frames == 0u || now - changed < std::chrono::seconds(kHangSeconds))
                 continue;
-            // (a level loading: the game sets 0x6CD324 while it does - a long load is no freeze)
-            if (const uint8_t *rdram = g_tfRuntime->memory().getRDRAM(); rdram && rdram[0x006CD324u] != 0u)
+            // (a level loading: the game sets 0x6CD324 while it does - a long load is no freeze; but a load with no
+            // frame for kLoadHangSeconds is: TODO 185 b froze in a warp tunnel, where this test kept the dump away)
+            const bool loading = [] {
+                const uint8_t *rdram = g_tfRuntime->memory().getRDRAM();
+                return rdram && rdram[0x006CD324u] != 0u;
+            }();
+            if (loading && now - changed < std::chrono::seconds(kLoadHangSeconds))
                 continue;
             frozen = true;
             ++count;
             const std::string name = "hang_" + std::to_string(count) + "_" + stamp();
-            std::fprintf(stderr, "[tf] watchdog: no game frame for %d s (frame %llu) - %s\n", kHangSeconds,
+            std::fprintf(stderr, "[tf] watchdog: no game frame for %d s%s (frame %llu) - %s\n", loading ? kLoadHangSeconds : kHangSeconds, loading ? ", in a load" : "",
                          static_cast<unsigned long long>(frames), name.c_str());
             logKernelState("watchdog");
             logAllThreads("watchdog");

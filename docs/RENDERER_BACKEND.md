@@ -183,6 +183,14 @@ in the same range on the same PC.
 The same routes and comparison are what each step of the split itself is checked with: before and after a step, the
 Direct3D 12 pictures must be identical bit for bit (`native_compare.py` reporting PSNR inf on every picture).
 
+A caveat on the cold-boot routes (1 and 2): they are not repeatable from run to run, even with the same build. While
+loading, the game's clock and the renderer's pace can line up two ways. The HQ's idle animations land a frame apart,
+and the Amazon pictures take one of two outcomes, decided by whether the game waits about 66 ms on its clock right
+after the level's load (the same pipelines are made either way). So for bit-for-bit checks use save states: the HQ
+from a state in the HQ (its ring and its options screen) in place of the cold boot, and the levels from the check
+states. Use the cold boot only to see that the route still plays, and compare its pictures against several runs of
+the reference build, not one.
+
 ## 9. The split, step by step
 
 - **S1** - `nr_backend.h`: the interface as one abstract type, and API-neutral types for what the shared half passes
@@ -193,6 +201,59 @@ Direct3D 12 pictures must be identical bit for bit (`native_compare.py` reportin
 - **S3** - `render()` is split: the walk over the draw list (targets by frame register, the order of passes, the field
   weave, the glow, the anti-aliasing decision, the pictures and their hand-over) becomes shared code that only calls
   the interface; `nr_d3d.cpp` keeps the Direct3D 12 calls as the interface's implementation.
+  The narrow device interface is `nr_device.h` (`nr::gfx::Device`), done in sub-steps, each bit-identical:
+  (1) targets: the Direct3D 12 device owns the targets' surfaces, views and states; `render()` keys them by GS
+  address and reaches them only by `gfx::TargetId` (create, resize, release, clear, use, view, snapshot). The
+  picture is a target of its own (`TargetDesc::shared`), its surfaces the window's. (2) textures, meshes and the
+  rings: the device owns textures (`gfx::TextureId` is opaque; the device maps it to its own view), meshes (by id) and
+  the frame's rings; `render()` makes the mip chains, keeps its textures and meshes by the game's ids, and writes its
+  per-draw data where `ringAlloc` points. Three calls were added to the approved draft so that the step stays a pure
+  refactor:
+  - `uploadTextureLater(texture, source, urgent)`: the texture is made and uploaded off the drawing thread when the
+    device gets to it, its texels read from `source` then (gone by then: skipped; a failed upload is tried again while
+    the source lives); `urgent` ones (the game's own textures over the frame's budget) go before the large HD images;
+    `textureReady` tells when it can be drawn (until then the shared half draws the game's texture or a stand-in). The
+    Direct3D 12 device does it on a copy queue of its own (the uploader thread: batches of at most 48 MB of staging,
+    an HD image's texels let go of once on the GPU) and writes the texture's view at a frame's start. A Vulkan device
+    does the same on a transfer queue (queue family ownership released to the graphics queue when done), or, without
+    one, synchronously at its next frame start.
+  - `setIndices(span)`: 32-bit indices in a ring (the frame's own meshes: 2D draws, primitives, the ocean, small
+    meshes; the clipped draws' kept triangles).
+  - `ringAlloc(kind, size, align, out)` with `RingKind` Constants (the draws' constants, 256-byte aligned), Instances
+    (the passes' entries, 144 bytes each, read as a per-instance vertex stream; `out.first` is the entry's index, a
+    draw's first instance) and Vertices (vertices and indices made this frame). Each is its own ring, a frame slot's
+    part, begun again with the frame. The Direct3D 12 device writes the constants into an upload heap and, before the
+    frame's list runs, copies the frame's part into video memory (a small list of its own; `TF_NATIVE_CBVRAM`) - the
+    draws read the video memory copy. A Vulkan device can write a host-visible, device-local buffer directly where the
+    GPU offers one (resizable BAR), or keep the same copy with `vkCmdCopyBuffer` and a barrier before the frame.
+  (3) state and the draws: `render()` sets every draw's state and records every draw through the device - target
+  and viewport, scissor, pipeline (a `gfx::PipelineDesc`; the device makes the pipeline the first time it is asked
+  for and keys it by a number of its own), blend factor, the three sampled slots, the draw's constants, the
+  geometry, the draw. The device leaves out a set equal to the last one (`TF_NATIVE_STATEFILTER`: on some GPUs each
+  set is a register write), and forgets what it set when anything recorded around it sets its own (binding a target
+  again forgets all). Four points were added:
+  - `setPipeline` returns false when the pipeline can't be made: the draw is left out, never drawn with the last
+    draw's state.
+  - `setPreviousVertices(span)`: the frame before's vertices of the same mesh, the third vertex stream (the 3D's
+    motion between frames); an empty span is none.
+  - `drawIndirect(groundMesh, firstInstance)`: a ground's grass blades, their count written by the GPU (the device's
+    own compute pass). A Vulkan device: `vkCmdDrawIndexedIndirect` on the same arguments buffer.
+  - `gfx::kKeepTexture` in `bindTextures`: that slot stays bound to what it was. Slots 1 and 2 are read only by the
+    draws that set them (the palette, the target's own copy, the fog's depth).
+  Until sub-step 6 the draw loop stays in `nr_d3d.cpp`, calling only the device for its state and draws; it moves to
+  `nr_frame.cpp` once copies, weave, anti-aliasing and queries go through the device too.
+  (4) copies, the weave and the anti-aliasing: the field weave was already draws (a field copied into the picture
+  is a GS draw that samples the field's target), so it needed nothing new. `copyWhole` copies a target into another
+  of the same size and format. Targets can be made without depth (`TargetDesc::depth = false`) and in the formats the
+  passes need (`RGBA8`, `RG8`, `R8`, `R32Float`; the GS's targets stay `BGRA8`). The passes that are not GS draws are
+  `gfx::Effect`s, set with `setPipeline` (a `PipelineDesc` with `effect` set; its other fields unused) and drawn with
+  `draw(3)` as a full-screen triangle: FXAA, SMAA's three passes, and the warp tunnel's sparks (`Effect::Cloud`: a
+  strip of four a point, the points per instance - the device switches to triangle strips for it and back). The
+  anti-aliasing pass is now the frame builder's: it copies the picture into a target of its own, then draws FXAA, or
+  SMAA's edges, weights and blend, into its targets and back into the picture. SMAA's area and search tables are the
+  effect's own: the device binds them with `Effect::SmaaWeights` (a Vulkan device keeps them as part of the shared
+  shader set's data). The pass's GPU time stamps stay as they are until sub-step 5.
+  Next: queries and stats (time stamps, the occlusion probe and its read-back, predication); publish.
 - **S4** - the window hand-over takes a neutral picture: CPU pixels, or an exported texture with its handle type.
 
 Each step leaves the pictures bit-identical and the frame rate unchanged (section 8).

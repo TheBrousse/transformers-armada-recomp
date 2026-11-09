@@ -14,6 +14,7 @@
 // Alpha modes: 0 the colour's; 1 the distance from a plane (0x3660), 0 to 128.
 #include "nr_types.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -108,7 +109,9 @@ namespace nr
         }
     }
 
-    void buildPasses(const Draw &d, std::vector<Pass> &out)
+    namespace
+    {
+    void buildPassesOf(const Draw &d, std::vector<Pass> &out)
     {
         const ShaderState &sh = d.shader;
         // The lit metal: reflection (context 1), then the lit base (context 2), the GS's order.
@@ -389,5 +392,170 @@ namespace nr
             }
         }
         out.push_back(p);
+    }
+    }
+
+    bool midPose(const float *b, const float *a, float *m)
+    {
+        if (std::memcmp(a, b, 64u) == 0)
+        {
+            std::memcpy(m, a, 64u);
+            return true;
+        }
+        for (int i = 0; i < 16; ++i)
+            m[i] = 0.5f * (a[i] + b[i]); // (the average: the origin's row always, the axes' where no turn is found)
+        double B[3][4], A[3][4];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+                B[r][c] = b[4 * r + c], A[r][c] = a[4 * r + c];
+        // The turn between the poses as it acts on the model's axes: with B = R_b P and A = R_a P (P the camera's, the same
+        // for both), Q = A pinv(B) = R_a R_b^-1 - P need not be known. pinv(B) = B^T (B B^T)^-1.
+        double G[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                double v = 0.0;
+                for (int c = 0; c < 4; ++c)
+                    v += B[i][c] * B[j][c];
+                G[i][j] = v;
+            }
+        const auto det3 = [](const double M[3][3]) {
+            return M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+                   M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+        };
+        const auto inv3 = [&](const double M[3][3], double R[3][3]) {
+            const double d = det3(M);
+            if (!(std::fabs(d) > 0.0))
+                return false;
+            R[0][0] = (M[1][1] * M[2][2] - M[1][2] * M[2][1]) / d;
+            R[0][1] = (M[0][2] * M[2][1] - M[0][1] * M[2][2]) / d;
+            R[0][2] = (M[0][1] * M[1][2] - M[0][2] * M[1][1]) / d;
+            R[1][0] = (M[1][2] * M[2][0] - M[1][0] * M[2][2]) / d;
+            R[1][1] = (M[0][0] * M[2][2] - M[0][2] * M[2][0]) / d;
+            R[1][2] = (M[0][2] * M[1][0] - M[0][0] * M[1][2]) / d;
+            R[2][0] = (M[1][0] * M[2][1] - M[1][1] * M[2][0]) / d;
+            R[2][1] = (M[0][1] * M[2][0] - M[0][0] * M[2][1]) / d;
+            R[2][2] = (M[0][0] * M[1][1] - M[0][1] * M[1][0]) / d;
+            return true;
+        };
+        const double trace = G[0][0] + G[1][1] + G[2][2];
+        double Gi[3][3];
+        if (!(trace > 0.0) || std::fabs(det3(G)) < 1e-9 * trace * trace * trace || !inv3(G, Gi))
+            return true; // (an axis scaled away, or none: the average)
+        double Q[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                double v = 0.0;
+                for (int k = 0; k < 3; ++k)
+                {
+                    double ab = 0.0; // (A B^T)[i][k]
+                    for (int c = 0; c < 4; ++c)
+                        ab += A[i][c] * B[k][c];
+                    v += ab * Gi[k][j];
+                }
+                Q[i][j] = v;
+            }
+        if (!(det3(Q) > 0.0))
+            return true; // (a mirror between the poses: no turn - the average)
+        // Its rotation: the polar decomposition Q = U S, U by Newton's iteration U <- (U + U^-T) / 2.
+        double U[3][3];
+        std::memcpy(U, Q, sizeof(U));
+        for (int it = 0; it < 12; ++it)
+        {
+            double Ui[3][3];
+            if (!inv3(U, Ui))
+                return true;
+            double change = 0.0;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                {
+                    const double v = 0.5 * (U[i][j] + Ui[j][i]);
+                    change = std::max(change, std::fabs(v - U[i][j]));
+                    U[i][j] = v;
+                }
+            if (change < 1e-12)
+                break;
+        }
+        const double cosAngle = std::clamp(0.5 * (U[0][0] + U[1][1] + U[2][2] - 1.0), -1.0, 1.0);
+        if (cosAngle < 0.5)
+            return false; // (over 60 degrees in one frame: no pose of the same thing)
+        // Half the turn: the quaternion's (w >= cos 30 here), its angle halved.
+        const double w = 0.5 * std::sqrt(std::max(0.0, 1.0 + U[0][0] + U[1][1] + U[2][2]));
+        double qx = (U[2][1] - U[1][2]) / (4.0 * w), qy = (U[0][2] - U[2][0]) / (4.0 * w), qz = (U[1][0] - U[0][1]) / (4.0 * w), qw = w;
+        qw += 1.0;
+        const double n = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        qw /= n, qx /= n, qy /= n, qz /= n;
+        const double H[3][3] = {{1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qw * qz), 2.0 * (qx * qz + qw * qy)},
+                                {2.0 * (qx * qy + qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qw * qx)},
+                                {2.0 * (qx * qz - qw * qy), 2.0 * (qy * qz + qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy)}};
+        // Its stretch S = U^T Q halfway (a scale changing: next to never), so the half turn's matrix is H (I + S) / 2.
+        double S[3][3], Qh[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                double v = 0.0;
+                for (int k = 0; k < 3; ++k)
+                    v += U[k][i] * Q[k][j];
+                S[i][j] = v;
+            }
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                double v = 0.0;
+                for (int k = 0; k < 3; ++k)
+                    v += H[i][k] * (0.5 * ((k == j ? 1.0 : 0.0) + S[k][j]));
+                Qh[i][j] = v;
+            }
+        // The axes halfway: Qh B, plus half of what Q B leaves of A (a camera's projection that changed).
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+            {
+                double turned = 0.0, through = 0.0;
+                for (int k = 0; k < 3; ++k)
+                    turned += Qh[r][k] * B[k][c], through += Q[r][k] * B[k][c];
+                m[4 * r + c] = static_cast<float>(turned + 0.5 * (A[r][c] - through));
+            }
+        return true;
+    }
+
+    void buildPasses(const Draw &d, std::vector<Pass> &out)
+    {
+        const size_t first = out.size();
+        buildPassesOf(d, out);
+        // (TODO 101 a) Each pass's pose halfway between its two, along the turn: the GPU's curve through the three (nr_d3d.cpp
+        // `posed`). A turn of over 60 degrees in a frame is no pose: drawn as it is now in every picture. TF_POSES_LINEAR=1:
+        // the average, the straight blend as before (an A/B).
+        static const bool linear = std::getenv("TF_POSES_LINEAR") && *std::getenv("TF_POSES_LINEAR") == '1';
+        for (size_t i = first; i < out.size(); ++i)
+        {
+            Pass &p = out[i];
+            bool posed = true;
+            if (linear)
+                for (int k = 0; k < 16; ++k)
+                    p.matrixM[k] = 0.5f * (p.matrix[k] + p.matrixB[k]);
+            else
+                posed = midPose(p.matrixB, p.matrix, p.matrixM);
+            if (posed && p.clips)
+            {
+                if (linear)
+                    for (int r = 0; r < 4; ++r)
+                        for (int c = 0; c < 4; ++c)
+                            p.clipM[r][c] = 0.5f * (p.clip[r][c] + p.clipB[r][c]);
+                else
+                    posed = midPose(&p.clipB[0][0], &p.clip[0][0], &p.clipM[0][0]);
+            }
+            if (!posed)
+            {
+                std::memcpy(p.matrixB, p.matrix, sizeof(p.matrixB));
+                std::memcpy(p.matrixM, p.matrix, sizeof(p.matrixM));
+                std::memcpy(p.clipB, p.clip, sizeof(p.clipB));
+                std::memcpy(p.clipM, p.clip, sizeof(p.clipM));
+                for (int l = 0; l < 3; ++l)
+                    std::memcpy(p.lightsB[l], p.p[8 + l], sizeof(p.lightsB[l]));
+            }
+            else if (!p.clips)
+                std::memcpy(p.clipM, p.clip, sizeof(p.clipM));
+        }
     }
 }

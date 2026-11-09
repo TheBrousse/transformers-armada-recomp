@@ -502,6 +502,8 @@ namespace nr
                 bool cutNow = false;
                 uint64_t shrinkDraws = 0, shrinkOver[3] = {}; // (TODO 101 a, TF_N9_CHECK) halfway blends that shrink a part
                 double shrinkMax = 0.0;
+                uint64_t shrinkSnapped = 0, shrinkLinearOver = 0; // (TODO 101 a: turns over 60 degrees, not blended; the straight blend's over 1%)
+                double shrinkLinearMax = 0.0;
                 uint64_t checked = 0, near[3] = {}, moved = 0, withB = 0, without = 0, frames = 0, pictures = 0, bIsA = 0, bOther = 0, told = 0;
                 std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
             } g_poses;
@@ -773,27 +775,115 @@ namespace nr
                         {
                             if (!sv.hasB)
                                 continue;
-                            double worst = 0.0, longest = 0.0;
+                            // (TODO 101 a) The shrink of the turn as drawn: the matrix a picture is drawn with, as the operator Op on the
+                            // model's axes that takes field B's rows to it (Op = C pinv(B)) - a turn keeps Op's smallest singular value
+                            // at 1, the straight blend of a turn by an angle a takes it to cos(a / 2) halfway. (On the screen the rows'
+                            // own lengths change with the view - an axis turning towards the eye shortens there - so they are no measure.)
+                            double worst = 0.0, worstLinear = 0.0;
+                            float mid[16];
+                            const bool posed = midPose(sv.b.data(), sv.a.data(), mid);
+                            if (!posed)
+                                ++st.shrinkSnapped;
+                            double B3[3][4], G[3][3], Gi[3][3];
                             for (int r = 0; r < 3; ++r)
-                            {
-                                double l = 0.0;
-                                for (int c = 0; c < 3; ++c)
-                                    l += static_cast<double>(sv.a[4 * r + c]) * sv.a[4 * r + c];
-                                longest = std::max(longest, std::sqrt(l));
-                            }
-                            for (int r = 0; r < 3; ++r)
-                            {
-                                double la = 0.0, lb = 0.0, lm = 0.0;
-                                for (int c = 0; c < 3; ++c)
+                                for (int c = 0; c < 4; ++c)
+                                    B3[r][c] = sv.b[4 * r + c];
+                            for (int i = 0; i < 3; ++i)
+                                for (int j = 0; j < 3; ++j)
                                 {
-                                    const double a = sv.a[4 * r + c], b = sv.b[4 * r + c], m = 0.5 * (a + b);
-                                    la += a * a, lb += b * b, lm += m * m;
+                                    double v = 0.0;
+                                    for (int c = 0; c < 4; ++c)
+                                        v += B3[i][c] * B3[j][c];
+                                    G[i][j] = v;
                                 }
-                                const double want = 0.5 * (std::sqrt(la) + std::sqrt(lb));
-                                // (an axis next to nothing beside the others - a part scaled away - shrinks by nothing one sees)
-                                if (want > 1e-12 && want > 0.1 * longest)
-                                    worst = std::max(worst, 1.0 - std::sqrt(lm) / want);
+                            const auto det3 = [](const double M[3][3]) {
+                                return M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+                                       M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+                            };
+                            const double tr = G[0][0] + G[1][1] + G[2][2], dg = det3(G);
+                            const bool measurable = tr > 0.0 && std::fabs(dg) > 1e-9 * tr * tr * tr;
+                            if (measurable)
+                            {
+                                Gi[0][0] = (G[1][1] * G[2][2] - G[1][2] * G[2][1]) / dg;
+                                Gi[0][1] = (G[0][2] * G[2][1] - G[0][1] * G[2][2]) / dg;
+                                Gi[0][2] = (G[0][1] * G[1][2] - G[0][2] * G[1][1]) / dg;
+                                Gi[1][0] = (G[1][2] * G[2][0] - G[1][0] * G[2][2]) / dg;
+                                Gi[1][1] = (G[0][0] * G[2][2] - G[0][2] * G[2][0]) / dg;
+                                Gi[1][2] = (G[0][2] * G[1][0] - G[0][0] * G[1][2]) / dg;
+                                Gi[2][0] = (G[1][0] * G[2][1] - G[1][1] * G[2][0]) / dg;
+                                Gi[2][1] = (G[0][1] * G[2][0] - G[0][0] * G[2][1]) / dg;
+                                Gi[2][2] = (G[0][0] * G[1][1] - G[0][1] * G[1][0]) / dg;
+                                // The smallest singular value of an operator: the square root of Op^T Op's smallest eigenvalue (the
+                                // symmetric 3x3's, by the trigonometric solution).
+                                const auto sigmaMin = [&](const double C[3][4]) {
+                                    double Op[3][3];
+                                    for (int i = 0; i < 3; ++i)
+                                        for (int j = 0; j < 3; ++j)
+                                        {
+                                            double v = 0.0;
+                                            for (int k = 0; k < 3; ++k)
+                                            {
+                                                double cb = 0.0;
+                                                for (int c = 0; c < 4; ++c)
+                                                    cb += C[i][c] * B3[k][c];
+                                                v += cb * Gi[k][j];
+                                            }
+                                            Op[i][j] = v;
+                                        }
+                                    double M[3][3];
+                                    for (int i = 0; i < 3; ++i)
+                                        for (int j = 0; j < 3; ++j)
+                                        {
+                                            double v = 0.0;
+                                            for (int k = 0; k < 3; ++k)
+                                                v += Op[k][i] * Op[k][j];
+                                            M[i][j] = v;
+                                        }
+                                    const double p1 = M[0][1] * M[0][1] + M[0][2] * M[0][2] + M[1][2] * M[1][2];
+                                    const double q = (M[0][0] + M[1][1] + M[2][2]) / 3.0;
+                                    double lo;
+                                    if (p1 < 1e-30)
+                                        lo = std::min({M[0][0], M[1][1], M[2][2]});
+                                    else
+                                    {
+                                        const double p2 = (M[0][0] - q) * (M[0][0] - q) + (M[1][1] - q) * (M[1][1] - q) + (M[2][2] - q) * (M[2][2] - q) + 2.0 * p1;
+                                        const double pp = std::sqrt(p2 / 6.0);
+                                        double Bm[3][3];
+                                        for (int i = 0; i < 3; ++i)
+                                            for (int j = 0; j < 3; ++j)
+                                                Bm[i][j] = (M[i][j] - (i == j ? q : 0.0)) / pp;
+                                        const double r = std::clamp(det3(Bm) / 2.0, -1.0, 1.0);
+                                        const double phi = std::acos(r) / 3.0;
+                                        lo = q + 2.0 * pp * std::cos(phi + 2.0 * 3.14159265358979323846 / 3.0);
+                                    }
+                                    return std::sqrt(std::max(0.0, lo));
+                                };
+                                double A3[3][4];
+                                for (int r = 0; r < 3; ++r)
+                                    for (int c = 0; c < 4; ++c)
+                                        A3[r][c] = sv.a[4 * r + c];
+                                const double endA = sigmaMin(A3); // (a scale changing between the poses: what the blend should have)
+                                for (const double t : {0.25, 0.5, 0.75})
+                                {
+                                    double C[3][4], L[3][4];
+                                    for (int r = 0; r < 3; ++r)
+                                        for (int c = 0; c < 4; ++c)
+                                        {
+                                            const double a = sv.a[4 * r + c], b = sv.b[4 * r + c], m = mid[4 * r + c];
+                                            C[r][c] = b * (1.0 - t) * (1.0 - 2.0 * t) + m * 4.0 * t * (1.0 - t) + a * t * (2.0 * t - 1.0);
+                                            L[r][c] = b + (a - b) * t;
+                                        }
+                                    const double want = 1.0 + (endA - 1.0) * t;
+                                    if (want > 1e-6)
+                                    {
+                                        if (posed)
+                                            worst = std::max(worst, 1.0 - sigmaMin(C) / want);
+                                        worstLinear = std::max(worstLinear, 1.0 - sigmaMin(L) / want);
+                                    }
+                                }
                             }
+                            st.shrinkLinearOver += worstLinear > 1e-2;
+                            st.shrinkLinearMax = std::max(st.shrinkLinearMax, worstLinear);
                             ++st.shrinkDraws;
                             st.shrinkMax = std::max(st.shrinkMax, worst);
                             static int toldShrink = 0;
@@ -806,6 +896,14 @@ namespace nr
                                              d.mesh->vertices.size(), d.mesh->type, d.mesh->prim, d.target,
                                              sv.carriedB ? "carried (the frame before's field A)" : sv.gameB ? "the game's field B" : "shared",
                                              relDiff(sv.b.data(), sv.a.data()));
+                                std::string rows;
+                                for (int q = 0; q < 16; ++q)
+                                {
+                                    char v[64];
+                                    std::snprintf(v, sizeof(v), " %.6g/%.6g", static_cast<double>(sv.b[q]), static_cast<double>(sv.a[q]));
+                                    rows += v;
+                                }
+                                std::fprintf(stderr, "[n9]   its rows (field B / field A):%s\n", rows.c_str());
                             }
                             st.shrinkOver[0] += worst > 1e-4;
                             st.shrinkOver[1] += worst > 1e-3;
@@ -1125,13 +1223,14 @@ namespace nr
                              100.0 * st.moved / n, static_cast<unsigned long long>(st.bIsA), static_cast<unsigned long long>(st.bOther), static_cast<unsigned long long>(st.carried), static_cast<unsigned long long>(st.notPose), static_cast<unsigned long long>(st.shared), static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.pictures),
                              st.cameraDelta.size(), static_cast<double>(f.fieldBMoment), st.perPictureMs, d3d::gpuPictureMs(), d3d::gpuExtraMs(),
                              d3d::cpuPictureMs(), st.frameBaseMs, static_cast<unsigned long long>(st.probesKept), static_cast<unsigned long long>(st.probesFailed));
-                std::fprintf(stderr, "[n9] camera cuts (frames shown as they are): %llu, %llu of them the camera's jump; halfway blends: %llu draws, a part shorter by over 0.01/0.1/1%%: %llu/%llu/%llu, at most %.3f%%\n",
+                std::fprintf(stderr, "[n9] camera cuts (frames shown as they are): %llu, %llu of them the camera's jump; blends: %llu draws, a part shorter by over 0.01/0.1/1%%: %llu/%llu/%llu, at most %.3f%% (along the turn; %llu turns over 60 degrees not blended; a straight blend: %llu over 1%%, at most %.3f%%)\n",
                              static_cast<unsigned long long>(st.cuts), static_cast<unsigned long long>(st.cutsByTurn),
                              static_cast<unsigned long long>(st.shrinkDraws), static_cast<unsigned long long>(st.shrinkOver[0]),
-                             static_cast<unsigned long long>(st.shrinkOver[1]), static_cast<unsigned long long>(st.shrinkOver[2]), 100.0 * st.shrinkMax);
-                st.cuts = st.cutsByTurn = st.shrinkDraws = 0;
+                             static_cast<unsigned long long>(st.shrinkOver[1]), static_cast<unsigned long long>(st.shrinkOver[2]), 100.0 * st.shrinkMax,
+                             static_cast<unsigned long long>(st.shrinkSnapped), static_cast<unsigned long long>(st.shrinkLinearOver), 100.0 * st.shrinkLinearMax);
+                st.cuts = st.cutsByTurn = st.shrinkDraws = st.shrinkSnapped = st.shrinkLinearOver = 0;
                 std::fill(std::begin(st.shrinkOver), std::end(st.shrinkOver), 0ull);
-                st.shrinkMax = 0.0;
+                st.shrinkMax = st.shrinkLinearMax = 0.0;
                 std::fprintf(stderr, "[n9] meshes made anew each frame: %llu blended from the frame before's, %llu jumped, %llu new\n",
                              static_cast<unsigned long long>(st.vertexCarried), static_cast<unsigned long long>(st.vertexJumped),
                              static_cast<unsigned long long>(st.vertexNew));

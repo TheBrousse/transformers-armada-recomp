@@ -7,6 +7,7 @@
 #include "file_trace.h"
 #include "camera_mode.h"
 #include "dualsense.h"
+#include "boss_cheat.h"
 #include "distance_meter.h"
 #include "hd_movies.h"
 #include "nr_movie.h"
@@ -624,6 +625,18 @@ namespace
             g_skipIntroMovie = game_config::skipIntroMovie(hd_movies::movieKey(movie)); // (the "Intro screens" switch Off)
             ++g_liveFmvStreams;
             g_fmvFrames = 0;
+            // (TODO 255) The movies are 640x384 pictures that the game draws letterboxed in its 640x448 frame (rows 32 to
+            // 416), and the films and logos have 12-row black bars of their own on top: their picture is 640x360, about
+            // 1.66:1 on the console's 4:3 TV. Shown as the whole 4:3 frame, a 16:9 screen got a small picture with black
+            // all round. Now only that band of rows is shown, as large as the window allows at its own shape (the PS2's
+            // 1.66:1, full height on 16:9 and 21:9). The Atari logo has no bars: its band is the 384 rows. With an HD copy
+            // (movies_hd) its own overlay draws instead. TF_MOVIE_BAND=0: the whole 4:3 frame, as before.
+            static const bool band = !(std::getenv("TF_MOVIE_BAND") && *std::getenv("TF_MOVIE_BAND") == '0');
+            if (band)
+            {
+                const bool bars = hd_movies::movieKey(movie) != "NATARI";
+                ps2_host_display::setPictureBand((bars ? 44.0f : 32.0f) / 448.0f, (bars ? 404.0f : 416.0f) / 448.0f);
+            }
             updateDisplayAspect(rdram);
             applyVBlankPeriod(runtime);
         }
@@ -648,6 +661,7 @@ namespace
         if (object && g_liveFmvStreams > 0 && --g_liveFmvStreams == 0)
         {
             hd_movies::movieEnded();
+            ps2_host_display::setPictureBand(0.0f, 1.0f); // (TODO 255: the whole picture again)
             ps2_stubs::clearPadOverrideState();
             updateDisplayAspect(rdram);
             applyVBlankPeriod(runtime);
@@ -1929,6 +1943,10 @@ namespace
     constexpr uint32_t kHalfRate = 0x006CF654u;
     constexpr uint32_t kBetwixtMode = 0x006CD8DCu;
     constexpr uint32_t kDropThreshold = 0x006CD988u; // frames without a margin before 60 drops to 30
+    constexpr uint32_t kGovernorTarget = 0x006CE980u;   // targetRates[0]: the governor's target rate (the main loop sets it)
+    constexpr uint32_t kWantTwoFields = 0x006CD984u;    // the governor's choice: frames of two fields (the console's 30) or one
+    constexpr uint32_t kFramesOfTwoFields = 0x006CF010u; // the governor's "30" flag
+    constexpr uint32_t kCountFromFlipA = 0x006CF014u;   // a frame's VBlank wait counted from the last flip (one field)
     constexpr uint32_t kGameBegin = 0x00294950u;
     constexpr uint32_t kGameEnd = 0x002942E0u;
     constexpr uint32_t kGame = 0x006CF2B8u;             // gp-0x3E38: the taGame (the level)
@@ -4056,6 +4074,21 @@ namespace
             std::memcpy(rdram + kSoundFrameRate, rdram + kConsoleFrameRate, sizeof(float));
             convertLevel(rdram, ctx, runtime, madeAt, 0);
             setViewFields(rdram, 0);
+            // (TODO 221) The governor's target too, and its choice: the main loop sets targetRates[0] when it starts, so the
+            // state kept the PC rate's (124 a second: a frame's period 8 ms) - every frame of the 30's work (~9 ms) looked
+            // late, the governor stayed at one field a frame (wantTwoFields 0, countFromFlipA 1, as the PC rate leaves
+            // them) and the level ran 60 frames a second with the console's 1/30 s a frame: the whole game twice as fast
+            // (the jet bikes' invitation timer, measured 0.5 s apart for its 1 s). Now the console's target (59.94 / 2) and
+            // two fields a frame, as a level begun at 30 has them.
+            {
+                float console = 0.0f;
+                std::memcpy(&console, rdram + kConsoleFrameRate, sizeof(console));
+                const float target = console > 1.0f ? console * 0.5f : 29.97f;
+                std::memcpy(rdram + kGovernorTarget, &target, sizeof(target));
+                rdram[kWantTwoFields] = 1u;
+                rdram[kFramesOfTwoFields] = 1u;
+                rdram[kCountFromFlipA] = 0u;
+            }
             std::fprintf(stderr, "[tf] the level, made at %d frames a second, set up for the console's 30\n", madeAt);
         }
         if (g_frameRate > 30)
@@ -8569,6 +8602,7 @@ namespace
         native_disc::install(runtime);  // TF_NATIVE_DISC=1: TwoFish's disc reads answered on the host (native_disc.cpp)
         native_sound::install(runtime); // TF_NATIVE_SOUND=1: the sound server answered on the EE (native_sound.cpp)
         distance_meter::install(runtime); // the distance meter (distance_meter.cpp)
+        boss_cheat::install(runtime); // one-hit kills leave the bosses' fights to play out (boss_cheat.h, TODO 199)
         start_screens::install(runtime);  // boot straight to the main menu (start_screens.h, TODO 110)
         camera_mode::install(runtime);    // first / third person (camera_mode.cpp)
         photo_mode::install(runtime);     // the free camera, F8 (photo_mode.cpp)
