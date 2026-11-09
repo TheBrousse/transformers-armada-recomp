@@ -31,6 +31,12 @@ namespace pad_speaker
         double g_callUntil = -1e9;  // dialogue streams opened before this are the call's
         int g_callStreams = 0;      // the call's streams playing now
         double g_callSeen = -1e9;   // (a count left over - a stream never ended - is dropped after 90 s)
+        // (TODO 257) The call's messages heard so far: the pause menu's Show Objective plays the last one again, with no
+        // beep and no answer before it - the same file, so it goes to the controller too.
+        std::deque<std::string> g_callFiles;
+        std::atomic<bool> g_levelPaused{false};
+        std::atomic<double> g_unpausedAt{-1e9}; // (Show Objective closes the pause menu, then opens the message: just after)
+        constexpr double kUnpauseWindow = 3.0;
         constexpr double kRingWindow = 30.0;   // s from a beep to the answer
         constexpr double kVoiceWindow = 4.0;   // s from the answer, or a message's end, to the next message
 
@@ -183,11 +189,28 @@ namespace pad_speaker
         std::lock_guard<std::mutex> lock(g_callMutex);
         if (g_callStreams > 0 && now - g_callSeen > 90.0)
             g_callStreams = 0;
-        if (g_callStreams <= 0 && now >= g_callUntil)
+        const bool fromPause = g_levelPaused.load(std::memory_order_relaxed) || now - g_unpausedAt.load(std::memory_order_relaxed) < kUnpauseWindow;
+        const bool again = std::find(g_callFiles.begin(), g_callFiles.end(), f) != g_callFiles.end() || fromPause;
+        if (g_callStreams <= 0 && now >= g_callUntil && !again)
             return false;
+        if (!again)
+        {
+            g_callFiles.push_back(f);
+            if (g_callFiles.size() > 32u)
+                g_callFiles.pop_front();
+        }
+        else if (g_callStreams <= 0 && now >= g_callUntil)
+            std::fprintf(stderr, "[pad speaker] '%s': a call's message played again (Show Objective%s), for the controller's speaker\n",
+                         file.c_str(), fromPause ? ", from the pause menu" : "");
         ++g_callStreams;
         g_callSeen = now;
         return true;
+    }
+
+    void setLevelPaused(bool paused)
+    {
+        if (g_levelPaused.exchange(paused, std::memory_order_relaxed) && !paused)
+            g_unpausedAt.store(seconds(), std::memory_order_relaxed);
     }
 
     void noteAlertStreamEnded()

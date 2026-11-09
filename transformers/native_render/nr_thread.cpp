@@ -7,6 +7,7 @@
 // (or TF_FRAME_DROPS=0) a faster game waits for the drawing rather than piling frames up, as before. TF_NATIVE_THREAD=0
 // draws on the game's thread as before.
 #include "nr_types.h"
+#include "nr_frame.h" // (frame::g_bloom: TF_NATIVE_SHOTGLOW, TODO 108)
 #include "nr_shader.h"
 #include "nr_n5.h"
 #include "view_turn.h"
@@ -2027,7 +2028,79 @@ namespace nr
             // the pictures between frames down to one a frame for seconds at a time, at 120 on this PC's 240 Hz)
             poses::g_poses.preMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             static const bool shotAb = std::getenv("TF_NATIVE_SHOTAB") != nullptr;
-            if (shotAb && !job.shot.empty())
+            static const bool shotGlow = std::getenv("TF_NATIVE_SHOTGLOW") != nullptr;
+            static const bool shotTone = std::getenv("TF_NATIVE_SHOTTONE") != nullptr;
+            if (shotTone && !job.shot.empty())
+            {
+                // (TODO 108 (2), a checking aid: the frame drawn without and with the tone mapping - _t0 _t1.)
+                const size_t dot = job.shot.rfind('.');
+                const std::string stem = dot == std::string::npos ? job.shot : job.shot.substr(0, dot);
+                const std::string ext = dot == std::string::npos ? std::string(".bmp") : job.shot.substr(dot);
+                const int was = frame::toneMode();
+                const float wasStrength = frame::toneStrength();
+                // (TF_NATIVE_SHOTTONE=<s>,<s>...: the frame at each strength, _ts0 _ts1 ... - 0 off; else _t0 _t1, off and on)
+                const std::string list = std::getenv("TF_NATIVE_SHOTTONE");
+                if (list.find(',') != std::string::npos)
+                {
+                    size_t at = 0;
+                    for (int n = 0; at <= list.size(); ++n)
+                    {
+                        size_t end = list.find(',', at);
+                        if (end == std::string::npos)
+                            end = list.size();
+                        const float s = static_cast<float>(std::atof(list.substr(at, end - at).c_str()));
+                        frame::g_tone.store(s > 0.0f ? 1 : 0, std::memory_order_relaxed);
+                        frame::setToneStrength(s);
+                        d3d::render(job.frame, stem + "_ts" + std::to_string(n) + ext);
+                        at = end + 1;
+                    }
+                }
+                else
+                    for (int m = 0; m < 2; ++m)
+                    {
+                        frame::g_tone.store(m, std::memory_order_relaxed);
+                        d3d::render(job.frame, stem + "_t" + std::to_string(m) + ext);
+                    }
+                frame::g_tone.store(was, std::memory_order_relaxed);
+                frame::setToneStrength(wasStrength);
+            }
+            else if (shotGlow && !job.shot.empty())
+            {
+                // (TODO 108, a checking aid: the frame drawn with the game's glow, the modern bloom and no glow - the same
+                // input, three shots _g0 _g1 _g2.)
+                const size_t dot = job.shot.rfind('.');
+                const std::string stem = dot == std::string::npos ? job.shot : job.shot.substr(0, dot);
+                const std::string ext = dot == std::string::npos ? std::string(".bmp") : job.shot.substr(dot);
+                const int was = frame::bloomMode();
+                const float wasStrength = frame::bloomStrength();
+                // (TF_NATIVE_SHOTGLOW=<s>,<s>...: the game's glow _g0, then the bloom at each strength _gs0 _gs1 ...)
+                const std::string list = std::getenv("TF_NATIVE_SHOTGLOW");
+                if (list.find(',') != std::string::npos)
+                {
+                    frame::g_bloom.store(0, std::memory_order_relaxed);
+                    d3d::render(job.frame, stem + "_g0" + ext);
+                    size_t at = 0;
+                    for (int n = 0; at <= list.size(); ++n)
+                    {
+                        size_t end = list.find(',', at);
+                        if (end == std::string::npos)
+                            end = list.size();
+                        frame::g_bloom.store(1, std::memory_order_relaxed);
+                        frame::setBloomStrength(static_cast<float>(std::atof(list.substr(at, end - at).c_str())));
+                        d3d::render(job.frame, stem + "_gs" + std::to_string(n) + ext);
+                        at = end + 1;
+                    }
+                }
+                else
+                    for (int m = 0; m < 3; ++m)
+                    {
+                        frame::g_bloom.store(m, std::memory_order_relaxed);
+                        d3d::render(job.frame, stem + "_g" + std::to_string(m) + ext);
+                    }
+                frame::g_bloom.store(was, std::memory_order_relaxed);
+                frame::setBloomStrength(wasStrength);
+            }
+            else if (shotAb && !job.shot.empty())
             {
                 // (TODO 94: the frame drawn with the picture-keeping speed-ups off, then on - the same input, two shots.)
                 const size_t dot = job.shot.rfind('.');

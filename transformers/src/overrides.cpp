@@ -6,6 +6,7 @@
 #include "cam_trace.h"
 #include "file_trace.h"
 #include "camera_mode.h"
+#include "discord_presence.h"
 #include "dualsense.h"
 #include "boss_cheat.h"
 #include "distance_meter.h"
@@ -325,6 +326,7 @@ namespace
     PS2Runtime::RecompiledFunction g_createFmvStream = nullptr;
     PS2Runtime::RecompiledFunction g_fmvStreamDtor = nullptr;
     int g_liveFmvStreams = 0;
+    bool g_liveFmvIsFilm = false; // (the movie playing is a film, not the boot logos or the title's attract loop: Discord status)
     std::vector<uint32_t> g_inSceneStreams; // fmvStreamPS2 objects shown in the scene (the LEVELS previews)
     struct SceneStreamPace // (TODO 113: fmvStreamUpdate, below)
     {
@@ -623,6 +625,10 @@ namespace
             if (!movie.empty())
                 hd_movies::movieStarted(*runtime, movie);
             g_skipIntroMovie = game_config::skipIntroMovie(hd_movies::movieKey(movie)); // (the "Intro screens" switch Off)
+            {
+                const std::string key = hd_movies::movieKey(movie);
+                g_liveFmvIsFilm = key != "NATARI" && key != "NMH_LOGO" && key != "NATTRACT";
+            }
             ++g_liveFmvStreams;
             g_fmvFrames = 0;
             // (TODO 255) The movies are 640x384 pictures that the game draws letterboxed in its 640x448 frame (rows 32 to
@@ -1416,6 +1422,7 @@ namespace
             camera_mode::frame(rdram, game != 0u);
             dualsense::frame(rdram, game != 0u, playerPositionAddress(rdram)); // the pad's light bar (dualsense.h)
             speedrun_timer::frame(rdram, g_liveFmvStreams != 0, runtime->eeScheduler().currentVSyncTick());
+            discord_presence::frame(rdram, game != 0u, g_executorVtable == 0x006B7360u, g_liveFmvStreams != 0 && g_liveFmvIsFilm);
             photo_mode::frame(rdram, game != 0u); // (before tuning: the game's speed it sets)
             fast_load::frame(rdram, *runtime, g_executorVtable == 0x006B7360u); // the sound muted while a level loads (fast_load.h)
             {
@@ -7199,6 +7206,7 @@ namespace
         game_config::addSettings(); // the Cheats and Debug tabs (game_config.h)
         controller_settings::add(); // the Controller tab (DualSense / DualShock 4)
         dualsense::addSettings();   // ... and what the game shows on the pad (dualsense.h)
+        discord_presence::addSettings(); // the Discord status (discord_presence.h)
         ultrawide::addSettings();   // Graphics: the picture's shape (ultrawide.h)
         native_sound::addSettings(); // Sound: the native sound server (native_sound.h)
         fast_load::addSettings();   // Gameplay: fast loading (fast_load.h)

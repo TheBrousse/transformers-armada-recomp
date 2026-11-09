@@ -43,6 +43,10 @@ namespace pad_speaker
     void noteToneKeyed(const std::string &tone);
     bool alertStream(const std::string &file);
     void noteAlertStreamEnded();
+    // (TODO 257) Once a game frame (mod_menu::frame): a level is paused. A call's message opened then or just after (the
+    // pause menu's Show Objective closes the menu and plays it again), or one heard in a call before, goes to the
+    // controller's speaker like the call itself.
+    void setLevelPaused(bool paused);
 
     // The mixer, after each mix: the pad's frames (48 kHz stereo, interleaved), to the runtime's speaker stream.
     void push(const int16_t *frames, size_t count);

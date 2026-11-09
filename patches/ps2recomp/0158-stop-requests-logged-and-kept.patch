@@ -1,0 +1,76 @@
+Subject: [PATCH] Every stop request logged (with a host observer for its source); a stop asked for before run() is kept
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 75def33..35dd283 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -479,8 +479,13 @@ public:
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+ 
++    // Asks the game to stop (the window closed, a menu's quit, a test's end...). The first request says so in the log,
++    // with where it came from when the host has said how to find that out (setStopObserver). A request made before run()
++    // starts is kept: run() then returns at once, without starting the game.
+     void requestStop();
+     bool isStopRequested() const;
++    // Called on the requesting thread at the first stop request (e.g. to log its caller); nullptr: none.
++    static void setStopObserver(void (*observer)(bool beforeRun));
+ 
+     EeScheduler &eeScheduler();
+     const EeScheduler &eeScheduler() const;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index edd6bee..48c12b9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3219,13 +3219,32 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+     drainCompletedDmacHandlers(rdram);
+ }
+ 
++namespace
++{
++    std::atomic<void (*)(bool)> g_stopObserver{nullptr};
++    std::atomic<bool> g_runStarted{false}; // run() has begun (a stop before it is kept for it: see run())
++}
++
++void PS2Runtime::setStopObserver(void (*observer)(bool beforeRun))
++{
++    g_stopObserver.store(observer, std::memory_order_release);
++}
++
+ void PS2Runtime::requestStop()
+ {
+-    m_stopRequested.store(true, std::memory_order_relaxed);
++    const bool first = !m_stopRequested.exchange(true, std::memory_order_acq_rel);
+     if (m_eeScheduler)
+     {
+         m_eeScheduler->requestStop();
+     }
++    if (first)
++    {
++        const bool beforeRun = !g_runStarted.load(std::memory_order_acquire);
++        std::fprintf(stderr, "[runtime] stop requested%s\n", beforeRun ? " (before the game started)" : "");
++        std::fflush(stderr);
++        if (void (*observer)(bool) = g_stopObserver.load(std::memory_order_acquire))
++            observer(beforeRun);
++    }
+ }
+ 
+ bool PS2Runtime::isStopRequested() const
+@@ -3473,7 +3492,16 @@ namespace
+ 
+ void PS2Runtime::run()
+ {
+-    m_stopRequested.store(false, std::memory_order_relaxed);
++    // A stop asked for before the game started (an extension that could not install, a test's quit...) is kept: the
++    // game does not start. (It used to be cleared here - the game then ran on, and a watchdog waiting on that stop
++    // ended the process seconds later, as if it had hung on its way out: TODO 256.)
++    g_runStarted.store(true, std::memory_order_release);
++    if (m_stopRequested.load(std::memory_order_acquire))
++    {
++        std::fprintf(stderr, "[runtime] a stop was requested before the game started: it does not start\n");
++        std::fflush(stderr);
++        return;
++    }
+     ps2_stubs::resetSifState();
+     resetIop();
+     ps2_stubs::resetAudioStubState();

@@ -1,10 +1,8 @@
-// The native renderer's graphics backend (docs/RENDERER_BACKEND.md): the line between the shared half - the capture,
-// the draw list, the passes - and the code that talks to one graphics API. Direct3D 12 (nr_d3d.cpp) is the one backend
-// today; a second (Vulkan) implements the same interface.
-//
-// Roadmap P3, step S1: the API-neutral types the shared half hands the backend (a draw's blend, depth test and colour
-// writes, the formats) and the backend's calls as one interface. The calls are today's nr::d3d functions; the frame's
-// recording is still done whole inside render() - its finer calls come with step S3.
+// The native renderer's graphics backend (docs/RENDERER_BACKEND.md): the API-neutral types the frame builder hands the
+// device (a draw's blend, depth test and colour writes, the formats), and the backend's outer calls as one interface -
+// the frame's entry, the pictures to the window, the settings, the timing figures (section 2 of the document). The
+// frame's recording itself goes through gfx::Device (nr_device.h). Direct3D 12 (nr_d3d.cpp) is the one backend today;
+// the callers still use its nr::d3d functions, which this interface forwards to.
 #pragma once
 
 #include <cstdint>

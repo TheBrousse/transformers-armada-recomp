@@ -4,6 +4,7 @@
 #include "port_ext.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 namespace ext
@@ -59,7 +60,13 @@ namespace ext
         bool ok = true;
         for (const Extension *e : registry())
             if (e->phase == phase && e->install && !e->install(runtime))
+            {
+                // (TODO 256) Said in the log: the game is stopped for it (overrides.cpp), and nothing else names it.
+                std::fprintf(stderr, "[ext] %s could not install (phase %d): the game stops\n", e->name ? e->name : "?",
+                             static_cast<int>(phase));
+                std::fflush(stderr);
                 ok = false;
+            }
         return ok;
     }
 
@@ -172,6 +179,14 @@ namespace ext
         for (const Extension *e : registry())
             if (e->beforeQuit)
                 e->beforeQuit();
+    }
+
+    bool presenceCharacter(const uint8_t *rdram, std::string &name, std::string &imageKey)
+    {
+        for (const Extension *e : registry())
+            if (e->presenceCharacter && e->presenceCharacter(rdram, name, imageKey))
+                return true;
+        return false;
     }
 
     std::vector<std::string> loadoutTags()

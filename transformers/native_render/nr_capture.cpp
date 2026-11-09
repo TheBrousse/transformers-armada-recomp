@@ -23,6 +23,7 @@
 #include "nr_movie.h"
 #include "nr_rain.h"
 #include "nr_n5.h"
+#include "nr_frame.h" // (frame::setBloom: the modern bloom's setting, TODO 108)
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -31,9 +32,11 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_host_display.h"
+#include "runtime/ps2_host_input.h"
 #include "runtime/ps2_settings.h"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -144,6 +147,7 @@ namespace nr
         {
             std::unordered_map<uint32_t, Upload> uploads;
             std::unordered_map<uint32_t, uint32_t> bindings;
+            std::unordered_map<uint32_t, uint64_t> bindSeq; // (TODO 259: g_bindSeq as the list stood)
             uint64_t applied = 0, scans = 0;
             bool synced = false;
         };
@@ -151,8 +155,24 @@ namespace nr
         thread_local bool t_useView = false; // (set while the renderer's thread expands a frame)
         const std::unordered_map<uint32_t, Upload> &uploadsTable() { return t_useView ? g_view.uploads : g_uploads; }
         const std::unordered_map<uint32_t, uint32_t> &bindingsTable() { return t_useView ? g_view.bindings : g_tbpTextures; }
+        const std::unordered_map<uint32_t, uint64_t> &bindSeqTable() { return t_useView ? g_view.bindSeq : g_bindSeq; }
+        std::string guestString(const uint8_t *rdram, uint32_t at);
+        const uint8_t *g_logRdram = nullptr; // (TF_NATIVE_UPLOADLOG: main RAM, as the last upload saw it)
         void logChange(bool binding, uint32_t block, Upload upload)
         {
+            // (Debug, TODO 259: TF_NATIVE_UPLOADLOG=<block hex>: every upload and binding recorded at that block, its texture's
+            // name - the game thread's view of what the GS holds there.)
+            static const uint32_t logBlock = std::getenv("TF_NATIVE_UPLOADLOG") ? static_cast<uint32_t>(std::strtoul(std::getenv("TF_NATIVE_UPLOADLOG"), nullptr, 16)) : 0xFFFFFFFFu;
+            if (block == logBlock)
+            {
+                static int left = 200;
+                if (left-- > 0)
+                {
+                    const uint8_t *rdram = g_logRdram;
+                    std::fprintf(stderr, "[native render] %s at %04x: texture %08x '%s' level %08x\n", binding ? "binding" : "upload", block,
+                                 upload.texture, rdram && upload.texture ? guestString(rdram, upload.texture + 0x18u).c_str() : "-", upload.level);
+                }
+            }
             if (!framesDeferred())
                 return;
             if (g_changes.size() >= 65536u)
@@ -168,10 +188,14 @@ namespace nr
         void viewUpTo(uint64_t count)
         {
             std::lock_guard<std::recursive_mutex> lock(g_texMutex);
-            if (!g_view.synced || g_view.applied < g_changesBase || g_view.scans != g_tableScans)
+            // (Debug, TODO 259: TF_NATIVE_VIEWAHEAD=1 - the game thread's tables as they are now, every time: what a frame draws
+            // when its copy runs ahead of it.)
+            static const bool ahead = std::getenv("TF_NATIVE_VIEWAHEAD") && *std::getenv("TF_NATIVE_VIEWAHEAD") == '1';
+            if (ahead || !g_view.synced || g_view.applied < g_changesBase || g_view.scans != g_tableScans)
             {
                 g_view.uploads = g_uploads;
                 g_view.bindings = g_tbpTextures;
+                g_view.bindSeq = g_bindSeq;
                 g_view.applied = g_changeCount;
                 g_view.scans = g_tableScans;
                 g_view.synced = true;
@@ -181,7 +205,10 @@ namespace nr
             {
                 const TableChange &c = g_changes[static_cast<size_t>(g_view.applied - g_changesBase)];
                 if (c.binding)
+                {
                     g_view.bindings[c.block] = c.upload.texture;
+                    g_view.bindSeq[c.block] = c.upload.seq; // (a binding's change carries its g_bindSeq)
+                }
                 else
                     g_view.uploads[c.block] = c.upload;
             }
@@ -1355,27 +1382,65 @@ namespace nr
                 if (!g_registerWrite[reg])
                     return nullptr;
                 const uint32_t tbp = static_cast<uint32_t>(tex0) & 0x3FFFu;
-                auto it = g_tbpTextures.find(tbp);
-                uint32_t bound = it != g_tbpTextures.end() ? it->second : 0u;
+                // (TODO 259: the tables as the list stood where this draw is - bindingsTable / uploadsTable / bindSeqTable, the
+                // renderer's own copy when it expands the frame - not the game thread's, which has run on by then: a texture
+                // the game uploaded at this block later (a streaming slot: Antarctica's ice floors share theirs with the
+                // Mini-Con panel and seven more) looked newer than the binding and was drawn in its place.
+                // TF_NATIVE_LIVETABLES=1: the game thread's, as before.)
+                static const bool liveTables = std::getenv("TF_NATIVE_LIVETABLES") && *std::getenv("TF_NATIVE_LIVETABLES") == '1';
+                const auto &bindingsNow = liveTables ? g_tbpTextures : bindingsTable();
+                const auto &uploadsNow = liveTables ? g_uploads : uploadsTable();
+                const auto &bindSeqNow = liveTables ? g_bindSeq : bindSeqTable();
+                auto it = bindingsNow.find(tbp);
+                uint32_t bound = it != bindingsNow.end() ? it->second : 0u;
+                const uint32_t boundBefore = bound;
                 // (TODO 124: a texture uploaded at TBP after SetTexture's last binding there is what the GS holds - the
                 // draw came before its own binding was recorded. The HQ with Hot Shot selected, 4:3: his car picture
                 // (CHARPIC) uploaded over the label font's pages (6MILL_COL, bound there last), its first draw read the
                 // font's binding - font glyphs where the car is; on the ring, the QUIT icon (ICON2) drawn with a room
                 // texture (RM_07) - a big grey panel. TF_NATIVE_UPLOADWINS=0: the binding, as before.)
                 static const bool uploadWins = !(std::getenv("TF_NATIVE_UPLOADWINS") && *std::getenv("TF_NATIVE_UPLOADWINS") == '0');
-                if (uploadWins && bound)
-                    if (auto up = g_uploads.find(tbp); up != g_uploads.end() && up->second.texture && up->second.texture != bound &&
-                                                       word(rdram, up->second.texture) == 0x006B4760u &&
-                                                       word(rdram, up->second.texture + 0x98u + 4u * std::min(word(rdram, up->second.texture + 0x90u), 15u)) ==
-                                                           up->second.level)
+                const auto uploadOver = [&](const std::unordered_map<uint32_t, Upload> &uploads, const std::unordered_map<uint32_t, uint64_t> &seqs,
+                                            uint32_t b) {
+                    if (auto up = uploads.find(tbp); up != uploads.end() && up->second.texture && up->second.texture != b &&
+                                                     word(rdram, up->second.texture) == 0x006B4760u &&
+                                                     word(rdram, up->second.texture + 0x98u + 4u * std::min(word(rdram, up->second.texture + 0x90u), 15u)) ==
+                                                         up->second.level)
                     {
-                        const auto b = g_bindSeq.find(tbp);
-                        if (up->second.seq > (b != g_bindSeq.end() ? b->second : 0u))
-                        {
-                            bound = up->second.texture;
-                            ++g_boundByUpload;
-                        }
+                        const auto s = seqs.find(tbp);
+                        if (up->second.seq > (s != seqs.end() ? s->second : 0u))
+                            return up->second.texture;
                     }
+                    return b;
+                };
+                if (uploadWins && bound)
+                {
+                    const uint32_t over = uploadOver(uploadsNow, bindSeqNow, bound);
+                    if (over != bound)
+                    {
+                        bound = over;
+                        ++g_boundByUpload;
+                    }
+                }
+                // (Debug, TODO 259: TF_NATIVE_VIEWCHECK=1: a draw whose texture the game thread's live tables would have
+                // chosen differently, told with both names - the first 60.)
+                static const bool viewCheck = std::getenv("TF_NATIVE_VIEWCHECK") && *std::getenv("TF_NATIVE_VIEWCHECK") == '1';
+                if (viewCheck && t_useView)
+                {
+                    auto lb = g_tbpTextures.find(tbp);
+                    uint32_t live = lb != g_tbpTextures.end() ? lb->second : 0u;
+                    if (uploadWins && live)
+                        live = uploadOver(g_uploads, g_bindSeq, live);
+                    static int told = 60;
+                    if (live != bound && told > 0)
+                    {
+                        --told;
+                        std::fprintf(stderr, "[native render] view check at tick %llu, tbp %04x: drawn '%s', the live tables say '%s' (binding '%s')\n",
+                                     static_cast<unsigned long long>(g_expandTick), tbp, bound ? guestString(rdram, bound + 0x18u).c_str() : "-",
+                                     live ? guestString(rdram, live + 0x18u).c_str() : "-",
+                                     boundBefore ? guestString(rdram, boundBefore + 0x18u).c_str() : "-");
+                    }
+                }
                 return textureFor(rdram, tex0, bound);
             }
             if (word(rdram, g_stateBlock + at + 8u) != (context == 2 ? 0x07u : 0x06u))
@@ -1421,6 +1486,26 @@ namespace nr
                              blockOf(key.mip[1]), blockOf(key.mip[2]), word(rdram, t + 0x58u + 4u * first), word(rdram, t + 0x5Cu + 4u * first),
                              word(rdram, t + 0x60u + 4u * first), word(rdram, t + 0x64u + 4u * first));
             }
+        }
+
+        // (Debug, TODO 259: TF_NATIVE_TEXNAMELOG=<text>: each texture whose name holds that text, the first 40 times it is drawn
+        // with a new TEX0 - found by its binding or by the upload at TBP.)
+        void texNameLog(const uint8_t *rdram, uint32_t texture, uint64_t tex0, bool byBinding)
+        {
+            static const char *want = std::getenv("TF_NATIVE_TEXNAMELOG");
+            if (!want || !*want || !texture || word(rdram, texture) != 0x006B4760u)
+                return;
+            static int left = 40;
+            static std::unordered_set<uint64_t> seen;
+            const std::string name = guestString(rdram, texture + 0x18u);
+            std::string upper = name;
+            for (char &c : upper)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (left <= 0 || upper.find(want) == std::string::npos || !seen.insert(tex0 ^ (static_cast<uint64_t>(texture) << 1)).second)
+                return;
+            --left;
+            std::fprintf(stderr, "[native render] texture '%s' (%08x) drawn at tick %llu with tex0 %016llx, %s\n", name.c_str(), texture,
+                         static_cast<unsigned long long>(g_expandTick), static_cast<unsigned long long>(tex0), byBinding ? "its binding" : "the upload at TBP");
         }
 
         // The texture TEX0 samples: `bound` (the material's, or what SetTexture made this TEX0 of),
@@ -1513,6 +1598,7 @@ namespace nr
                                      clutUp != uploadsTable().end() ? clutUp->second.level : 0u, static_cast<unsigned long long>(tex0));
                     }
                 gameMipsOf(rdram, t, key.image, key);
+                texNameLog(rdram, t, tex0, true);
                 return convertKey(rdram, tex0, key);
             }
             auto image = uploadsTable().find(static_cast<uint32_t>(tex0) & 0x3FFFu);
@@ -1544,6 +1630,7 @@ namespace nr
                 key.clut = clut->second.level;
             }
             gameMipsOf(rdram, key.texture, key.image, key);
+            texNameLog(rdram, key.texture, tex0, false);
             return convertKey(rdram, tex0, key);
         }
 
@@ -1603,6 +1690,17 @@ namespace nr
                 e.clut = key.clut;
                 e.data = data;
                 e.palette = convertPalette(rdram, key, g_nextId++);
+                // (TODO 152) The same colours as the palette last made from this CLUT: that one, its id and GPU texture
+                // kept. The lens filters' TEX0 and bound texture change now and then (a new entry above each time; after
+                // a level's start nearly every frame), so Antarctica's grade was often a new palette - a new GPU texture,
+                // and on a frame with many new textures put off (the frame's cap, nr_frame.cpp textureFor): the grade
+                // drawn from GS memory, the whole 3D picture bluish-white for that frame.
+                static std::unordered_map<uint32_t, std::shared_ptr<const Texture>> byClut;
+                std::shared_ptr<const Texture> &last = byClut[key.clut];
+                if (e.palette && last && last->pixels == e.palette->pixels)
+                    e.palette = last;
+                else if (e.palette)
+                    last = e.palette;
             }
             return e.palette;
         }
@@ -2416,6 +2514,7 @@ namespace nr
             {
                 std::lock_guard<std::recursive_mutex> lock(g_texMutex);
                 const Upload up{getRegU32(ctx, 4), getRegU32(ctx, 6), ++g_tableSeq};
+                g_logRdram = rdram;
                 g_uploads[getRegU32(ctx, 7) & 0x3FFFu] = up;
                 logChange(false, getRegU32(ctx, 7) & 0x3FFFu, up);
                 rememberLevel(rdram, getRegU32(ctx, 6));
@@ -2575,6 +2674,7 @@ namespace nr
             }
             const auto &owner = o.owner;
             std::lock_guard<std::recursive_mutex> lock(g_texMutex);
+            g_logRdram = rdram;
             ++g_groupLoads;
             for (uint32_t s = first; s < cursor; s += 8u)
             {
@@ -2693,6 +2793,370 @@ namespace nr
                 kept.clear();
             return made;
         }
+        // (TODO 240 follow-up) The button prompts follow the controller's layout (F1 > Controls > Controller buttons,
+        // patch 0156): the game prints a prompt as a glyph of its menu font DECK - a quad cut from the button's cell of
+        // the atlas, whichever set is drawn (the game's, crisp PS5 / PS2, Xbox, keys: all share the cells). A glyph quad
+        // of a game button whose controller button changed is cut from the cell of the controller button that now
+        // presses it, shrunk around its centre where that cell's shape differs (never stretched). Live: the layout is
+        // read again every quarter second. The default layout touches nothing. Only the drawn quads and the texture's
+        // name are read - nothing of the game's code. TF_PROMPT_REMAP=0: off.
+        namespace prompts
+        {
+            enum : int { Up, Down, Left, Right, Cross, Circle, Square, Triangle, L1, R1, L2, R2, L3, R3, Start, Select, kCount };
+            constexpr const char *kNames[kCount] = {"up", "down", "left", "right", "cross", "circle", "square", "triangle",
+                                                    "l1", "r1", "l2", "r2", "l3", "r3", "start", "select"};
+            struct Cell
+            {
+                // texels of DECK's 256 x 256 atlas, as the game cuts its glyphs (measured with TF_PROMPT_LOG=2 for the face
+                // buttons and the D-pad; the shoulder buttons and SELECT from the glyph table); x1 = 0: none
+                int x0, y0, x1, y1;
+            };
+            constexpr Cell kDeck[kCount] = {
+                {96, 197, 113, 215}, {96, 215, 113, 233}, {96, 180, 114, 197}, {96, 163, 114, 180}, // up down left right
+                {5, 231, 28, 254},   {28, 231, 51, 254},  {51, 231, 74, 254},  {74, 231, 97, 254},  // cross circle square triangle
+                {62, 182, 91, 201},  {62, 163, 91, 182},  {1, 163, 30, 190},   {32, 163, 60, 190},  // l1 r1 l2 r2
+                {1, 192, 30, 220},   {32, 192, 60, 220},  {0, 0, 0, 0},        {118, 206, 158, 230}, // l3 r3 start select
+            };
+            std::atomic<bool> g_active{false};
+            std::atomic<int> g_shown[kCount]; // the controller button whose picture each game button's prompt shows
+            std::atomic<uint64_t> g_remapped{0};
+            std::atomic<uint64_t> g_version{0}; // (counts the layout's changes: the slot labels' remapped meshes are made per version)
+            std::mutex g_mutex;
+            std::chrono::steady_clock::time_point g_readAt{};
+            std::string g_layout;
+
+            int index(const std::string &name)
+            {
+                for (int i = 0; i < kCount; ++i)
+                    if (name == kNames[i])
+                        return i;
+                return -1;
+            }
+
+            // The layout read again at most every quarter second (and logged when it changed).
+            void refresh()
+            {
+                static const bool off = std::getenv("TF_PROMPT_REMAP") && *std::getenv("TF_PROMPT_REMAP") == '0';
+                if (off)
+                    return;
+                const auto now = std::chrono::steady_clock::now();
+                std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+                if (!lock.owns_lock() || now - g_readAt < std::chrono::milliseconds(250))
+                    return;
+                g_readAt = now;
+                std::string layout = ps2_host_input::padBindings();
+                if (layout == g_layout)
+                    return;
+                g_layout = layout;
+                int shown[kCount];
+                for (int i = 0; i < kCount; ++i)
+                    shown[i] = i;
+                for (size_t at = 0; at < layout.size();)
+                {
+                    size_t end = layout.find(';', at);
+                    if (end == std::string::npos)
+                        end = layout.size();
+                    const std::string item = layout.substr(at, end - at);
+                    at = end + 1;
+                    const size_t eq = item.find('=');
+                    if (eq == std::string::npos)
+                        continue;
+                    const int game = index(item.substr(0, eq));
+                    const size_t comma = item.find(',', eq + 1);
+                    const int pad = index(item.substr(eq + 1, comma == std::string::npos ? std::string::npos : comma - eq - 1));
+                    // (a controller button with no cell of its own - Start - leaves the game button's picture)
+                    if (game >= 0 && pad >= 0 && kDeck[pad].x1 != 0)
+                        shown[game] = pad;
+                }
+                bool any = false;
+                std::string told;
+                for (int i = 0; i < kCount; ++i)
+                {
+                    g_shown[i].store(shown[i], std::memory_order_relaxed);
+                    if (shown[i] != i && kDeck[i].x1 != 0)
+                    {
+                        any = true;
+                        told += std::string(told.empty() ? "" : ", ") + kNames[i] + " shows " + kNames[shown[i]];
+                    }
+                }
+                g_active.store(any, std::memory_order_release);
+                g_version.fetch_add(1u, std::memory_order_release);
+                std::fprintf(stderr, "[prompts] the button pictures follow the controller layout: %s\n", any ? told.c_str() : "as the game has them");
+            }
+
+            // A draw's glyph quads (six vertices a sprite, as nr_gif makes them) remapped where they are a button's cell.
+            void remap(const uint8_t *rdram, Mesh &mesh, uint64_t tex0, uint32_t bound)
+            {
+                refresh();
+                if (!g_active.load(std::memory_order_acquire) || !bound || mesh.vertices.size() < 6u || mesh.vertices.size() % 6u != 0u ||
+                    mesh.indices.size() != mesh.vertices.size())
+                    return;
+                // (the keyboard's key prompts show the keys bound to the game's buttons: the controller's layout is not theirs)
+                if (keyPromptsShown())
+                    return;
+                // (DECK is 256 x 256 in GS memory: the cells' units)
+                if (((tex0 >> 26) & 0xFu) != 8u || ((tex0 >> 30) & 0xFu) != 8u)
+                    return;
+                std::string name = guestString(rdram, bound + 0x18u);
+                if (const size_t slash = name.find_last_of("/\\"); slash != std::string::npos)
+                    name = name.substr(slash + 1);
+                if (const size_t dot = name.find('.'); dot != std::string::npos)
+                    name.resize(dot);
+                for (char &c : name)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (name != "DECK")
+                    return;
+                constexpr float kTexels = 256.0f, kTolerance = 1.5f;
+                std::vector<Vertex> &v = mesh.vertices;
+                for (size_t q = 0; q + 6u <= v.size(); q += 6u)
+                {
+                    float u0 = v[q].u, u1 = u0, v0 = v[q].v, v1 = v0, x0 = v[q].x, x1 = x0, y0 = v[q].y, y1 = y0;
+                    for (size_t k = q + 1u; k < q + 6u; ++k)
+                    {
+                        u0 = std::min(u0, v[k].u), u1 = std::max(u1, v[k].u), v0 = std::min(v0, v[k].v), v1 = std::max(v1, v[k].v);
+                        x0 = std::min(x0, v[k].x), x1 = std::max(x1, v[k].x), y0 = std::min(y0, v[k].y), y1 = std::max(y1, v[k].y);
+                    }
+                    // (TF_PROMPT_LOG=2: every different glyph rectangle of DECK's drawn, once - the cells as the game cuts them)
+                    static const bool cells = std::getenv("TF_PROMPT_LOG") && *std::getenv("TF_PROMPT_LOG") == '2';
+                    if (cells)
+                    {
+                        static std::mutex seenMutex;
+                        static std::unordered_set<uint64_t> seen;
+                        const auto r = [](float f) { return static_cast<uint64_t>(std::lround(f * 512.0f)) & 0xFFFFu; };
+                        const uint64_t key = r(u0) | r(u1) << 16 | r(v0) << 32 | r(v1) << 48;
+                        std::lock_guard<std::mutex> lock(seenMutex);
+                        if (seen.insert(key).second && seen.size() < 400u)
+                            std::fprintf(stderr, "[prompts] DECK glyph cut at %.1f,%.1f - %.1f,%.1f (texels), drawn %.1f x %.1f\n", u0 * kTexels,
+                                         v0 * kTexels, u1 * kTexels, v1 * kTexels, x1 - x0, y1 - y0);
+                    }
+                    // (A glyph may come in pieces - the game splits its text's quads at some screen columns: each piece's rectangle
+                    // lies inside its button's cell; matched by where its middle is)
+                    const float mu = 0.5f * (u0 + u1) * kTexels, mv = 0.5f * (v0 + v1) * kTexels;
+                    int game = -1;
+                    for (int b = 0; b < kCount && game < 0; ++b)
+                        if (kDeck[b].x1 != 0 && mu > kDeck[b].x0 && mu < kDeck[b].x1 && mv > kDeck[b].y0 && mv < kDeck[b].y1 &&
+                            u0 * kTexels >= kDeck[b].x0 - kTolerance && u1 * kTexels <= kDeck[b].x1 + kTolerance &&
+                            v0 * kTexels >= kDeck[b].y0 - kTolerance && v1 * kTexels <= kDeck[b].y1 + kTolerance)
+                            game = b;
+                    if (game < 0)
+                        continue;
+                    const int pad = g_shown[game].load(std::memory_order_relaxed);
+                    if (pad == game)
+                        continue;
+                    const Cell &from = kDeck[game], &to = kDeck[pad];
+                    const float fw = static_cast<float>(from.x1 - from.x0), fh = static_cast<float>(from.y1 - from.y0);
+                    const float tw = static_cast<float>(to.x1 - to.x0), th = static_cast<float>(to.y1 - to.y0);
+                    const float pu = (u1 - u0) * kTexels, pv = (v1 - v0) * kTexels, w = x1 - x0, h = y1 - y0;
+                    if (pu <= 0.0f || pv <= 0.0f || w <= 0.0f || h <= 0.0f)
+                        continue;
+                    // The whole glyph on the screen (this piece's pixels a texel, from where the piece lies in its cell), and the
+                    // new cell's glyph in its place: the same pixels a texel, shrunk to fit where its shape differs, centred.
+                    const float sx = w / pu, sy = h / pv;
+                    const float gx = x0 - (u0 * kTexels - from.x0) * sx, gy = y0 - (v0 * kTexels - from.y0) * sy;
+                    const float gw = fw * sx, gh = fh * sy;
+                    float nw = tw * sx, nh = th * sy;
+                    const float fit = std::min({1.0f, gw / nw, gh / nh});
+                    nw *= fit, nh *= fit;
+                    const float nx = gx + 0.5f * (gw - nw), ny = gy + 0.5f * (gh - nh);
+                    for (size_t k = q; k < q + 6u; ++k)
+                    {
+                        const float fu = (v[k].u * kTexels - from.x0) / fw, fv = (v[k].v * kTexels - from.y0) / fh; // (0..1 across the cell)
+                        v[k].u = (to.x0 + fu * tw) / kTexels;
+                        v[k].v = (to.y0 + fv * th) / kTexels;
+                        v[k].x = nx + fu * nw;
+                        v[k].y = ny + fv * nh;
+                    }
+                    g_remapped.fetch_add(1u, std::memory_order_relaxed);
+                }
+                static const bool log = std::getenv("TF_PROMPT_LOG") != nullptr;
+                if (log)
+                {
+                    // (at most every 5 s)
+                    static std::atomic<int64_t> toldAt{0};
+                    const int64_t nowMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    int64_t last = toldAt.load(std::memory_order_relaxed);
+                    if (g_remapped.load(std::memory_order_relaxed) && nowMs - last >= 5000 && toldAt.compare_exchange_strong(last, nowMs))
+                        std::fprintf(stderr, "[prompts] %llu glyphs drawn with the controller's button so far\n",
+                                     static_cast<unsigned long long>(g_remapped.load(std::memory_order_relaxed)));
+                }
+            }
+        }
+
+        // (TODO 240 follow-up) The HQ Mini-Con loadout's slot labels follow the controller layout too. They are not font
+        // glyphs: each slot's side tab is part of the room's model, textured from MINICONFRAME (256 x 128), whose top row holds
+        // three label cells - L2, R1, R2, each 68 x 24 texels - and whose frame's own tab carries L1, turned a quarter (texels
+        // 1..25 across, 47.5..114.5 down). The slots L2 / R1 / R2 map their cell onto the middle of their tab, the slot L1 the
+        // frame's L1 there. A slot whose game button another controller button now presses gets its label triangles pointed at
+        // that button's label instead: a cell moved to the other cell, or turned onto the frame's L1 (and back) the way the
+        // slots' own meshes map them - each tab then looks like the original tab of the button it shows, at any texture size
+        // (the HD image too); one taken to the other side's slot is turned end for end, so it reads the way that side's
+        // labels do. Only the drawn mesh's UVs and the texture's name are read. A layout that moves nothing onto
+        // L1 / L2 / R1 / R2, or a button with no label here (the face buttons), leaves the tab as it is.
+        namespace slats
+        {
+            enum : int { kL1, kL2, kR1, kR2, kSlots }; // (the frame's L1, then the three cells left to right)
+            constexpr int kGame[kSlots] = {prompts::L1, prompts::L2, prompts::R1, prompts::R2};
+            constexpr float kCellU[kSlots] = {0.0f, 9.0f, 94.0f, 179.0f}; // (a cell's left edge, texels; kL1 has none)
+            constexpr float kCellV = 8.0f;                                // (the cells' top as the slots sample them)
+
+            int slotOf(int button)
+            {
+                for (int s = 0; s < kSlots; ++s)
+                    if (kGame[s] == button)
+                        return s;
+                return -1;
+            }
+
+            // A label point relative to its picture (along the cell 0..68, across it 0..24), from either kind of region.
+            void toRelative(int slot, float u, float v, float &a, float &b)
+            {
+                if (slot == kL1)
+                    a = (v - 47.5f) * (68.0f / 67.0f), b = 25.0f - u; // (the frame's L1: its rows run along the cell, turned)
+                else
+                    a = u - kCellU[slot], b = v - kCellV;
+            }
+            void fromRelative(int slot, float a, float b, float &u, float &v)
+            {
+                if (slot == kL1)
+                    u = 25.0f - b, v = 47.5f + a * (67.0f / 68.0f);
+                else
+                    u = kCellU[slot] + a, v = kCellV + b;
+            }
+
+            // Which slot's label a triangle samples (texels), -1: none.
+            int labelOf(const float *u, const float *v)
+            {
+                constexpr float t = 0.6f;
+                bool frame = true;
+                for (int k = 0; k < 3; ++k)
+                    frame = frame && u[k] >= 1.0f - t && u[k] <= 25.0f + t && v[k] >= 47.5f - t && v[k] <= 114.5f + t;
+                if (frame)
+                    return kL1;
+                for (int s = kL2; s < kSlots; ++s)
+                {
+                    bool in = true;
+                    for (int k = 0; k < 3; ++k)
+                        in = in && u[k] >= kCellU[s] - t && u[k] <= kCellU[s] + 68.0f + t && v[k] >= 7.0f - t && v[k] <= 32.0f + t;
+                    if (in)
+                        return s;
+                }
+                return -1;
+            }
+
+            struct Entry
+            {
+                std::weak_ptr<const Mesh> source;
+                uint64_t version = 0;
+                std::shared_ptr<const Mesh> out; // (null: nothing of it moved)
+            };
+            std::mutex g_mutex;
+            std::unordered_map<uint64_t, Entry> g_made;   // (by the source mesh's id)
+            std::unordered_map<uint32_t, bool> g_isFrame; // (a vlTexturePS2 address: whether it is MINICONFRAME)
+
+            // The draw's mesh with its label triangles remapped, when its texture is MINICONFRAME and the layout moves a label.
+            void remap(const uint8_t *rdram, Draw &d)
+            {
+                // (The layout as the prompts read it: every textured 2D draw reads it again now and then, and the HQ always
+                // draws some - the default layout costs this one load.)
+                if (!prompts::g_active.load(std::memory_order_acquire))
+                    return;
+                // (the game's 256 x 128 texture, or an HD image in its place - the same shape, the same source, and the UVs in
+                // fractions of either)
+                const Texture *t = d.texture.get();
+                if (!d.mesh || !t || d.mesh->immediate || d.mesh->indices.size() % 3u != 0u ||
+                    !(t->upscaled ? t->width == 2u * t->height : t->width == 256u && t->height == 128u))
+                    return;
+                int shown[kSlots];
+                bool moved = false;
+                for (int s = 0; s < kSlots; ++s)
+                {
+                    shown[s] = slotOf(prompts::g_shown[kGame[s]].load(std::memory_order_relaxed));
+                    moved = moved || (shown[s] >= 0 && shown[s] != s);
+                }
+                if (!moved)
+                    return;
+                std::lock_guard<std::mutex> lock(g_mutex);
+                {
+                    if (g_isFrame.size() > 4096u)
+                        g_isFrame.clear();
+                    auto [it, fresh] = g_isFrame.try_emplace(t->source, false);
+                    if (fresh)
+                    {
+                        std::string name = guestString(rdram, t->source + 0x18u);
+                        if (const size_t slash = name.find_last_of("/\\"); slash != std::string::npos)
+                            name = name.substr(slash + 1);
+                        if (const size_t dot = name.find('.'); dot != std::string::npos)
+                            name.resize(dot);
+                        for (char &c : name)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        it->second = name == "MINICONFRAME";
+                    }
+                    if (!it->second)
+                        return;
+                }
+                const uint64_t version = prompts::g_version.load(std::memory_order_acquire);
+                if (auto it = g_made.find(d.mesh->id); it != g_made.end() && it->second.version == version && it->second.source.lock() == d.mesh)
+                {
+                    if (it->second.out)
+                        d.mesh = it->second.out;
+                    return;
+                }
+                if (g_made.size() > 256u)
+                    for (auto it = g_made.begin(); it != g_made.end();)
+                        it = it->second.source.expired() ? g_made.erase(it) : std::next(it);
+                Entry &e = g_made[d.mesh->id];
+                e.source = d.mesh;
+                e.version = version;
+                e.out.reset();
+                const Mesh &m = *d.mesh;
+                std::shared_ptr<Mesh> out;
+                uint32_t labels = 0;
+                for (size_t t = 0; t + 3u <= m.indices.size(); t += 3u)
+                {
+                    float u[3], v[3];
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const Vertex &x = m.vertices[m.indices[t + k]];
+                        const float q = m.projective && x.size != 0.0f ? x.size : 1.0f;
+                        u[k] = x.u / q * 256.0f, v[k] = x.v / q * 128.0f;
+                    }
+                    const int slot = labelOf(u, v);
+                    if (slot < 0 || shown[slot] < 0 || shown[slot] == slot)
+                        continue;
+                    if (!out)
+                    {
+                        out = std::make_shared<Mesh>(m);
+                        out->id = g_nextId++;
+                    }
+                    // (each vertex of a moved triangle its own: another triangle sharing it keeps its UV)
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        Vertex x = m.vertices[m.indices[t + k]];
+                        const float q = m.projective && x.size != 0.0f ? x.size : 1.0f;
+                        float a, b, nu, nv;
+                        toRelative(slot, u[k], v[k], a, b);
+                        // (the right-hand slots' tabs mirror the left's, and each label is drawn for its own side: one taken
+                        // to the other side is turned end for end - it then reads along the tab the way that side's do)
+                        if ((slot <= kL2) != (shown[slot] <= kL2))
+                            a = 68.0f - a;
+                        fromRelative(shown[slot], a, b, nu, nv);
+                        x.u = nu / 256.0f * q, x.v = nv / 128.0f * q;
+                        out->indices[t + k] = static_cast<uint32_t>(out->vertices.size());
+                        out->vertices.push_back(x);
+                    }
+                    ++labels;
+                }
+                static const bool log = std::getenv("TF_PROMPT_LOG") != nullptr;
+                if (log)
+                    std::fprintf(stderr, "[prompts] HQ slot labels: mesh %llu (set %08x, %zu triangles), %u label triangles remapped\n",
+                                 static_cast<unsigned long long>(m.id), m.source, m.indices.size() / 3u, labels);
+                e.out = out;
+                if (out)
+                    d.mesh = out;
+            }
+        }
+
         void addImmediate(const uint8_t *rdram, const gif::Primitives &p, std::vector<Vertex> *take = nullptr)
         {
             struct Add
@@ -2793,6 +3257,7 @@ namespace nr
                 {
                     d.texture = textureFor(rdram, p.tex0, bound);
                     d.topPalette = topPaletteFor(rdram, p.tex0, bound);
+                    prompts::remap(rdram, *mesh, p.tex0, bound); // (TODO 240 follow-up: the prompts follow the controller layout)
                 }
                 // (N3b: a loose frame's indexed texture - read from GS memory, as its own packets uploaded it: whatever the
                 // game's tables say is there belongs to its frames, not to a screen it draws on its own. The HQ-to-level
@@ -3587,6 +4052,7 @@ namespace nr
                     d.topPalette = topPaletteOf(rdram);
                     if (d.mesh && d.mesh->prim2)
                         d.texture2 = textureOf(rdram, 2);
+                    slats::remap(rdram, d); // (TODO 240 follow-up: the HQ loadout slots' labels follow the controller layout)
                     if (d.texture && g_stateBlock && word(rdram, g_stateBlock + 0x38u) == 0x06u)
                     {
                         // (The set's TEX0 and its material, for the microcode primitives drawn with it.)
@@ -4424,7 +4890,7 @@ namespace nr
                 std::lock_guard<std::recursive_mutex> lock(g_texMutex);
             g_tbpTextures[word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu] = kept;
                 g_bindSeq[word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu] = ++g_tableSeq;
-                logChange(true, word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu, Upload{kept, 0u});
+                logChange(true, word(rdram, kGsShadow + 8u * (6u + stage)) & 0x3FFFu, Upload{kept, 0u, g_tableSeq});
             }
             if (g_why > 0)
             {
@@ -5842,6 +6308,90 @@ namespace nr
                 return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
             };
             s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
+        // (TODO 108) Its modern bloom (TF_NATIVE_BLOOM, live, off by default - the game's own glow is the faithful look).
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_BLOOM";
+            s.section = "Graphics";
+            s.label = "Glow (native renderer)";
+            s.order = 57;
+            s.help = "Native renderer: the glow around bright parts of the picture. Original: the game's own glow, worked out "
+                     "in a small 128 x 128 picture as on the PS2. Modern bloom: a soft glow made at the screen's full resolution, "
+                     "with the same threshold, strength and shape the game sets for each place.";
+            s.choices = {{"0", "Original"}, {"1", "Modern bloom"}};
+            s.defaultValue = "0";
+            s.apply = [](const std::string &value) {
+                frame::setBloom(value == "1" ? 1 : 0);
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
+        // (TODO 108) The modern bloom's strength (the F1 slider; 100% the game's glow matched).
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_BLOOM_STRENGTH";
+            s.section = "Graphics";
+            s.label = "Bloom strength (native renderer)";
+            s.order = 57;
+            s.help = "Native renderer, the modern bloom: how strong and wide the glow is. 100% matches the game's own glow; above, "
+                     "the bright parts glow brighter and wider; below, fainter.";
+            s.choices = {{"0", "0%"}, {"0.25", "25%"}, {"0.5", "50%"}, {"0.75", "75%"}, {"1", "100%"}, {"1.25", "125%"}, {"1.5", "150%"}, {"1.75", "175%"}, {"2", "200%"}};
+            s.defaultValue = "1.5";
+            s.apply = [](const std::string &value) {
+                frame::setBloomStrength(static_cast<float>(std::atof(value.c_str())));
+                return true;
+            };
+            s.available = []() { return ps2_settings::choice("TF_NATIVE_BLOOM") == "1"; };
+            s.unavailableHelp = "Turn it on first (the row above).";
+            ps2_settings::add(s);
+        }
+        // (TODO 108 (2)) Its tone mapping (TF_NATIVE_TONEMAP, live, off by default - the picture as the game draws it).
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_TONEMAP";
+            s.section = "Graphics";
+            s.label = "Tone mapping (native renderer)";
+            s.order = 58;
+            s.help = "Native renderer: Filmic gives the 3D scene a film-like tone curve - highlights roll off softly instead "
+                     "of clipping, mid-tones keep their brightness, shadows get a little deeper. Off: the colours as the game "
+                     "draws them. The HUD and menus are not changed.";
+            s.choices = {{"0", "Off"}, {"1", "Filmic"}};
+            s.defaultValue = "0";
+            s.apply = [](const std::string &value) {
+                frame::setTone(value == "1" ? 1 : 0);
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
+        // (TODO 108) The tone mapping's strength (the F1 slider).
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_TONE_STRENGTH";
+            s.section = "Graphics";
+            s.label = "Tone mapping strength (native renderer)";
+            s.order = 58;
+            s.help = "Native renderer, the filmic tone mapping: how strong the curve is - contrast, richer highlights and colour, "
+                     "deeper shadows. 0% is the picture as the game draws it.";
+            s.choices = {{"0", "0%"}, {"0.1", "10%"}, {"0.2", "20%"}, {"0.3", "30%"}, {"0.4", "40%"}, {"0.5", "50%"}, {"0.6", "60%"}, {"0.7", "70%"}, {"0.8", "80%"}, {"0.9", "90%"}, {"1", "100%"}};
+            s.defaultValue = "0.6";
+            s.apply = [](const std::string &value) {
+                frame::setToneStrength(static_cast<float>(std::atof(value.c_str())));
+                return true;
+            };
+            s.available = []() { return ps2_settings::choice("TF_NATIVE_TONEMAP") == "1"; };
+            s.unavailableHelp = "Turn it on first (the row above).";
             ps2_settings::add(s);
         }
         // Its supersampling (TF_NATIVE_SSAA, live, off by default): the 3D drawn at 1.5x the screen's pixels each way.

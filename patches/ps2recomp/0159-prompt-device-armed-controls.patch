@@ -1,0 +1,92 @@
+Subject: [PATCH] The device the prompts follow: a gamepad control counts once seen at rest (an axis resting at one end, a button held, never make the keyboard player's prompts the controller's); which device and why logged
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 677c486..6f5320b 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1002,8 +1002,48 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ 
+     // What the gamepad does this read (the device the player uses: lastDevice).
+     const bool gamepadConnected = sonyPad || gamepad >= 0;
+-    const bool gamepadUsed = btns != 0xFFFFu || std::fabs(padLx) > 0.5f || std::fabs(padLy) > 0.5f || std::fabs(padRx) > 0.5f ||
+-                             std::fabs(padRy) > 0.5f;
++    // (patch 0159, TODO 260) A control counts as the player's only once it has been seen at rest since the device
++    // came: a stick near its middle, a button (or a trigger, through the layout) let go. A device that is no
++    // controller to the player - an axis resting at one end (a pedal, a throttle, a mapping tool's virtual pad left
++    // off-centre), a button reported held - would else be "the gamepad used" on every read, the keyboard
++    // never the device and the prompts the controller's with only the keyboard in use.
++    static bool axisArmed[4] = {};
++    static uint16_t buttonArmed = 0u; // (a bit per game button: seen let go)
++    const float padAxes[4] = {padLx, padLy, padRx, padRy};
++    bool gamepadUsed = false;
++    const char *usedBy = nullptr;
++    static bool wasConnected = false;
++    if (gamepadConnected && !wasConnected)
++        std::fprintf(stderr, "[pad] a controller is there: '%s'\n",
++                     sonyPad ? "DualSense / DualShock 4" : (GetGamepadName(gamepad) ? GetGamepadName(gamepad) : "?"));
++    wasConnected = gamepadConnected;
++    if (!gamepadConnected)
++    {
++        for (bool &armed : axisArmed)
++            armed = false;
++        buttonArmed = 0u;
++    }
++    else
++    {
++        static const char *const kAxisNames[4] = {"left stick", "left stick", "right stick", "right stick"};
++        for (int a = 0; a < 4; ++a)
++        {
++            if (std::fabs(padAxes[a]) < 0.25f)
++                axisArmed[a] = true;
++            else if (axisArmed[a] && std::fabs(padAxes[a]) > 0.5f && !gamepadUsed)
++            {
++                gamepadUsed = true;
++                usedBy = kAxisNames[a];
++            }
++        }
++        const uint16_t pressed = static_cast<uint16_t>(~btns);
++        buttonArmed = static_cast<uint16_t>(buttonArmed | btns); // (a released bit is 1)
++        if ((pressed & buttonArmed) != 0u && !gamepadUsed)
++        {
++            gamepadUsed = true;
++            usedBy = "a button";
++        }
++    }
+     bool keyboardUsed = false;
+ 
+     // Keyboard and mouse buttons, on top of the gamepad: the layout (kDefaultKeymap, PS2X_KEYMAP,
+@@ -1077,10 +1117,30 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         g_padStyle.store(sonyPad ? ps2_host_input::PadStyle::PlayStation :
+                         ps2_host_input::padStyleForName(GetGamepadName(gamepad)), std::memory_order_relaxed);
+     g_gamepadConnected.store(gamepadConnected, std::memory_order_relaxed);
+-    if (gamepadUsed)
+-        g_lastDevice.store(static_cast<int>(ps2_host_input::Device::Gamepad), std::memory_order_relaxed);
+-    else if (keyboardUsed)
+-        g_lastDevice.store(static_cast<int>(ps2_host_input::Device::Keyboard), std::memory_order_relaxed);
++    {
++        const int before = g_lastDevice.load(std::memory_order_relaxed);
++        int now = before;
++        if (gamepadUsed)
++            now = static_cast<int>(ps2_host_input::Device::Gamepad);
++        else if (keyboardUsed)
++            now = static_cast<int>(ps2_host_input::Device::Keyboard);
++        if (now != before)
++        {
++            g_lastDevice.store(now, std::memory_order_relaxed);
++            // (patch 0159) Which device the prompts follow, and what made it so (the first changes of a run, and
++            // then every 50th: a player who switches all the time fills no log).
++            static int changes = 0;
++            if (++changes <= 20 || changes % 50 == 0)
++            {
++                if (gamepadUsed)
++                    std::fprintf(stderr, "[pad] the device used last: the gamepad '%s' (its %s)\n",
++                                 sonyPad ? "DualSense / DualShock 4" : (GetGamepadName(gamepad) ? GetGamepadName(gamepad) : "?"),
++                                 usedBy ? usedBy : "input");
++                else
++                    std::fprintf(stderr, "[pad] the device used last: the keyboard and mouse\n");
++            }
++        }
++    }
+ 
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);

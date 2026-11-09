@@ -90,6 +90,9 @@ namespace ext
         void (*addDecompFunctions)() = nullptr;
         // Its last words before a test run's quit (TF_QUIT_VSYNC ends the process without exit handlers).
         void (*beforeQuit)() = nullptr;
+        // The character the player plays when it is its own (Discord status, discord_presence.h): its name and the
+        // art asset key of its small image; false: none of its own (the Autobot is shown).
+        bool (*presenceCharacter)(const uint8_t *rdram, std::string &name, std::string &imageKey) = nullptr;
     };
 
     // Registers an extension (kept by pointer: give it static storage).
@@ -121,6 +124,8 @@ namespace ext
     bool restartGame(bool clicked);
     void addDecompFunctions();
     void beforeQuit();
+    // The first extension's character (presenceCharacter above); false: none.
+    bool presenceCharacter(const uint8_t *rdram, std::string &name, std::string &imageKey);
 }
 
 #define TF_EXT_CAT2(a, b) a##b

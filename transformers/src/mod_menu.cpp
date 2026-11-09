@@ -7,6 +7,7 @@
 #include "photo_mode.h"
 #include "menu_style.h"
 #include "menu_mouse.h"
+#include "pad_speaker.h"
 #include "small_crosshair.h"
 #include "boss_cheat.h"
 #include "distance_meter.h"
@@ -2802,6 +2803,7 @@ namespace mod_menu
             const bool top = paused && frames - g_pauseInputFrame.load() <= 2u;
             g_inMenu.store(read(kGame) == 0u ? 1 : (paused ? (top ? 3 : 2) : 0), std::memory_order_relaxed);
             menu_mouse::frame(rdram, paused && read(kGame) != 0u); // (the pause menu: menu_mouse.h)
+            pad_speaker::setLevelPaused(paused && read(kGame) != 0u); // (TODO 257: Show Objective's message)
 #if defined(PS2X_ENABLE_DEBUG_UI)
             if (static bool listed = std::getenv("TF_MOD_MENU_LIST") == nullptr; !listed && frames >= 120u)
             {

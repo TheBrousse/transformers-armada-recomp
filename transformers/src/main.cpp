@@ -23,6 +23,7 @@
 #include "start_screens.h"
 #include "save_io.h"
 #include "ultrawide.h"
+#include "discord_presence.h"
 #include "updates.h"
 #include "self_log.h"
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -493,6 +494,7 @@ int main(int argc, char *argv[])
         updates::afterRun(runtime);
 
         ps2x::sonypad::shutdown();    // a DualSense's motors off, its LEDs back to the pad (ps2_sony_pad.h)
+        discord_presence::shutdown(); // the Discord status cleared (discord_presence.h)
         ps2_audio_stream::shutdown(); // completes a PS2X_AUDIO_DUMP file
         std::cout.flush();
         std::cerr.flush();

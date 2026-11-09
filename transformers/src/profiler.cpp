@@ -857,6 +857,48 @@ namespace
         std::fflush(stderr);
     }
 
+    // (TODO 256) Where the stop request came from - the window closed, a menu's quit, a test's TF_QUIT_VSYNC, the updater,
+    // an extension that could not install... - logged once, on the requesting thread, with its caller's stack (the
+    // runtime's own line says whether it came before the game started). Repeated by the exit watchdog.
+    std::mutex g_stopFromMutex;
+    std::string g_stopFrom;
+
+    void noteStopSource(bool beforeRun)
+    {
+        void *frames[24] = {};
+        const USHORT count = CaptureStackBackTrace(2, 24, frames, nullptr); // (past this and PS2Runtime::requestStop)
+        HANDLE process = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+        SymSetOptions(SymGetOptions() | SYMOPT_IGNORE_CVREC);
+        SymInitialize(process, exeDirectory().c_str(), TRUE);
+        char line[64];
+        std::snprintf(line, sizeof(line), "thread %lu%s:", static_cast<unsigned long>(GetCurrentThreadId()),
+                      beforeRun ? ", before the game started" : "");
+        std::string text = line;
+        for (USHORT i = 0; i < count && i < 10; ++i)
+        {
+            const std::string name = symbolFor(process, reinterpret_cast<DWORD64>(frames[i]));
+            if (name == "BaseThreadInitThunk" || name == "RtlUserThreadStart")
+                break;
+            text += (i ? " <- " : " ") + name;
+            // (the requesting function's line too: one function asks for a stop at many places)
+            IMAGEHLP_LINE64 where{};
+            where.SizeOfStruct = sizeof(where);
+            DWORD offset = 0;
+            if (i == 0 && SymGetLineFromAddr64(process, reinterpret_cast<DWORD64>(frames[i]) - 1, &offset, &where) && where.FileName)
+            {
+                const char *file = std::strrchr(where.FileName, '\\');
+                text += " (" + std::string(file ? file + 1 : where.FileName) + ":" + std::to_string(where.LineNumber) + ")";
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_stopFromMutex);
+            g_stopFrom = text;
+        }
+        std::fprintf(stderr, "[tf] the stop came from %s\n", text.c_str());
+        std::fflush(stderr);
+    }
+
     // Shutdown watchdog. Once the runtime was asked to stop (the window was closed, or
     // TF_QUIT_VSYNC was reached) the process should be gone within moments. If it is still
     // here after a few seconds something is stuck: say where, and end the process so that
@@ -866,7 +908,13 @@ namespace
         while (!g_tfRuntime || !g_tfRuntime->isStopRequested())
             Sleep(250);
         Sleep(5000);
-        std::fprintf(stderr, "[tf] exit watchdog: still running 5 s after the stop request\n");
+        std::string from;
+        {
+            std::lock_guard<std::mutex> lock(g_stopFromMutex);
+            from = g_stopFrom;
+        }
+        std::fprintf(stderr, "[tf] exit watchdog: still running 5 s after the stop request (it came from %s)\n",
+                     from.empty() ? "an unknown place" : from.c_str());
         logAllThreads("exit watchdog");
         std::fflush(stdout);
         TerminateProcess(GetCurrentProcess(), 3);
@@ -1073,6 +1121,7 @@ namespace
     {
         ProfilerStarter()
         {
+            PS2Runtime::setStopObserver(&noteStopSource); // (TODO 256: every stop request's source in the log)
             std::thread(exitWatchdogMain).detach();
             if (const char *env = std::getenv("TF_WATCHDOG"); !env || *env != '0')
             {

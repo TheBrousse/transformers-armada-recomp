@@ -1,5 +1,36 @@
 # What's new
 
+## 0.4.2
+
+**New**
+- Discord status: while you play, your Discord profile can show the level you are in (or the HQ, the main menu,
+  or a film), the Autobot you play with a small picture, and for how long. It needs the Discord app running on
+  your PC; without it nothing happens. On by default; switch it off in F1 > Other > Discord status.
+- Two new looks for the native renderer in F1 > Graphics, both off by default: "Glow: Modern bloom" draws the
+  game's glow at your screen's full resolution, and "Tone mapping: Filmic" gives the 3D world a film-like look with
+  more contrast and richer colour. Each has a strength slider under it. The HUD and the menus stay as they are.
+- The button pictures in the game's prompts now follow your controller layout (F1 > Controls > Controller
+  buttons): with "Triggers fire", a Jump prompt shows L2 and a Fire prompt shows R2. The L1 / L2 / R1 / R2 labels
+  of the Mini-Con loadout in the HQ follow it too.
+
+**Fixed**
+- Playing with keyboard and mouse, the prompts could show PlayStation buttons (for example "(X) Open" at a
+  Mini-Con) when a controller that never rests was plugged in, such as a pedal, a flight stick or a virtual pad
+  from a mapping tool. Such a device now only counts once it has been seen at rest, so your keys are shown.
+  Thanks to SirCebollo for the report.
+- Antarctica: the whole picture could turn bright bluish white for a single frame.
+- A texture could sometimes be drawn from an older picture that had already been replaced. This was found while
+  looking into SirCebollo's report of a green and purple pattern on Antarctica's canyon floors; if you still see
+  that pattern, please tell us.
+- With a DualSense, a radio call you replay with Show Objective in the pause menu now plays from the controller's
+  speaker again, like the first time.
+- If something goes wrong while the game is starting, it now stops right away and its log says why. Before, the
+  game could start and then close on its own about 5 seconds later.
+
+**Changed**
+- More of the native renderer is now split into a game part and a graphics-card part, on the way to a Vulkan
+  renderer. Nothing should look different.
+
 ## 0.4.1
 
 **Fixed**
