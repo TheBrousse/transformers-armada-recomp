@@ -1,5 +1,11 @@
 # What's new
 
+## 0.4.0
+
+**Fixed**
+- The setup no longer stops at once with "powershell could not be started: program not found" on PCs whose PATH
+  is missing Windows' own folders. Download the new tfa-setup.exe and run it again.
+
 ## 0.3.9
 
 **Fixed**

@@ -527,7 +527,8 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
     /// Runs a program, its output into the log and turned into steps/details. Err = its last lines.
     fn exec(&self, exe: &str, args: &[&str], dir: Option<&Path>, path_env: &str, tx: &Sender<Msg>, step: usize,
             log: &Arc<Mutex<Option<std::fs::File>>>) -> Result<(), String> {
-        let mut cmd = Command::new(exe);
+        let mut cmd = Command::new(program(exe));
+        let path_env = with_system_dirs(path_env);
         // (PSModulePath dropped: started from PowerShell 7, Windows PowerShell would inherit its
         // module folders and miss its own commands - Get-FileHash, found in the first test)
         // (long paths for git and the build's own downloads: 260 characters is not enough in a
@@ -538,7 +539,7 @@ Git could not be installed or found. Install Git from git-scm.com and run the se
         cmd.env("GIT_CONFIG_KEY_1", "safe.directory").env("GIT_CONFIG_VALUE_1", "*");
         // (update.ps1 on a failure: no 30 s pause in a window nobody sees)
         cmd.env("TFA_UPDATE_NO_PAUSE", "1");
-        cmd.args(args).env("PATH", path_env).env_remove("PSModulePath").stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).creation_flags_no_window();
+        cmd.args(args).env("PATH", &path_env).env_remove("PSModulePath").stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).creation_flags_no_window();
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
@@ -763,7 +764,7 @@ fn desktop_shortcut_once(folder: &Path, repo: &Path) {
         return;
     }
     let script = "$d=[Environment]::GetFolderPath('Desktop'); $s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Transformers Armada.lnk'));                   $s.TargetPath=$env:TFA_TARGET; $s.WorkingDirectory=$env:TFA_DIR; $s.IconLocation=$env:TFA_ICON+',0';                   $s.Description='Transformers Armada (PC)'; $s.Save()";
-    let ok = Command::new("powershell")
+    let ok = Command::new(program("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("TFA_TARGET", folder.join("tfa-setup.exe"))
         .env("TFA_DIR", folder)
@@ -1103,6 +1104,34 @@ fn with_git_dir(path_env: &str) -> String {
         Some(d) => format!("{};{path_env}", d.display()),
         None => path_env.to_string(),
     }
+}
+
+/// Windows' own folders added to a PATH that lacks them (at its end: the player's order stays). A player's PC had a PATH
+/// without them and the setup stopped at once: "powershell could not be started: program not found" (2026-11-09);
+/// setup.ps1 also runs cmd and winget, which need System32.
+fn with_system_dirs(path: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let mut out = path.trim_end_matches(';').to_string();
+    for dir in [format!(r"{root}\System32"), root.clone(), format!(r"{root}\System32\Wbem"),
+                format!(r"{root}\System32\WindowsPowerShell\v1.0")] {
+        if !out.split(';').any(|p| p.trim().trim_end_matches('\\').eq_ignore_ascii_case(&dir)) {
+            if !out.is_empty() { out.push(';'); }
+            out.push_str(&dir);
+        }
+    }
+    out
+}
+
+/// The program to start: Windows PowerShell by its full path (found even when PATH lacks its folder), else the name.
+fn program(exe: &str) -> PathBuf {
+    if exe.eq_ignore_ascii_case("powershell") {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let full = PathBuf::from(format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"));
+        if full.is_file() {
+            return full;
+        }
+    }
+    PathBuf::from(exe)
 }
 
 /// PATH as the registry has it now (programs installed meanwhile), plus what we had.
@@ -1563,4 +1592,35 @@ fn main() -> eframe::Result {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Ok(Box::new(app))
     }))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn system_dirs_added_once_at_the_end() {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let out = with_system_dirs(r"C:\Tools;");
+        assert!(out.starts_with(r"C:\Tools;"));
+        assert!(out.to_lowercase().contains(&format!(r"{root}\System32\WindowsPowerShell\v1.0").to_lowercase()));
+        assert_eq!(with_system_dirs(&out), out);
+    }
+
+    #[test]
+    fn powershell_found_by_full_path() {
+        assert!(program("powershell").is_absolute());
+        assert!(program("powershell").is_file());
+        assert_eq!(program("winget"), PathBuf::from("winget"));
+    }
+
+    #[test]
+    fn powershell_starts_with_an_empty_path() {
+        let out = Command::new(program("powershell"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Get-Command cmd | Select-Object -Expand Source"])
+            .env("PATH", with_system_dirs(""))
+            .output()
+            .expect("powershell starts without PATH");
+        assert!(String::from_utf8_lossy(&out.stdout).to_lowercase().contains("cmd.exe"));
+    }
 }
