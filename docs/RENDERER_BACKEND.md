@@ -192,6 +192,13 @@ the strength (0: as it was, 1: the whole curve, faded out in the deepest shadows
 added after (0: none; the frame builder gives 0.3 x the strength). RGBA8. Recorded once a frame where the anti-aliasing is, just before
 it. A backend without it returns false from `effect()`: the picture is drawn as it is.
 
+`LocalContrast` (the local contrast, an option, off by default): the picture's copy (`t0`) with k times its luminance's
+difference from a blur of it (`t1`, any size, sampled linear with `s4`; the difference held to +-0.2) added to each
+channel, into the picture, its colour only (alpha kept). Constants (b0): 1 / the target's width and height, k. RGBA8.
+The frame builder makes the blur with `BloomDown` (no threshold, from the picture straight to a quarter of its size,
+then down to 1/16) and `BloomUp` (the blend factor 0: each step replaces the level above, back up to the quarter), and records it where the anti-aliasing is, before the tone mapping. A backend without
+it returns false from `effect()`: the picture is drawn as it is.
+
 ### 4.5 Queries, statistics, predication, read-backs
 
 | Call | Rules | D3D12 |
@@ -237,7 +244,7 @@ images), `R32_FLOAT`, depth `D32_FLOAT` on an `R32_TYPELESS` resource (sampled b
 
 **Shaders.** HLSL, as string literals in `nr_d3d.cpp`: `kShader` (the GS draws: vertex shader `vs`, pixel shader `ps`,
 the clipping geometry shader `gsClip`), `kAaShader` (FXAA), `kSmaaPrelude` and `kSmaaEntries` (SMAA 1x),
-`kProbeShader`, `kCloudShader`, `kBloomShader` (the modern bloom's two steps), `kToneShader` (the tone mapping), and the grass compute shader. They are compiled at start with `D3DCompile` at Shader
+`kProbeShader`, `kCloudShader`, `kBloomShader` (the modern bloom's two steps), `kToneShader` (the tone mapping), `kClarityShader` (the local contrast), and the grass compute shader. They are compiled at start with `D3DCompile` at Shader
 Model 5.1 (`vs_5_1`, `ps_5_1`, `gs_5_1`; the grass `cs_5_0`). The pixel shader has variants: the `PSV_` defines compile
 only the paths a draw uses (`PipelineDesc::variant`); until a variant is ready the device draws with the whole shader,
 which gives the same pixels. Compiled shaders and pipelines are kept on disk (`cache::`, `plib::`) and warmed at start.
@@ -375,7 +382,7 @@ A first Vulkan device can leave out everything optional and still draw the game:
 Optional, each with a way to say no: the GPU grass (`grassGpuReady` false), pipeline statistics (`pipelineStats`
 false), predication (`predication` false), the clipping geometry shader (off on AMD already), extra moment pictures
 (`TF_POSES` off by default), the modern bloom (`effect(BloomDown)` false: the game's glow is drawn), the tone mapping
-(`effect(ToneMap)` false), `report`.
+(`effect(ToneMap)` false), the local contrast (`effect(LocalContrast)` false), `report`.
 
 ## Appendix: how the split was made
 

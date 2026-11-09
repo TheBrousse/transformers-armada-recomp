@@ -1,5 +1,31 @@
 # What's new
 
+## 0.4.4
+
+**New**
+- Render scale (F1 > Graphics, native renderer): draws the picture with fewer pixels and enlarges it to fill the
+  window, at 100%, 85%, 75%, 67% or 50%. Softer, but much lighter for the graphics card: on integrated graphics
+  that cannot keep up at the screen's resolution it can more than double the frames you see. 100% by default, so
+  nothing changes unless you pick it. Thanks to TheBrousse.
+- VSync setting (F1 > Graphics). On, as before, the game draws at most one picture per screen refresh. Off, it
+  draws as many as your PC can, even on a 60 Hz screen (lower input delay, the picture may tear). The frame rate
+  cap still applies.
+- Local contrast (F1 > Graphics, native renderer, off by default): gives rocks, ice and metal more depth while
+  keeping the colours and the overall brightness. It has a strength slider. The HUD and the menus are not changed.
+
+**Changed**
+- Faster start-up with the native renderer: its shaders are now made while the game is built and stored inside
+  it, so even the very first start on a PC no longer spends several seconds (up to 20 seconds on low-end PCs)
+  preparing them. The grass shaders, which were prepared again at every start, are now kept too. Thanks to
+  TheBrousse.
+
+**Fixed**
+- On a 60 Hz screen the HQ's Drop Zones screen no longer drops to 15 or 30 frames a second; it now runs at 60 like
+  the rest of the HQ.
+- The game's film player now finds the sound of films whose sound is marked a little differently. On the European
+  disc this made the Melbourne House logo and the intro movie stop the game with an error screen; the US disc's
+  films were not affected. Thanks to TheBrousse.
+
 ## 0.4.3
 
 **Fixed**

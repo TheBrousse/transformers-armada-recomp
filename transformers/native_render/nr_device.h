@@ -87,6 +87,9 @@ namespace nr::gfx
         ToneMap,     // (TODO 108) the filmic tone mapping: the picture's copy (t0) into the picture, its colour only (alpha
                      // kept), RGBA8. b0: exposure, the inverse curve's k, the strength (0: as it was, 1: the full curve,
                      // faded out below sRGB 0.25), the saturation added after (0: none)
+        LocalContrast, // (TODO 108) the local contrast: the picture's copy (t0) with its luminance's difference from a blur
+                       // of it (t1, any size, sampled linear) added, k times, into the picture - its colour only (alpha kept),
+                       // RGBA8. b0: 1 / the target's width, height; k
     };
 
     struct PipelineDesc

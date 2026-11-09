@@ -1,0 +1,65 @@
+Subject: [PATCH] Runtime: a movie picture's decode charged at the frames' scale at 60 too (TODO 266)
+
+A movie picture's decode is charged 10 ms of the console's EE time, scaled by the frames' time scale while the
+game runs at a port's frame rate (the HQ's level previews). That was told by the VBlank period differing from
+the console's, but at 60 frames a second the period IS the console's: the full 10 ms went against a frame of
+16.7 ms, and once a preview frame waited for its picture every frame after it took two VBlanks (the HQ at 30,
+and at 15 once the rate fell to 30). EeScheduler::vblankPeriodSet tells whether a port's period was given
+(setVBlankPeriod above 0); the charge is scaled then too.
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -444,6 +444,9 @@
+     {
+         return std::chrono::nanoseconds(m_vblankPeriodNs.load(std::memory_order_relaxed));
+     }
++    // Whether the period was given (setVBlankPeriod with a period above 0: a port's frame rate) rather than left the
++    // console's - true at a rate of 60 too, whose period is the console's (TODO 266).
++    [[nodiscard]] bool vblankPeriodSet() const noexcept { return m_vblankPeriodSet.load(std::memory_order_relaxed); }
+     [[nodiscard]] uint64_t vblankPeriodCycles() const noexcept
+     {
+         // (rounded up, as the cycles of the console's period always were)
+@@ -747,6 +750,7 @@
+     std::atomic<uint32_t> m_cycleScaleOverride{0u}; // setCycleScale, in 1/256 (0: none)
+     std::atomic<int> m_maxPacingLag{0}; // setMaxPacingLag (0: kMaxPacingLagVBlanks)
+     std::atomic<int64_t> m_vblankPeriodNs{kConsoleVBlankPeriod.count()}; // setVBlankPeriod
++    std::atomic<bool> m_vblankPeriodSet{false};                           // setVBlankPeriod (above 0)
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+     std::atomic<bool> m_guestExecuting{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -579,6 +579,7 @@
+ void EeScheduler::setVBlankPeriod(std::chrono::nanoseconds period) noexcept
+ {
+     // (1 ms to 100 ms: 1000 to 10 VBlanks a second)
++    m_vblankPeriodSet.store(period.count() > 0, std::memory_order_relaxed);
+     if (period.count() <= 0)
+         period = kConsoleVBlankPeriod;
+     period = std::clamp(period, std::chrono::nanoseconds(1000000), std::chrono::nanoseconds(100000000));
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -3016,7 +3016,10 @@
+                 // frames a second scales its code by 30/R and its VBlanks by 60/R, and a fixed 10 ms then spilled
+                 // every frame that took a picture into the next VBlank (a game at 240 has 4.2 ms a frame) - the
+                 // HQ's level previews held its frames to 80 a second. While the VBlanks are the console's (a
+-                // movie of the window's own, the boot) the scale stays 1: the charge as before.
++                // movie of the window's own, the boot) the scale stays 1: the charge as before. (TODO 266: told by
++                // the period having been set, not by its length - at 60 frames a second it is the console's length
++                // too, the full 10 ms was charged against a frame of 16.7, and a preview frame that waited once
++                // kept every frame after it at two VBlanks: the HQ at 30.)
+                 // PS2X_MPEG_SCALE_CHARGE=0: always the fixed 10 ms.
+                 static const bool scaleCharge = []()
+                 {
+@@ -3025,7 +3028,7 @@
+                 }();
+                 EeScheduler &ee = runtime->eeScheduler();
+                 uint32_t charge = kPictureDecodeCycles;
+-                if (scaleCharge && ee.vblankPeriod() != EeScheduler::kConsoleVBlankPeriod)
++                if (scaleCharge && (ee.vblankPeriodSet() || ee.vblankPeriod() != EeScheduler::kConsoleVBlankPeriod))
+                     charge = static_cast<uint32_t>((static_cast<uint64_t>(kPictureDecodeCycles) * ee.currentCycleScale256()) >> 8u);
+                 static uint32_t lastSaid = kPictureDecodeCycles;
+                 if (charge != lastSaid)

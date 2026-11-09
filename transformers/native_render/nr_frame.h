@@ -114,6 +114,43 @@ namespace nr::frame
     inline float toneStrength() { return strengthOf(g_toneStrength, "TF_NATIVE_TONE_STRENGTH", kToneStrengthDefault, 1.0f); }
     inline void setBloomStrength(float s) { g_bloomStrength.store(std::clamp(s, 0.0f, 2.0f), std::memory_order_relaxed); }
     inline void setToneStrength(float s) { g_toneStrength.store(std::clamp(s, 0.0f, 1.0f), std::memory_order_relaxed); }
+    // (TODO 108 (3) C1, TF_NATIVE_CLARITY: 1 the local contrast over the 3D; unset or 0 none. Its strength, the F1 slider,
+    // 0..1: TF_NATIVE_CLARITY_STRENGTH.)
+    inline std::atomic<int> g_clarity{-1};
+    inline int clarityMode()
+    {
+        int v = g_clarity.load(std::memory_order_relaxed);
+        if (v < 0)
+        {
+            const char *e = std::getenv("TF_NATIVE_CLARITY");
+            int expected = -1;
+            g_clarity.compare_exchange_strong(expected, e && *e == '1' ? 1 : 0);
+            v = g_clarity.load(std::memory_order_relaxed);
+        }
+        return v;
+    }
+    inline void setClarity(int mode) { g_clarity.store(mode ? 1 : 0, std::memory_order_relaxed); }
+    inline constexpr float kClarityStrengthDefault = 0.5f;
+    inline std::atomic<float> g_clarityStrength{-1.0f};
+    inline float clarityStrength() { return strengthOf(g_clarityStrength, "TF_NATIVE_CLARITY_STRENGTH", kClarityStrengthDefault, 1.0f); }
+    inline void setClarityStrength(float s) { g_clarityStrength.store(std::clamp(s, 0.0f, 1.0f), std::memory_order_relaxed); }
+    // The render scale (TF_NATIVE_RENDER_SCALE, the F1 setting, 25..100, default 100): the picture drawn with that share of
+    // the window's lines and shown enlarged to it - for graphics cards that cannot fill the screen's pixels at the game's
+    // rate. TF_NATIVE_HEIGHT, when set, still fixes the lines. Read from the environment at first use, then set live.
+    inline std::atomic<int> g_renderScale{-1};
+    inline int renderScale()
+    {
+        int v = g_renderScale.load(std::memory_order_relaxed);
+        if (v < 0)
+        {
+            const char *e = std::getenv("TF_NATIVE_RENDER_SCALE");
+            int expected = -1;
+            g_renderScale.compare_exchange_strong(expected, e && *e ? std::clamp(std::atoi(e), 25, 100) : 100);
+            v = g_renderScale.load(std::memory_order_relaxed);
+        }
+        return v;
+    }
+    inline void setRenderScale(int percent) { g_renderScale.store(std::clamp(percent, 25, 100), std::memory_order_relaxed); }
 
     // ---- The game textures' mip chains (the frame builder's, and the D3D12 device's own uploads) ----
     void halveLevel(const uint32_t *src, uint32_t pw, uint32_t ph, uint32_t *dst);

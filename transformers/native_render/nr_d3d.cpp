@@ -947,6 +947,34 @@ float4 tonePs(float4 pos : SV_Position) : SV_Target
 }
 )";
 
+        // (TODO 108 (3) C1) The local contrast (TF_NATIVE_CLARITY, off by default): the picture's luminance lifted against a wide
+        // blur of itself - k times the difference added to each channel (the colours kept), the difference held to +-0.2 so
+        // hard edges get no halo. A full-screen triangle, before the HUD; s4 = linear, clamped.
+        const char kClarityShader[] = R"(
+cbuffer Clarity : register(b0)
+{
+    float4 clarityParam; // xy 1 / the target's width, height; z k
+};
+Texture2D<float4> clarityIn : register(t0);
+Texture2D<float4> clarityBlur : register(t1);
+SamplerState clarityLinear : register(s4);
+
+float4 clarityVs(uint id : SV_VertexID) : SV_Position
+{
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 clarityPs(float4 pos : SV_Position) : SV_Target
+{
+    const float3 c = clarityIn.Load(int3(pos.xy, 0)).rgb;
+    const float3 b = clarityBlur.SampleLevel(clarityLinear, pos.xy * clarityParam.xy, 0).rgb;
+    const float3 w = float3(0.2126, 0.7152, 0.0722);
+    const float d = clamp(dot(c, w) - dot(b, w), -0.2, 0.2);
+    return float4(saturate(c + d * clarityParam.z), 1.0);
+}
+)";
+
         const char kAaShader[] = R"(
 cbuffer Aa : register(b0)
 {
@@ -1367,6 +1395,7 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
             ID3D12PipelineState *aaPipeline = nullptr;
             ID3D12PipelineState *bloomDownPipeline = nullptr, *bloomUpPipeline = nullptr; // (TODO 108: the modern bloom's)
             ID3D12PipelineState *tonePipeline = nullptr;                                 // (TODO 108: the tone mapping's)
+            ID3D12PipelineState *clarityPipeline = nullptr;                              // (TODO 108: the local contrast's)
             UINT64 timestampHz = 0;
             // (P3 S3) The device's time stamps (gfx timestamp(): kTimestampsPerFrame a slot, resolved at closeFrame) and
             // statistics (pipelineStats(): made on the first ask, kStatEntriesPerFrame a slot), each with its readback.
@@ -1539,6 +1568,37 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
                 return blob;
             }
 
+            // The shaders built into the executable: build.ps1 runs `TransformersRecomp --bake-shaders <file>` after
+            // linking (bakeShaders below: every shader this file compiles, through compile()), and builds the table
+            // it writes in, so no start compiles them - the first one on a PC included (the grass's took ~15 s on an
+            // N100). CMake starts with an empty table; a key it lacks goes on to the cache and the compiler as before.
+            struct BakedShader
+            {
+                uint64_t key;
+                const unsigned char *bytes;
+                size_t size;
+            };
+#include "nr_shaders_baked.inc"
+            std::atomic<uint32_t> g_bakedHits{0};
+            bool g_baking = false; // (--bake-shaders: everything compiled afresh and collected, nothing written to the cache)
+            std::vector<std::pair<uint64_t, std::vector<uint8_t>>> g_bakedOut;
+
+            ID3DBlob *loadBaked(uint64_t key)
+            {
+                for (const BakedShader &b : kBakedShaders)
+                {
+                    if (b.key != key || b.size < 4u)
+                        continue;
+                    ID3DBlob *blob = nullptr;
+                    if (FAILED(D3DCreateBlob(b.size, &blob)))
+                        return nullptr;
+                    std::memcpy(blob->GetBufferPointer(), b.bytes, b.size);
+                    ++g_bakedHits;
+                    return blob;
+                }
+                return nullptr;
+            }
+
             void storeShader(uint64_t key, ID3DBlob *blob)
             {
                 if (dir().empty() || !blob)
@@ -1551,10 +1611,10 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
         }
 
         ID3DBlob *compile(const char *entry, const char *target, const char *source = kShader, size_t size = sizeof(kShader) - 1,
-                          const D3D_SHADER_MACRO *defines = nullptr)
+                          const D3D_SHADER_MACRO *defines = nullptr, UINT extraFlags = 0)
         {
-            // (TODO 164 stage 3: from the shader cache when it has this source, entry point, target and defines)
-            const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+            // (TODO 164 stage 3: from the shader cache when it has this source, entry point, target, defines and flags)
+            const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | extraFlags;
             uint64_t key = cache::fnv(1469598103934665603ull, "nr shader cache 1", 17);
             const int compiler = D3D_COMPILER_VERSION;
             key = cache::fnv(key, &compiler, sizeof compiler);
@@ -1568,15 +1628,25 @@ float4 smaaBlendPs(SmaaBlendOut i) : SV_Target
                 if (d->Definition)
                     key = cache::fnv(key, d->Definition, std::strlen(d->Definition) + 1u);
             }
-            if (ID3DBlob *hit = cache::loadShader(key))
-                return hit;
+            if (!cache::g_baking)
+            {
+                if (ID3DBlob *hit = cache::loadBaked(key))
+                    return hit;
+                if (ID3DBlob *hit = cache::loadShader(key))
+                    return hit;
+            }
             ID3DBlob *code = nullptr, *errors = nullptr;
             const HRESULT hr = D3DCompile(source, size, "nr_shader", defines, nullptr, entry, target, flags, 0, &code, &errors);
             if (FAILED(hr))
                 std::fprintf(stderr, "[native render] shader %s: %s\n", entry,
                              errors ? static_cast<const char *>(errors->GetBufferPointer()) : "failed");
             release(errors);
-            if (code)
+            if (code && cache::g_baking)
+            {
+                const auto *p = static_cast<const uint8_t *>(code->GetBufferPointer());
+                cache::g_bakedOut.emplace_back(key, std::vector<uint8_t>(p, p + code->GetBufferSize()));
+            }
+            else if (code)
                 cache::storeShader(key, code);
             return code;
         }
@@ -2303,17 +2373,15 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 const char *entries[3] = {"CsCount", "CsScan", "CsWrite"};
                 for (int k = 0; k < 3; ++k)
                 {
-                    ID3DBlob *code = nullptr, *err = nullptr;
-                    const HRESULT hr = D3DCompile(kCs, sizeof(kCs) - 1, "nr_grass_cs", g_exact ? exact : nullptr, nullptr, entries[k], "cs_5_0",
-                                                  D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &err);
-                    if (FAILED(hr))
+                    // (from the shader cache like the others: compiled here at every start they took ~15 s of it on an
+                    // Intel UHD - N100 - with the optimizer at level 3 and IEEE strictness)
+                    ID3DBlob *code = compile(entries[k], "cs_5_0", kCs, sizeof(kCs) - 1, g_exact ? exact : nullptr,
+                                             D3DCOMPILE_IEEE_STRICTNESS);
+                    if (!code)
                     {
-                        std::fprintf(stderr, "[native render] grass on the GPU: shader %s: %s\n", entries[k],
-                                     err ? static_cast<const char *>(err->GetBufferPointer()) : "failed");
-                        release(err);
+                        std::fprintf(stderr, "[native render] grass on the GPU: shader %s failed\n", entries[k]);
                         return false;
                     }
-                    release(err);
                     D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
                     cd.pRootSignature = g_root;
                     cd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
@@ -4775,9 +4843,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             g.psInterp = compile("psInterp", "ps_5_1");
         }
         g.gsCode = compile("gsClip", "gs_5_1"); // (none: the GPU's clipper alone, as before)
-        std::fprintf(stderr, "[native render] shaders: %.0f ms (%u from the shader cache, %u compiled and kept)\n",
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shadersStart).count(), cache::g_shaderHits.load(),
-                     cache::g_shaderMade.load());
+        std::fprintf(stderr, "[native render] shaders: %.0f ms (%u built in, %u from the shader cache, %u compiled and kept)\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shadersStart).count(), cache::g_bakedHits.load(),
+                     cache::g_shaderHits.load(), cache::g_shaderMade.load());
         plib::open(); // (TODO 164: the pipelines kept on disk, the ones used before made ahead)
         plib::warm();
         {
@@ -4921,6 +4989,38 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 release(bu);
                 if (!g.bloomDownPipeline || !g.bloomUpPipeline)
                     std::fprintf(stderr, "[native render] the modern bloom could not be made: the game's glow is drawn\n");
+            }
+            // (TODO 108 C1) The local contrast's pipeline: written, the picture's alpha kept (none: the picture as drawn, told once).
+            {
+                ID3DBlob *cv = compile("clarityVs", "vs_5_1", kClarityShader, sizeof(kClarityShader) - 1),
+                         *cp = compile("clarityPs", "ps_5_1", kClarityShader, sizeof(kClarityShader) - 1);
+                if (cv && cp)
+                {
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+                    pd.pRootSignature = g.root;
+                    pd.VS = {cv->GetBufferPointer(), cv->GetBufferSize()};
+                    pd.PS = {cp->GetBufferPointer(), cp->GetBufferSize()};
+                    D3D12_RENDER_TARGET_BLEND_DESC &rt = pd.BlendState.RenderTarget[0];
+                    rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+                    rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                    rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+                    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+                    pd.SampleMask = 0xFFFFFFFFu;
+                    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    pd.RasterizerState.DepthClipEnable = TRUE;
+                    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                    pd.NumRenderTargets = 1;
+                    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    pd.SampleDesc.Count = 1;
+                    if (FAILED(g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g.clarityPipeline))))
+                        g.clarityPipeline = nullptr;
+                }
+                release(cv);
+                release(cp);
+                if (!g.clarityPipeline)
+                    std::fprintf(stderr, "[native render] the local contrast could not be made: the picture is drawn as it is\n");
             }
             // (TODO 108) The tone mapping's pipeline: written, the picture's alpha kept (none: the picture as drawn, told once).
             {
@@ -6246,6 +6346,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 case gfx::Effect::BloomDown: return g.bloomDownPipeline != nullptr;
                 case gfx::Effect::BloomUp: return g.bloomUpPipeline != nullptr;
                 case gfx::Effect::ToneMap: return g.tonePipeline != nullptr;
+                case gfx::Effect::LocalContrast: return g.clarityPipeline != nullptr;
                 }
                 return false;
             }
@@ -6324,6 +6425,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                     case gfx::Effect::BloomDown: pso = g.bloomDownPipeline; break;
                     case gfx::Effect::BloomUp: pso = g.bloomUpPipeline; break;
                     case gfx::Effect::ToneMap: pso = g.tonePipeline; break;
+                    case gfx::Effect::LocalContrast: pso = g.clarityPipeline; break;
                     default: break;
                     }
                     if (!pso)
@@ -7087,6 +7189,116 @@ namespace nr::d3d
         }
         frame::render(input, shotPath);
     }
+
+    // --bake-shaders <file> (build.ps1, after linking): every shader this file compiles - the same sources, entry
+    // points, targets, defines and flags as at run time, so the same keys - written as the built-in table
+    // (nr_shaders_baked.inc, read by cache::loadBaked), and only when it differs: an unchanged table rebuilds nothing.
+    // No device is needed (D3DCompile only). A shader added later and not listed here is compiled at run time as before.
+    // Returns 0: the table is as it was, 2: written anew, 1: a shader failed.
+    int bakeShaders(const char *path)
+    {
+        cache::g_baking = true;
+        bool ok = true;
+        const auto take = [&ok](ID3DBlob *code) {
+            ok = ok && code != nullptr;
+            release(code);
+        };
+        // The main shader: its stages, the depth-test debug pair (TF_NATIVE_ZWALT) and every pixel-shader variant
+        // (psv::compileVariant: bit 0 set, the six PSV_ switches; equal define sets give the same key, kept once).
+        for (const char *entry : {"vs"})
+            take(compile(entry, "vs_5_1"));
+        for (const char *entry : {"ps", "psTiny", "psInterp"})
+            take(compile(entry, "ps_5_1"));
+        take(compile("gsClip", "gs_5_1"));
+        for (uint32_t v = 1u; v < 256u; v += 2u)
+            take(psv::compileVariant(v));
+        // The grass's compute shaders, with the double-precision divisions and without (grassgpu::init picks by the GPU).
+        {
+            const D3D_SHADER_MACRO exact[] = {{"EXACT_DIV", "1"}, {nullptr, nullptr}};
+            for (const char *entry : {"CsCount", "CsScan", "CsWrite"})
+                for (const D3D_SHADER_MACRO *defines : {static_cast<const D3D_SHADER_MACRO *>(exact), static_cast<const D3D_SHADER_MACRO *>(nullptr)})
+                    take(compile(entry, "cs_5_0", grassgpu::kCs, sizeof(grassgpu::kCs) - 1, defines, D3DCOMPILE_IEEE_STRICTNESS));
+        }
+        // FXAA, SMAA 1x (its source put together as at start), the probe and the clouds.
+        take(compile("aaVs", "vs_5_1", kAaShader, sizeof(kAaShader) - 1));
+        take(compile("aaPs", "ps_5_1", kAaShader, sizeof(kAaShader) - 1));
+        // (TODO 108) The modern bloom's and the tone mapping's (added after this list was first written).
+        take(compile("bloomVs", "vs_5_1", kBloomShader, sizeof(kBloomShader) - 1));
+        take(compile("bloomDownPs", "ps_5_1", kBloomShader, sizeof(kBloomShader) - 1));
+        take(compile("bloomUpPs", "ps_5_1", kBloomShader, sizeof(kBloomShader) - 1));
+        take(compile("toneVs", "vs_5_1", kToneShader, sizeof(kToneShader) - 1));
+        take(compile("tonePs", "ps_5_1", kToneShader, sizeof(kToneShader) - 1));
+        {
+            std::string src(kSmaaPrelude, sizeof(kSmaaPrelude) - 1);
+            for (const char *piece : kSmaaSource)
+                src += piece;
+            src.append(kSmaaEntries, sizeof(kSmaaEntries) - 1);
+            const char *const names[6] = {"smaaEdgeVs", "smaaEdgePs", "smaaWeightVs", "smaaWeightPs", "smaaBlendVs", "smaaBlendPs"};
+            for (int k = 0; k < 6; ++k)
+                take(compile(names[k], (k & 1) ? "ps_5_1" : "vs_5_1", src.c_str(), src.size()));
+        }
+        take(compile("probeVs", "vs_5_1", kProbeShader, sizeof(kProbeShader) - 1));
+        take(compile("probePs", "ps_5_1", kProbeShader, sizeof(kProbeShader) - 1));
+        take(compile("cloudVs", "vs_5_1", kCloudShader, sizeof(kCloudShader) - 1));
+        take(compile("cloudPs", "ps_5_1", kCloudShader, sizeof(kCloudShader) - 1));
+        if (!ok)
+        {
+            std::fprintf(stderr, "[native render] --bake-shaders: a shader failed to compile (see above); the table is left as it was\n");
+            return 1;
+        }
+
+        std::map<uint64_t, std::vector<uint8_t>> table(cache::g_bakedOut.begin(), cache::g_bakedOut.end());
+        std::string text = "// Generated by TransformersRecomp --bake-shaders (build.ps1): the native renderer's shaders, compiled\n"
+                           "// (nr_d3d.cpp, cache::loadBaked). Not kept in the repository; do not edit.\n";
+        size_t index = 0, bytes = 0;
+        char buf[64];
+        for (const auto &[key, code] : table)
+        {
+            std::snprintf(buf, sizeof(buf), "static const unsigned char kBaked%zu[] = {", index++);
+            text += buf;
+            for (size_t i = 0; i < code.size(); ++i)
+            {
+                std::snprintf(buf, sizeof(buf), "%s%u,", (i % 40u) == 0u ? "\n" : "", static_cast<unsigned>(code[i]));
+                text += buf;
+            }
+            text += "};\n";
+            bytes += code.size();
+        }
+        text += "static const BakedShader kBakedShaders[] = {\n";
+        index = 0;
+        for (const auto &[key, code] : table)
+        {
+            std::snprintf(buf, sizeof(buf), "    {0x%016llxull, kBaked%zu, sizeof(kBaked%zu)},\n", static_cast<unsigned long long>(key), index, index);
+            text += buf;
+            ++index;
+        }
+        text += "};\n";
+
+        std::string old;
+        if (FILE *f = std::fopen(path, "rb"))
+        {
+            char chunk[65536];
+            for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0;)
+                old.append(chunk, n);
+            std::fclose(f);
+        }
+        if (old == text)
+        {
+            std::printf("shaders: %zu built in, unchanged\n", table.size());
+            return 0;
+        }
+        FILE *f = std::fopen(path, "wb");
+        if (!f || std::fwrite(text.data(), 1, text.size(), f) != text.size())
+        {
+            if (f)
+                std::fclose(f);
+            std::fprintf(stderr, "[native render] --bake-shaders: cannot write %s\n", path);
+            return 1;
+        }
+        std::fclose(f);
+        std::printf("shaders: %zu built in (%zu KB), written to %s\n", table.size(), bytes / 1024u, path);
+        return 2;
+    }
 }
 
 // (nr_types.h's preUpload: the capture's textures made ahead, to this file's queue.)
@@ -7094,6 +7306,7 @@ namespace nr
 {
     void preUpload(const std::shared_ptr<const Texture> &texture) { d3d::preUploadImpl(texture); }
     bool rendererStarting() { return d3d::startingNow(); }
+    int bakeShaders(const char *path) { return d3d::bakeShaders(path); }
 }
 
 // (Roadmap P3, step S1) The Direct3D 12 backend as nr_backend.h's interface: today's nr::d3d calls behind it.

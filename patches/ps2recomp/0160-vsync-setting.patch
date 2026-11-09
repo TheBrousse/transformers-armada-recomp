@@ -1,0 +1,104 @@
+Subject: [PATCH] Runtime: VSync as a live setting (TODO 266)
+
+The presents' wait for the screen's refresh was taken from PS2X_PRESENT_SYNC once, at the start. It is now
+ps2_host_present::sync / setSync: 1 at the refresh always, 0 at once (allowed to tear), -1 by the screen - at
+its refresh where it keeps a clock of its own, at once with variable refresh (the default, as before).
+PS2X_PRESENT_SYNC=0 / 1 still sets it at the start; the game's VSync setting changes it while it runs. The DXGI
+present thread asks it for every present.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_present.h b/ps2xRuntime/include/runtime/ps2_host_present.h
+--- a/ps2xRuntime/include/runtime/ps2_host_present.h
++++ b/ps2xRuntime/include/runtime/ps2_host_present.h
+@@ -32,6 +32,13 @@
+     void begin();
+     void end();
+ 
++    // VSync (TODO 266): whether each present waits for the screen's refresh. 1: always; 0: never - the picture goes to
++    // the screen at once (allowed to tear); -1: by the screen - at its refresh where it keeps a clock of its own, at once
++    // where its refresh is variable (FreeSync, G-Sync). PS2X_PRESENT_SYNC=0 / 1 at the start sets it; live from any thread
++    // (the settings' VSync).
++    void setSync(int mode);
++    int sync();
++
+     // The Direct3D side (ps2_host_present_dxgi.cpp; Windows only).
+     namespace dxgi
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_host_present.cpp b/ps2xRuntime/src/lib/ps2_host_present.cpp
+--- a/ps2xRuntime/src/lib/ps2_host_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present.cpp
+@@ -6,6 +6,7 @@
+ #include "raylib.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -36,6 +37,30 @@
+         }
+     }
+ 
++    namespace
++    {
++        // (-2: not taken from PS2X_PRESENT_SYNC yet)
++        std::atomic<int> g_sync{-2};
++    }
++
++    void setSync(int mode)
++    {
++        g_sync.store(mode < 0 ? -1 : (mode > 0 ? 1 : 0), std::memory_order_relaxed);
++    }
++
++    int sync()
++    {
++        int mode = g_sync.load(std::memory_order_relaxed);
++        if (mode == -2)
++        {
++            const char *env = std::getenv("PS2X_PRESENT_SYNC");
++            int expected = -2;
++            g_sync.compare_exchange_strong(expected, (env && (*env == '0' || *env == '1')) ? *env - '0' : -1);
++            mode = g_sync.load(std::memory_order_relaxed);
++        }
++        return mode;
++    }
++
+     bool start(void *nativeWindow)
+     {
+         if (g_active || !requested())
+diff --git a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -26,7 +26,7 @@
+ // at once (allowed to tear) where its refresh is variable (ps2_host_display::screenVariable): the
+ // screen then refreshes for each picture as it comes. (With the wait and variable refresh, AMD's
+ // driver held each present for two of the screen's refreshes for seconds at a time: 62.5 pictures
+-// a second.) PS2X_PRESENT_SYNC=1 or 0: always the one. PS2X_PRESENT_STATS=1 adds the swap chain's
++// a second.) PS2X_PRESENT_SYNC=1 or 0, or the settings' VSync (ps2_host_present::setSync, live): always the one. PS2X_PRESENT_STATS=1 adds the swap chain's
+ // own count of pictures shown and refreshes every 2 s.
+ #include "runtime/ps2_host_present.h"
+ #include "runtime/ps2_host_display.h"
+@@ -157,13 +157,10 @@
+             return on;
+         }
+ 
++        // (TODO 266: the settings' VSync, live - ps2_host_present::sync, PS2X_PRESENT_SYNC at the start)
+         int syncInterval()
+         {
+-            static const int forced = []()
+-            {
+-                const char *env = std::getenv("PS2X_PRESENT_SYNC");
+-                return (env && (*env == '0' || *env == '1')) ? *env - '0' : -1;
+-            }();
++            const int forced = ps2_host_present::sync();
+             return forced >= 0 ? forced : (ps2_host_display::screenVariable() ? 0 : 1);
+         }
+ 
+@@ -837,7 +834,7 @@
+         g.thread = std::thread(run);
+         std::fprintf(stderr, "[present] Direct3D 11 on %ls; swap chain %dx%d, 3 buffers, flip discard%s; presents %s\n",
+                      adapterDesc.Description, g.width, g.height, g.tearing ? ", may tear" : "",
+-                     std::getenv("PS2X_PRESENT_SYNC") ? (syncInterval() ? "at the screen's refresh" : "at once")
++                     ps2_host_present::sync() >= 0 ? (syncInterval() ? "at the screen's refresh" : "at once")
+                                                       : "at the screen's refresh, or at once with variable refresh");
+         return true;
+     }

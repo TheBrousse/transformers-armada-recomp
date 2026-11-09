@@ -6394,6 +6394,46 @@ namespace nr
             s.unavailableHelp = "Turn it on first (the row above).";
             ps2_settings::add(s);
         }
+        // (TODO 108 (3) C1) Its local contrast (TF_NATIVE_CLARITY, live, off by default) and its strength (the F1 slider).
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_CLARITY";
+            s.section = "Graphics";
+            s.label = "Local contrast (native renderer)";
+            s.order = 59;
+            s.help = "Native renderer: brings out the detail of the 3D scene - rocks, ice, metal - against its surroundings, "
+                     "without changing its colours or overall brightness. The HUD and menus are not changed.";
+            s.choices = {{"0", "Off"}, {"1", "On"}};
+            s.defaultValue = "0";
+            s.apply = [](const std::string &value) {
+                frame::setClarity(value == "1" ? 1 : 0);
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_CLARITY_STRENGTH";
+            s.section = "Graphics";
+            s.label = "Local contrast strength (native renderer)";
+            s.order = 59;
+            s.help = "Native renderer, the local contrast: how strong it is. Too strong, it shows halos at hard edges and the "
+                     "textures' grain.";
+            s.choices = {{"0", "0%"}, {"0.1", "10%"}, {"0.2", "20%"}, {"0.3", "30%"}, {"0.4", "40%"}, {"0.5", "50%"}, {"0.6", "60%"}, {"0.7", "70%"}, {"0.8", "80%"}, {"0.9", "90%"}, {"1", "100%"}};
+            s.defaultValue = "0.5";
+            s.apply = [](const std::string &value) {
+                frame::setClarityStrength(static_cast<float>(std::atof(value.c_str())));
+                return true;
+            };
+            s.available = []() { return ps2_settings::choice("TF_NATIVE_CLARITY") == "1"; };
+            s.unavailableHelp = "Turn it on first (the row above).";
+            ps2_settings::add(s);
+        }
         // Its supersampling (TF_NATIVE_SSAA, live, off by default): the 3D drawn at 1.5x the screen's pixels each way.
         {
             ps2_settings::Setting s;
@@ -6408,6 +6448,31 @@ namespace nr
             s.defaultValue = "0";
             s.apply = [](const std::string &value) {
                 d3d::setSupersampling(value == "1");
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
+        // Its render scale (TF_NATIVE_RENDER_SCALE, live, 100% by default): fewer lines than the window's, shown enlarged.
+        // On a small integrated GPU (Intel N100 / UHD Graphics) the full-screen passes' pixels are what limits the frame
+        // rate: at 1080p it draws ~13 frames a second, at 50% ~34. (TheBrousse, PR #9 of the public repository.)
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_NATIVE_RENDER_SCALE";
+            s.section = "Graphics";
+            s.label = "Render scale (native renderer)";
+            s.order = 56;
+            s.help = "Native renderer: the picture drawn with fewer pixels than the window has and enlarged to fill it - "
+                     "softer, but much lighter for the graphics card. For integrated graphics that cannot keep up at the "
+                     "screen's resolution. 100%: the window's own resolution.";
+            s.choices = {{"100", "100%"}, {"85", "85%"}, {"75", "75%"}, {"67", "67%"}, {"50", "50%"}};
+            s.defaultValue = "100";
+            s.apply = [](const std::string &value) {
+                frame::setRenderScale(std::atoi(value.c_str()));
                 return true;
             };
             s.available = []() {

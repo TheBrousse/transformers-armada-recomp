@@ -1349,6 +1349,77 @@ namespace nr::frame
             return true;
         }
 
+        // (TODO 108 (3) C1) The local contrast over the picture as it is (the 3D in, the HUD not yet): a wide blur of the picture
+        // made with the bloom's steps and levels (from the picture straight to 1/4, down to 1/16, no threshold; up again to
+        // 1/4, each step replacing the level above - the blend factor 0), then the picture's copy and that blur through gfx::Effect::LocalContrast back into the picture.
+        // Leaves the picture bound as the render target, without its depth: the caller binds its own again. False: not run.
+        bool runClarity(State::Target &picture)
+        {
+            gfx::Device &dev = gfx::device();
+            constexpr int kDeep = 4; // (levels 0..3: 1/2 to 1/16 - a blur about a sixtieth of the picture wide)
+            if (!dev.effect(gfx::Effect::LocalContrast) || !dev.effect(gfx::Effect::BloomDown) || !dev.effect(gfx::Effect::BloomUp) || !picture.id ||
+                !bloom::levelsFor(g.pictureW, g.pictureH) || bloom::count < kDeep)
+                return false;
+            const auto pass = [&](gfx::Effect e, gfx::TargetId into, uint32_t iw, uint32_t ih, gfx::TextureId t0, gfx::TextureId t1, const float *k,
+                                  size_t floats) {
+                gfx::RingSpan cs;
+                if (!dev.ringAlloc(gfx::RingKind::Constants, kConstantStride, 256u, cs))
+                    return false;
+                std::memset(cs.cpu, 0, 128u);
+                std::memcpy(cs.cpu, k, floats * sizeof(float));
+                dev.setTarget(into, false);
+                dev.setViewport(0.0f, 0.0f, static_cast<float>(iw), static_cast<float>(ih));
+                dev.setScissor(gfx::Rect{0, 0, static_cast<int32_t>(iw), static_cast<int32_t>(ih)});
+                gfx::PipelineDesc pd;
+                pd.effect = e;
+                if (!dev.setPipeline(pd))
+                    return false;
+                dev.bindDrawConstants(cs);
+                dev.bindTextures(t0, t1, 0u);
+                dev.draw(3u, 0u);
+                return true;
+            };
+            // Down: the picture straight into level 1 (a quarter: the half-size step skipped - the blur is wide, and that step
+            // was the dearest), each level into the next (no threshold).
+            dev.use(picture.id, gfx::UseFor::Sample);
+            gfx::TextureId from = dev.view(picture.id);
+            uint32_t fw = g.pictureW, fh = g.pictureH;
+            for (int i = 1; i < kDeep; ++i)
+            {
+                const float k[8] = {1.0f / static_cast<float>(bloom::levelW[i]), 1.0f / static_cast<float>(bloom::levelH[i]), 1.0f / static_cast<float>(fw),
+                                    1.0f / static_cast<float>(fh), 0.0f, 0.0f, 0.0f, 0.0f};
+                dev.use(bloom::level[i], gfx::UseFor::Draw);
+                if (!pass(gfx::Effect::BloomDown, bloom::level[i], bloom::levelW[i], bloom::levelH[i], from, 0u, k, 8u))
+                    return false;
+                dev.use(bloom::level[i], gfx::UseFor::Sample);
+                from = dev.view(bloom::level[i]);
+                fw = bloom::levelW[i], fh = bloom::levelH[i];
+            }
+            // Up: each level enlarged into the one above, in its place (the blend factor 0: the level's own content dropped).
+            const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            dev.setBlendFactor(none);
+            for (int i = kDeep - 1; i >= 2; --i)
+            {
+                const float k[8] = {1.0f / static_cast<float>(bloom::levelW[i - 1]), 1.0f / static_cast<float>(bloom::levelH[i - 1]),
+                                    1.0f / static_cast<float>(bloom::levelW[i]), 1.0f / static_cast<float>(bloom::levelH[i]), 1.0f, 1.0f, 1.0f, 0.0f};
+                dev.use(bloom::level[i - 1], gfx::UseFor::Draw);
+                if (!pass(gfx::Effect::BloomUp, bloom::level[i - 1], bloom::levelW[i - 1], bloom::levelH[i - 1], dev.view(bloom::level[i]), 0u, k, 8u))
+                    return false;
+                dev.use(bloom::level[i - 1], gfx::UseFor::Sample);
+            }
+            const float whole[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            dev.setBlendFactor(whole);
+            // The picture: its copy and the blur (level 1, a quarter of the picture) into it.
+            const gfx::TextureId copy = dev.snapshot(picture.id);
+            if (!copy)
+                return false;
+            dev.use(picture.id, gfx::UseFor::Draw);
+            const float k[4] = {1.0f / static_cast<float>(g.pictureW), 1.0f / static_cast<float>(g.pictureH), 1.2f * clarityStrength(), 0.0f};
+            const bool done = pass(gfx::Effect::LocalContrast, picture.id, g.pictureW, g.pictureH, copy, dev.view(bloom::level[1]), k, 4u);
+            dev.bindTextures(0u, 0u, 0u);
+            return done;
+        }
+
         bool runProbe(State::Target &scene, const float rect[4], uint64_t tick)
         {
             gfx::Device &dev = gfx::device();
@@ -1712,7 +1783,8 @@ namespace nr::frame
             const char *v = std::getenv("TF_NATIVE_HEIGHT");
             return v && *v ? std::atoi(v) : 0;
         }();
-        const int window = g_windowLines.load(std::memory_order_relaxed);
+        // (the render scale: that share of the window's lines, the picture shown enlarged - setRenderScale; 100 unless set)
+        const int window = g_windowLines.load(std::memory_order_relaxed) * renderScale() / 100;
         // (TODO 255) A movie shown as a band of the picture's rows (ps2_host_display::setPictureBand): the picture as
         // many lines taller as the band is short of it, so the band itself still has the window's lines.
         float bandTop = 0.0f, bandBottom = 1.0f;
@@ -2768,6 +2840,9 @@ namespace nr::frame
         // (TODO 108 (2): the tone mapping, at the same place - first, the anti-aliasing then smooths the mapped picture)
         const bool toneWanted = toneMode() != 0 && dev.effect(gfx::Effect::ToneMap);
         bool toneDone = false;
+        // (TODO 108 C1: the local contrast, at the same place - before the tone mapping, on the picture as drawn)
+        const bool clarityWanted = clarityMode() != 0 && clarityStrength() > 0.0f && dev.effect(gfx::Effect::LocalContrast);
+        bool clarityDone = false;
         size_t aaAt = 0;
         std::unordered_set<const State::Target *> holds3D;
         // The sun's occlusion probe (roadmap N3a): the rect the game's visibility test copied this frame, run where its copy
@@ -3122,6 +3197,15 @@ namespace nr::frame
                         }
                     }
                 }
+                // (Debug, TODO 108 S1: TF_NATIVE_NOSHADOWREAD=1 - the draws that read another target's top byte through a palette
+                // left out: the shadow receivers - the player's shadow, the trees' and blob shadows on the ground. Not the lens
+                // filter, which reads its own target.)
+                static const bool noShadowRead = std::getenv("TF_NATIVE_NOSHADOWREAD") && *std::getenv("TF_NATIVE_NOSHADOWREAD") == '1';
+                if (noShadowRead && topSource && topSource != &tg)
+                {
+                    ++left;
+                    continue;
+                }
                 static const std::pair<uint32_t, uint32_t> targetDraws = [] {
                     const char *e = std::getenv("TF_NATIVE_TARGETDRAWS");
                     char *end = nullptr;
@@ -3170,6 +3254,12 @@ namespace nr::frame
                 {
                     // (3D: a geometry set, an instance, a microcode primitive - anything not a 2D GIF draw.)
                     const bool carries3D = !draw.mesh->immediate || (source && holds3D.count(source));
+                    if (clarityWanted && !clarityDone && tg.main && picture3D && !carries3D)
+                    {
+                        if (runClarity(tg))
+                            current = nullptr; // (the draw's target, depth and viewport bound again)
+                        clarityDone = true;
+                    }
                     if (toneWanted && !toneDone && tg.main && picture3D && !carries3D)
                     {
                         if (runTone(tg))
@@ -4245,6 +4335,11 @@ namespace nr::frame
                          static_cast<unsigned long long>(g_clipCulled[0]), static_cast<unsigned long long>(g_clipCulled[1]));
         }
         probe(false);
+        if (clarityWanted && !clarityDone && picture3D)
+        {
+            runClarity(picture); // (no 2D over the 3D this frame: over the whole picture now)
+            clarityDone = true;
+        }
         if (toneWanted && !toneDone && picture3D)
         {
             runTone(picture); // (no 2D over the 3D this frame: over the whole picture now)

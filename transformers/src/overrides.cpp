@@ -49,6 +49,7 @@
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_display.h"
+#include "runtime/ps2_host_present.h"
 #include "runtime/ps2_host_input.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_vif1_thread.h"
@@ -332,6 +333,8 @@ namespace
     {
         uint32_t stream;
         double nextTick; // the raw VBlank at which the update is next let through
+        double lastTick = -1.0;   // (TODO 266: the raw VBlank of the frame before's update call)
+        bool lastLetThrough = false;
     };
     std::vector<SceneStreamPace> g_sceneStreamPace;
     uint32_t g_fmvFrames = 0;
@@ -692,18 +695,34 @@ namespace
         const uint32_t self = getRegU32(ctx, 4);
         EeScheduler &ee = runtime->eeScheduler();
         const double vblanksPerSecond = 1e9 / static_cast<double>(std::max<int64_t>(1, ee.vblankPeriod().count()));
-        // (only when entered afresh: after a yield inside it the call goes on at another pc; and not at the console's 60
-        // VBlanks a second - the HQ at 30 - where every frame is a picture already, as on the console)
-        if (ctx->pc == kFmvStreamUpdate && std::abs(vblanksPerSecond - 59.94) > 3.0 &&
+        // (only when entered afresh: after a yield inside it the call goes on at another pc; and only while the HQ runs at
+        // a PC rate - one VBlank a frame. At the console's 30 (two VBlanks a frame) every frame is a picture already. TODO
+        // 266: this was told by the VBlank rate, not 60 a second, and an HQ at 60 - a 60 Hz screen caps it there - has 60
+        // VBlanks a second too: its player then went unpaced, every frame waited for the next picture, the HQ fell to 30
+        // and, at 30 VBlanks a second, to 15 frames.)
+        if (ctx->pc == kFmvStreamUpdate && g_levelRate != 0 &&
             std::find(g_inSceneStreams.begin(), g_inSceneStreams.end(), self) != g_inSceneStreams.end())
         {
             const double tick = static_cast<double>(ee.currentVSyncTick());
             const double perPicture = std::max(2.0, vblanksPerSecond * 1001.0 / 30000.0); // (the player's least: 2)
             auto it = std::find_if(g_sceneStreamPace.begin(), g_sceneStreamPace.end(), [self](const SceneStreamPace &p)
                                    { return p.stream == self; });
+            // (TODO 266) An update let through that found its picture not yet due waited for it inside the call: that
+            // frame took a VBlank or more beyond its own (a frame is one VBlank here, two with in-between pictures). The
+            // grid then lags the movie's pictures by that much - each later update asked a VBlank early and waited again,
+            // every frame two VBlanks: the HQ at 30 on a 60 Hz screen, for as long as no hitch moved it. The grid goes to
+            // the picture it waited for (a VBlank before now) instead.
+            if (it != g_sceneStreamPace.end())
+            {
+                const double frameVBlanks = std::max(1.0, std::round(vblanksPerSecond / static_cast<double>(g_levelRate)));
+                if (it->lastLetThrough && it->lastTick >= 0.0 && tick - it->lastTick > frameVBlanks + 0.5)
+                    it->nextTick = std::max(it->nextTick, tick - 1.0 + perPicture);
+                it->lastTick = tick;
+                it->lastLetThrough = false;
+            }
             if (it == g_sceneStreamPace.end())
             {
-                g_sceneStreamPace.push_back({self, tick + perPicture});
+                g_sceneStreamPace.push_back({self, tick + perPicture, tick, true});
                 std::fprintf(stderr, "[tf] level preview movie at its own pace: its player asked once per %.2f VBlanks (TODO 113)\n",
                              perPicture);
             }
@@ -717,6 +736,7 @@ namespace
             {
                 // (on the picture grid while it keeps up; from now after a gap - a rate change, a slow frame)
                 it->nextTick = tick - it->nextTick < perPicture ? it->nextTick + perPicture : tick + perPicture;
+                it->lastLetThrough = true;
             }
             // TF_HQ_MOVIE_TRACE=1: every 2 s, the player's updates let through (its pictures: ~60 at the movie's 30 a
             // second) and left out. (Counted here: a guest call's host function need not return when the call does.)
@@ -3322,10 +3342,10 @@ namespace
             // (never above what the screen shows: the presents wait for its refresh on a fixed one, so a rate over it
             // is pictures thrown away - the test PC's 144 Hz screen at 160-218 with the cap at 240, its graphics card
             // the limit, fell and climbed every 10 s; with variable refresh a little under its top, as the ladder's
-            // "any rate" - 240 Hz: 235. PS2X_PRESENT_SYNC=0, presents at once (tearing): the cap itself.)
+            // "any rate" - 240 Hz: 235. VSync off (the settings', PS2X_PRESENT_SYNC=0 - presents at once, allowed to tear):
+            // the cap itself, Unlimited as many as the PC manages - TODO 266.)
             int top = g_frameRate;
-            const char *presentSync = std::getenv("PS2X_PRESENT_SYNC");
-            if (screenHz >= 50.0 && !(presentSync && *presentSync == '0'))
+            if (screenHz >= 50.0 && ps2_host_present::sync() != 0)
             {
                 const double margin = vrr ? std::max(3.0, 0.02 * screenHz) : 0.0;
                 top = std::max(30, std::min(top, static_cast<int>(std::floor(screenHz - margin + 0.5))));
@@ -7288,9 +7308,9 @@ namespace
             c.section = "Graphics";
             c.label = "Frame rate cap";
             c.order = 5;
-            c.help = "The most pictures a second the game draws. It draws as many as your PC can, up to this and the screen's "
-                     "refresh; the game itself always moves at its true speed, whatever is drawn. Unlimited: no cap. VSync is "
-                     "its own setting.";
+            c.help = "The most pictures a second the game draws. It draws as many as your PC can, up to this. With VSync on, also "
+                     "no more than the screen's refresh; with VSync off, Unlimited means as many as your PC can draw. The game "
+                     "itself always moves at its true speed, whatever is drawn.";
             c.choices = {{"30", "30"}, {"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}, {"0", "Unlimited"}};
             c.defaultValue = "240";
             c.available = []() { return followRates(); };
@@ -7303,6 +7323,31 @@ namespace
                 return true;
             };
             ps2_settings::add(c);
+        }
+        {
+            // (TODO 266) VSync: the presents wait for the screen's refresh (On: by the screen, as always - at its refresh,
+            // at once with FreeSync / G-Sync) or go at once (Off: allowed to tear; the frame rate cap alone limits the
+            // pictures, Unlimited none). Live: the presents at once (ps2_host_present::setSync), a level's rates from the
+            // next frame (taken as a cap change), the HQ's when it is entered next.
+            Setting v;
+            v.key = "PS2X_PRESENT_SYNC";
+            v.section = "Graphics";
+            v.label = "VSync";
+            v.order = 6;
+            v.help = "On: each picture waits for your screen's refresh, so nothing tears, and the game draws no more pictures "
+                     "than the screen shows. Off: each picture goes to the screen at once, as many as your PC can draw up to the "
+                     "frame rate cap, with less delay to your input; the picture may tear.";
+            v.choices = {{"on", "On"}, {"0", "Off"}};
+            v.defaultValue = "on";
+            v.current = []() { return std::string(ps2_host_present::sync() == 0 ? "0" : "on"); };
+            v.apply = [](const std::string &value)
+            {
+                ps2_host_present::setSync(value == "0" ? 0 : (value == "1" ? 1 : -1));
+                if (g_levelHooks)
+                    g_wantCap.store(g_rateSetting >= kUnlimitedRate ? 0 : g_rateSetting); // (the rates again, without the refresh's top)
+                return true;
+            };
+            ps2_settings::add(v);
         }
         {
             // (TODO 35) Frame pacing: how the levels' rates step - see pacingChoice. Taken when a level begins. (Only
@@ -8942,6 +8987,13 @@ namespace tf::port
     // (TODO 88) The native renderer's pictures are the window's - one a frame - whatever the "Smooth pictures between
     // frames" setting: the menus' pictures between their frames go by this alone (nr_thread.cpp poses::menuWanted).
     bool nativePictures() { return nativeOnePicture(); }
+
+    // (TODO 266) VSync off (the settings' VSync, PS2X_PRESENT_SYNC=0): the presents go at once, so the pictures are not
+    // tied to the screen's refresh - the menus' pictures between their frames as many as the PC draws (nr_thread.cpp).
+    bool vsyncOff() { return ps2_host_present::sync() == 0; }
+
+    // (TODO 266) The settings' frame rate cap (0: Unlimited), for the menus' pictures with VSync off.
+    int frameCap() { return g_rateSetting >= kUnlimitedRate ? 0 : g_rateSetting; }
 
     float oneFieldFactor() { return posePictures() ? 0.0f : 1.0f; }
 

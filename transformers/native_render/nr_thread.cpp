@@ -40,6 +40,8 @@ namespace tf::port
     bool nativePictures(); // (overrides.cpp: the window shows the native renderer's pictures, one a frame)
     int pictureCap();      // (overrides.cpp, TODO 161 a: the frame rate cap as a cap of pictures - 0: none)
     int fixedLogicRate();  // (overrides.cpp, TODO 161 a: the levels' fixed logic rate - 0: the rate follows the PC)
+    bool vsyncOff();       // (overrides.cpp, TODO 266: the settings' VSync off - the presents at once)
+    int frameCap();        // (overrides.cpp, TODO 266: the settings' frame rate cap - 0: Unlimited)
 }
 
 namespace nr
@@ -1595,6 +1597,12 @@ namespace nr
                 // (TODO 161: the frame rate cap is the pictures' - with the fixed logic rate - so no closer than it)
                 if (const int cap = tf::port::pictureCap(); cap > 0)
                     needed = std::max(needed, 1.0e9 / static_cast<double>(cap));
+                // (TODO 266: VSync off - the presents at once - the menus' pictures are not tied to the screen's refresh: as
+                // many as the render thread and the GPU make, up to the frame rate cap; on a 60 Hz screen they were 60 at most)
+                const bool unpaced = flatBlend && tf::port::vsyncOff();
+                if (unpaced)
+                    if (const int cap = tf::port::frameCap(); cap > 0)
+                        needed = std::max(needed, 1.0e9 / static_cast<double>(cap));
                 if (replay)
                 {
                     const double spanMs = static_cast<double>(span) / 1.0e6;
@@ -1680,8 +1688,10 @@ namespace nr
                         st.nextProbe = now + std::chrono::seconds(4); // (not in a level's first seconds)
                     needed = static_cast<double>(span) / n;
                 }
-                double pictureNs = std::max(refresh, needed);
-                if (!f.variableRefresh)
+                // (unpaced: no faster than the 16 moments a frame below allow, nor 1 ms - before the first timings `needed` is 0,
+                // and a period of 0 made the moments' loop below spin for ever: a hang at the boot's first menu, VSync off)
+                double pictureNs = unpaced ? std::max({needed, static_cast<double>(span) / 16.0, 1.0e6}) : std::max(refresh, needed);
+                if (!f.variableRefresh && !unpaced)
                 {
                     const int want = std::max(1, static_cast<int>(std::ceil(pictureNs / refresh - 0.02)));
                     const auto now = std::chrono::steady_clock::now();
@@ -1696,8 +1706,10 @@ namespace nr
                     pictureNs = refresh * st.refreshes;
                 }
                 pictureNs = std::min(pictureNs, static_cast<double>(span));
+                if (!(pictureNs > 0.0)) // (never a period of 0 or NaN: the loop below would not end)
+                    pictureNs = static_cast<double>(std::max<int64_t>(span, 1));
                 const double lead = std::min(3.0e6, 0.45 * refresh);
-                const double phase = f.variableRefresh ? 0.0 : static_cast<double>(f.refreshVblankNs) - lead;
+                const double phase = f.variableRefresh || unpaced ? 0.0 : static_cast<double>(f.refreshVblankNs) - lead;
                 // Moments in (prev, due]: phase + n * pictureNs.
                 std::vector<int64_t> moments;
                 {
@@ -2030,7 +2042,33 @@ namespace nr
             static const bool shotAb = std::getenv("TF_NATIVE_SHOTAB") != nullptr;
             static const bool shotGlow = std::getenv("TF_NATIVE_SHOTGLOW") != nullptr;
             static const bool shotTone = std::getenv("TF_NATIVE_SHOTTONE") != nullptr;
-            if (shotTone && !job.shot.empty())
+            static const bool shotClarity = std::getenv("TF_NATIVE_SHOTCLARITY") != nullptr;
+            if (shotClarity && !job.shot.empty())
+            {
+                // (TODO 108 C1, a checking aid: TF_NATIVE_SHOTCLARITY=<s>,<s>... - the frame at each strength, _cs0 _cs1 ...;
+                // 0 off.)
+                const size_t dot = job.shot.rfind('.');
+                const std::string stem = dot == std::string::npos ? job.shot : job.shot.substr(0, dot);
+                const std::string ext = dot == std::string::npos ? std::string(".bmp") : job.shot.substr(dot);
+                const int was = frame::clarityMode();
+                const float wasStrength = frame::clarityStrength();
+                const std::string list = std::getenv("TF_NATIVE_SHOTCLARITY");
+                size_t at = 0;
+                for (int n = 0; at <= list.size(); ++n)
+                {
+                    size_t end = list.find(',', at);
+                    if (end == std::string::npos)
+                        end = list.size();
+                    const float s = static_cast<float>(std::atof(list.substr(at, end - at).c_str()));
+                    frame::g_clarity.store(s > 0.0f ? 1 : 0, std::memory_order_relaxed);
+                    frame::setClarityStrength(s);
+                    d3d::render(job.frame, stem + "_cs" + std::to_string(n) + ext);
+                    at = end + 1;
+                }
+                frame::g_clarity.store(was, std::memory_order_relaxed);
+                frame::setClarityStrength(wasStrength);
+            }
+            else if (shotTone && !job.shot.empty())
             {
                 // (TODO 108 (2), a checking aid: the frame drawn without and with the tone mapping - _t0 _t1.)
                 const size_t dot = job.shot.rfind('.');
