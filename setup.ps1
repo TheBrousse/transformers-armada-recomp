@@ -87,6 +87,15 @@ if ($missing.Count -gt 0) {
         Fail ("missing:`n" + ($lines -join "`n") + "`nInstall them (or run setup.ps1 -InstallPrerequisites), open a NEW PowerShell, run setup.ps1 again.")
     }
     foreach ($m in $missing) {
+        # Visual Studio already there without its C++ tools: winget would add nothing ("already installed"),
+        # so its own installer adds them to that install instead (issue #2).
+        $noCpp = if ($m -eq "vs") { @(Get-VsWithoutCpp) } else { @() }
+        if ($noCpp.Count -gt 0) {
+            Step "Adding the C++ tools to $($noCpp[0]) (Windows asks for permission)"
+            $code = Install-VsCppTools $noCpp[0]
+            Write-Host "Visual Studio's installer finished (exit code $code)."
+            continue
+        }
         Step "Installing $($how[$m][0])"
         Invoke-Native { & cmd /c $how[$m][1] } | Out-Null   # (its exit code: the check after it decides)
     }
@@ -94,7 +103,11 @@ if ($missing.Count -gt 0) {
     Update-PathFromRegistry
     $still = @(Get-MissingPrerequisites)
     if ($still.Count -gt 0) {
-        Fail ("prerequisites installed, but not found yet: $($still -join ', '). Open a NEW PowerShell (or restart the PC after the Visual Studio install) and run setup.ps1 again.")
+        $hint = ""
+        if ($still -contains "vs") {
+            $hint = "`nIf it keeps saying vs: open the Visual Studio Installer from the Start menu, press Modify on your Visual Studio (or Build Tools), tick `"Desktop development with C++`" and install it (about 7 GB of free space needed). The installer's logs are the dd_*.log files in $env:TEMP."
+        }
+        Fail ("prerequisites installed, but not found yet: $($still -join ', '). Open a NEW PowerShell (or restart the PC after the Visual Studio install) and run setup.ps1 again.$hint")
     }
 }
 $Python = Find-Python

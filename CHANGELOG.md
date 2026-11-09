@@ -1,5 +1,12 @@
 # What's new
 
+## 0.3.9
+
+**Fixed**
+- The setup no longer stops with "prerequisites installed, but not found yet: vs" on PCs that already have Visual
+  Studio (or its Build Tools) without the C++ tools. The setup now adds the C++ tools itself; Windows asks for
+  permission once. If it still fails, the message explains how to add them by hand.
+
 ## 0.3.8
 
 **Fixed**

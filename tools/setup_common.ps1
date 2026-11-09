@@ -90,6 +90,33 @@ function Get-MissingPrerequisites {
     return $m
 }
 
+# Visual Studio installs (any edition, the Build Tools too) that LACK the C++ tools: their folders. winget sees such
+# an install as "already installed" and adds nothing, so the setup kept stopping with "not found yet: vs" (issue #2,
+# 2026-11-09). Install-VsCppTools adds the C++ tools to one of them with Visual Studio's own installer.
+function Get-VsWithoutCpp {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { return @() }
+    $all = @(Invoke-Probe { & $vswhere -all -products * -property installationPath } | Where-Object { $_ })
+    $cpp = @(Invoke-Probe { & $vswhere -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } | Where-Object { $_ })
+    return @($all | Where-Object { $cpp -notcontains $_ })
+}
+
+# Adds the C++ tools ("Desktop development with C++" / the VCTools workload) to an existing Visual Studio install.
+# Windows asks for permission once (the installer needs admin rights). Returns the installer's exit code.
+function Install-VsCppTools([string]$Path) {
+    $installer = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\setup.exe"
+    if (-not (Test-Path $installer)) { return -1 }
+    $workload = if ((Split-Path $Path -Leaf) -eq "BuildTools") { "Microsoft.VisualStudio.Workload.VCTools" } else { "Microsoft.VisualStudio.Workload.NativeDesktop" }
+    $a = @("modify", "--installPath", "`"$Path`"", "--add", $workload, "--includeRecommended", "--passive", "--norestart")
+    try {
+        $p = Start-Process -FilePath $installer -ArgumentList $a -Verb RunAs -Wait -PassThru
+        return $p.ExitCode
+    } catch {
+        Write-Host "warning: Visual Studio's installer did not start: $($_.Exception.Message)" -ForegroundColor Yellow
+        return -1
+    }
+}
+
 # Each prerequisite's name and its winget command (-InstallPrerequisites runs them).
 function Get-PrerequisiteInstall {
     $accept = "--accept-package-agreements --accept-source-agreements"
