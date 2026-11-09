@@ -1,5 +1,13 @@
 # What's new
 
+## 0.4.5
+
+**Fixed**
+- The setup now also checks for the Windows SDK, which the C++ build needs next to Visual Studio's C++ tools.
+  Without it the setup stopped at "Disc and game" with "No CMAKE_C_COMPILER could be found". When it is
+  missing, the setup adds it to your Visual Studio (Windows asks for permission once). Run the setup again; the
+  steps it already finished are kept.
+
 ## 0.4.4
 
 **New**

@@ -86,8 +86,26 @@ function Get-MissingPrerequisites {
     if (-not (Find-Python)) { $m += "python" }   # (a real one: not Windows' Microsoft Store shortcut)
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     $vs = (Test-Path $vswhere) -and [bool](Invoke-Probe { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath })
-    if (-not $vs) { $m += "vs" }
+    # (the C++ tools alone are not enough: without the Windows SDK, CMake's compiler test fails with "No
+    # CMAKE_C_COMPILER could be found" - a player's setup, 2026-11-10. The SDK counts as part of "vs".)
+    if (-not $vs -or -not (Test-WindowsSdk)) { $m += "vs" }
     return $m
+}
+
+# Whether a Windows 10/11 SDK the C++ build can use is installed: its headers and its x64 libraries.
+function Test-WindowsSdk {
+    $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ } | ForEach-Object { Join-Path $_ "Windows Kits\10" }
+    foreach ($r in $roots) {
+        $inc = Join-Path $r "Include"
+        if (-not (Test-Path -LiteralPath $inc)) { continue }
+        foreach ($v in @(Get-ChildItem -LiteralPath $inc -Directory -Filter "10.*" -ErrorAction SilentlyContinue)) {
+            $lib = Join-Path $r "Lib\$($v.Name)"
+            if ((Test-Path -LiteralPath (Join-Path $v.FullName "um\windows.h")) -and
+                (Test-Path -LiteralPath (Join-Path $lib "um\x64\kernel32.lib")) -and
+                (Test-Path -LiteralPath (Join-Path $lib "ucrt\x64\ucrt.lib"))) { return $true }
+        }
+    }
+    return $false
 }
 
 # Visual Studio installs (any edition, the Build Tools too) that LACK the C++ tools: their folders. winget sees such
@@ -98,7 +116,11 @@ function Get-VsWithoutCpp {
     if (-not (Test-Path $vswhere)) { return @() }
     $all = @(Invoke-Probe { & $vswhere -all -products * -property installationPath } | Where-Object { $_ })
     $cpp = @(Invoke-Probe { & $vswhere -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } | Where-Object { $_ })
-    return @($all | Where-Object { $cpp -notcontains $_ })
+    $without = @($all | Where-Object { $cpp -notcontains $_ })
+    # (the C++ tools there but no Windows SDK: the install with them is the one to modify - its recommended
+    # components bring the SDK; it comes first)
+    if ($cpp.Count -gt 0 -and -not (Test-WindowsSdk)) { return @($cpp + $without) }
+    return $without
 }
 
 # Adds the C++ tools ("Desktop development with C++" / the VCTools workload) to an existing Visual Studio install.

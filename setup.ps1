@@ -91,7 +91,7 @@ if ($missing.Count -gt 0) {
         # so its own installer adds them to that install instead (issue #2).
         $noCpp = if ($m -eq "vs") { @(Get-VsWithoutCpp) } else { @() }
         if ($noCpp.Count -gt 0) {
-            Step "Adding the C++ tools to $($noCpp[0]) (Windows asks for permission)"
+            Step "Adding the C++ tools and the Windows SDK to $($noCpp[0]) (Windows asks for permission)"
             $code = Install-VsCppTools $noCpp[0]
             Write-Host "Visual Studio's installer finished (exit code $code)."
             continue
@@ -105,7 +105,7 @@ if ($missing.Count -gt 0) {
     if ($still.Count -gt 0) {
         $hint = ""
         if ($still -contains "vs") {
-            $hint = "`nIf it keeps saying vs: open the Visual Studio Installer from the Start menu, press Modify on your Visual Studio (or Build Tools), tick `"Desktop development with C++`" and install it (about 7 GB of free space needed). The installer's logs are the dd_*.log files in $env:TEMP."
+            $hint = "`nIf it keeps saying vs: open the Visual Studio Installer from the Start menu, press Modify on your Visual Studio (or Build Tools), tick `"Desktop development with C++`" (with a Windows 10 or 11 SDK on the right) and install it (about 7 GB of free space needed). The installer's logs are the dd_*.log files in $env:TEMP."
         }
         Fail ("prerequisites installed, but not found yet: $($still -join ', '). Open a NEW PowerShell (or restart the PC after the Visual Studio install) and run setup.ps1 again.$hint")
     }
