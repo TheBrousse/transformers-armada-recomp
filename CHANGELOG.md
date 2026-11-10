@@ -1,5 +1,28 @@
 # What's new
 
+## 0.4.7
+
+**New**
+- F1 > Controls has dead zone settings for the left and the right stick. Raise them if a stick that rests a
+  little off centre moves you or the camera on its own.
+- F1 has a Quit game page at the bottom of the list. It closes the game after you confirm.
+- F1 > Graphics has a Thread placement setting (Off by default) that places the game's threads on the processor's
+  cores. On some processors it gives a slightly steadier frame rate. It takes a restart. Thanks to galaxyawesome.
+- The README has a "Where things are" section: where your saves, settings and logs are, and what to send with a
+  bug report.
+
+**Fixed**
+- Deep Amazon, the boss on the temple roof: when he grabs you and spins, you are now held and spun with him.
+  Above 30 frames a second you stayed standing on the ground.
+- A stick that rests slightly off centre no longer keeps the menus scrolling on its own.
+- HD textures made on a graphics card that gives broken images (some GTX 16 series cards) are now set aside, and
+  the game draws its own textures instead of wrong ones (green and purple floors, a riverbed with another
+  picture). Nothing is deleted. After a graphics driver update, F1 > Graphics > Check HD textures tries again.
+- The HD texture check also catches an image that shows another picture, or is wrong in one part.
+- Photo mode: turning HD textures on or off there, or loading a state saved there, no longer leaves the world
+  frozen or the game running slow.
+- The menus no longer drop to half the screen's refresh rate and stay there on some graphics cards.
+
 ## 0.4.6
 
 **New**

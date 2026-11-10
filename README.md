@@ -220,6 +220,17 @@ Esc gives the mouse back.
 Every key can be changed in **F1 > Controls**. The full list, with the function keys, is in
 **[docs/PLAYING.md](docs/PLAYING.md)**.
 
+## Where things are
+
+Open the folder you installed into, then `transformers-armada-recomp`.
+
+- **Saves:** in `game\mc0`. In the game, F1 > Saves imports, exports and backs them up into the `Saves` folder.
+- **Settings:** `settings.ini`.
+- **Logs, for a bug report:** the game's logs are in `runs`. Zip the newest `play_...out` and `play_...err` files
+  and attach them. If the install or an update failed, also attach `setup.log` or `update-setup.log` from the
+  folder you installed into.
+- **Never attach** save files, save states or anything from the `game` folder: they contain game data.
+
 ## Help
 
 - **Player guide:** [docs/PLAYING.md](docs/PLAYING.md) (settings, controls, updates)
@@ -252,6 +263,7 @@ Issues and pull requests are welcome. See **[docs/CONTRIBUTING.md](docs/CONTRIBU
 - **kayliox:** the PC port, the renderer and the sound.
 - **Jenvery:** the HQ frame-rate fix.
 - **TPepperoni666:** the stick response and the Xbox button prompts.
+- **galaxyawesome:** the ARM groundwork and the CPU thread placement setting.
 - **SirCebollo:** testing, and finding and reporting bugs.
 - The approach follows [Project Amp](https://gitlab.com/ztpeditor/project-amp), which brought *Amplitude* to PC the same way.
 - Third-party components and their licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

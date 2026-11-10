@@ -133,5 +133,32 @@ int main() {
     for(float r:{.051f,.07f,.1f,.25f,1.f}) {
         float v=vehicleAxis(r,c,.2f);std::printf("tuned car r=%.3f byte=%u guest=%.6f\n",r,axisByte(v),axis(axisByte(v)));
     }
+    // (TODO 274) Dead zone settings, and a menu (play = false) getting the stick itself.
+    for(int i=0;i<360;++i) {
+        const float a=i*3.14159265358979323846f/180.f;
+        for(float r:{.06f,.12f,.19f}) {
+            float x=std::cos(a)*r,y=std::sin(a)*r,rx=y,ry=x;const float ox=x,oy=y;
+            map(x,y,rx,ry,c,0,.2f,false,false);
+            check(x==ox&&y==oy&&rx==oy&&ry==ox,"a menu gets the stick as the pad gives it (no lift)");
+            check(axis(axisByte(x))==0&&axis(axisByte(y))==0,"a resting stick under a fifth moves no menu");
+        }
+        Config wide=c;wide.leftDeadzone=.15f;wide.rightDeadzone=.25f;
+        float x=std::cos(a)*.14f,y=std::sin(a)*.14f,rx=std::cos(a)*.24f,ry=std::sin(a)*.24f;
+        map(x,y,rx,ry,wide,0,.2f);
+        check(x==0&&y==0&&rx==0&&ry==0,"inside a wider dead zone: nothing, in play");
+        x=std::cos(a)*.16f;y=std::sin(a)*.16f;rx=std::cos(a)*.26f;ry=std::sin(a)*.26f;
+        map(x,y,rx,ry,wide,0,.2f);
+        check(std::hypot(x,y)>.6f&&std::hypot(rx,ry)>.19f,"just outside a wider dead zone: the lift, in play");
+        check(move(std::cos(a),std::sin(a),wide)>.85f,"full tilt still runs with a wider dead zone");
+        for(int kind=0;kind<2;++kind)for(float w:{0.f,1.f}) {
+            x=std::cos(a)*.14f;y=std::sin(a)*.14f;rx=std::cos(a)*.24f;ry=std::sin(a)*.24f;
+            Config cfg=wide;cfg.enabled=kind==0; // (kind 0: the response on, in a menu; 1: the response off, in play)
+            map(x,y,rx,ry,cfg,w,.2f,false,kind==1);
+            check(x==0&&y==0&&rx==0&&ry==0,"a wider dead zone cuts in a menu and with the response off");
+        }
+        x=std::cos(a)*.14f;y=std::sin(a)*.14f;rx=std::cos(a)*.24f;ry=std::sin(a)*.24f;
+        map(x,y,rx,ry,wide,1,.2f);
+        check(x==0&&y==0&&rx==0&&ry==0,"a wider dead zone cuts the car's original axes");
+    }
     std::printf("CHECKS %d FAILURES %d\n",checks,failures);return failures?1:0;
 }

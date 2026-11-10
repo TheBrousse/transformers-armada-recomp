@@ -35,6 +35,7 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_stick_response.h"
 
 #include "port_ext.h"
 #include <algorithm>
@@ -386,6 +387,17 @@ namespace menu_mouse
             word(rdram, g_ownScreen) == g_own[g_ownIndex].vtable)
             own = &g_own[g_ownIndex];
         const bool shown = listShown || own != nullptr;
+        // (TODO 274) While a menu's list is shown the sticks go to the game without the movement's lift: it turned a
+        // stick resting a little off centre into a held direction and the list scrolled on its own. (From ravioli-gh's
+        // Linux port, there for the Steam Deck's sticks.)
+        ps2_stick_response::setMenuShown(shown);
+        if (static const bool traceStick = std::getenv("TF_STICK_TRACE") != nullptr; traceStick) // (each change logged)
+        {
+            static int told = -1;
+            if (told != (shown ? 1 : 0))
+                std::fprintf(stderr, "[stick] %s (tick %llu)\n", (told = shown ? 1 : 0) ? "a menu: the sticks as the pad gives them" : "play: the response's lift on",
+                             static_cast<unsigned long long>(g_frames));
+        }
         if (static const bool traceList = std::getenv("TF_MENU_TRACE") != nullptr; traceList)
         {
             static uint32_t lastVtable = 1u;

@@ -4080,6 +4080,7 @@ namespace
     {
         nr::resetFrameTexturePolicy(); // also clears interframe microcode receipts/prefix and advances their epoch
         g_statesSeen = runtime->eeScheduler().loadedStateCount();
+        tuning::thawLoadedState(rdram); // (TODO 269: before the level's rate is read from its period below)
         // (TODO 150) The port's carry-overs from frame to frame, which the state does not hold, as in a game just started
         // with it: the cars' 30ths and held time and the bodies moved on for the frames between their steps (a body the
         // state holds moved on was put back by the session that made it, and not by one started with it), the contacts'
@@ -7940,8 +7941,37 @@ namespace
             static uint64_t windowPictures = 0;
             static uint64_t windowLeftOut = 0;
             static auto windowIdle = runtime->eeScheduler().idleHostTime();
+            // The 1% low (issue 12's thread placement bench): the frames of the last 30 s (the state load left out, as
+            // bench.ps1 does), the average of the slowest 1% as a rate. A ring buffer, so a long session costs no more
+            // than a short one and the report does not hitch the frames it measures.
+            struct FrameTime
+            {
+                clock::time_point at;
+                float ms;
+            };
+            constexpr size_t kRingFrames = 16384u; // (30 s at up to ~540 frames a second; faster, the window is shorter)
+            constexpr auto kLowWindow = std::chrono::seconds(30);
+            static std::vector<FrameTime> ring(kRingFrames);
+            static std::vector<float> slowest = []
+            {
+                std::vector<float> v;
+                v.reserve(kRingFrames);
+                return v;
+            }();
+            static size_t ringNext = 0;
+            static size_t ringCount = 0;
+            static clock::time_point lastFrame{};
+            static bool reportedOnce = false;
+            const auto frameNow = clock::now();
+            if (reportedOnce && lastFrame != clock::time_point{})
+            {
+                ring[ringNext] = FrameTime{frameNow, std::chrono::duration<float, std::milli>(frameNow - lastFrame).count()};
+                ringNext = (ringNext + 1u) % kRingFrames;
+                ringCount = std::min(ringCount + 1u, kRingFrames);
+            }
+            lastFrame = frameNow;
             ++frames;
-            const double elapsed = std::chrono::duration<double>(clock::now() - windowStart).count();
+            const double elapsed = std::chrono::duration<double>(frameNow - windowStart).count();
             if (elapsed >= 2.0)
             {
                 const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
@@ -7955,8 +7985,27 @@ namespace
                           << " host idle ms a frame "
                           << std::chrono::duration<double, std::milli>(runtime->eeScheduler().idleHostTime() - windowIdle).count() /
                                  std::max(frames, 1u)
-                          << " in-between left out " << ps2_host_display::secondFieldsLeftOut() - windowLeftOut
-                          << std::endl;
+                          << " in-between left out " << ps2_host_display::secondFieldsLeftOut() - windowLeftOut;
+                // (newest first, up to the first frame older than the window)
+                slowest.clear();
+                for (size_t i = 0; i < ringCount; ++i)
+                {
+                    const FrameTime &f = ring[(ringNext + kRingFrames - 1u - i) % kRingFrames];
+                    if (frameNow - f.at > kLowWindow)
+                        break;
+                    slowest.push_back(f.ms);
+                }
+                if (slowest.size() >= 100u)
+                {
+                    const size_t count = slowest.size() / 100u;
+                    std::nth_element(slowest.begin(), slowest.begin() + static_cast<std::ptrdiff_t>(count - 1u), slowest.end(), std::greater<float>());
+                    double sum = 0.0;
+                    for (size_t i = 0; i < count; ++i)
+                        sum += slowest[i];
+                    std::cerr << " 1% low " << (sum > 0.0 ? 1000.0 * static_cast<double>(count) / sum : 0.0);
+                }
+                std::cerr << std::endl;
+                reportedOnce = true;
                 frames = 0;
                 windowTick = tick;
                 windowPictures = pictures;
