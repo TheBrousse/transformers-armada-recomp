@@ -1,5 +1,16 @@
 # What's new
 
+## 0.4.8
+
+**Fixed**
+- 0.4.7 could turn a good set of HD textures off and say "this graphics card makes broken HD images" when the
+  card was fine. The card is now tested properly, and a set that 0.4.7 turned off comes back with this update.
+- After "Restart to apply", or after an update that brings you back where you were, the game could stay at
+  30 frames a second, and the HQ's Drop Zones screen at 15. It now comes back at your frame rate.
+- Choosing 30 in the frame rate limit list, even in passing, no longer keeps the game at 30 after you pick
+  another limit.
+- After alt-tabbing out and back, the frame rate returns at once to what it was before.
+
 ## 0.4.7
 
 **New**

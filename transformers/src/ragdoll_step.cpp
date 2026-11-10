@@ -145,6 +145,9 @@ namespace ragdoll_step
                             d.last[k + c] = now[k + c]; // (and shown there, not blended from where it was)
                     }
                 }
+                if (g_log && moved != 0u) // (TF_RAGDOLL_STEP_LOG: the game moved particles between two steps)
+                    std::fprintf(stderr, "[ragdoll step] doll %08x: the game moved %zu of %u particles between steps%s\n", self, moved, d.count,
+                                 moved >= d.count ? " (all: taken as a teleport)" : " (kept where it put them)");
                 if (moved >= d.count)
                     d.before = false;
                 else
