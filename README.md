@@ -16,6 +16,10 @@
 </p>
 
 <p align="center">
+  <a href="https://recomplauncher.com/game/transformers-armada-recomp"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher"></a>
+</p>
+
+<p align="center">
   <b>The setup contains no game.</b> You need your own copy of <b>Transformers (USA, SLUS-20668)</b> as an
   <code>.iso</code> disc image. The setup installs the tools it needs and builds the game on your PC from your disc.
 </p>
