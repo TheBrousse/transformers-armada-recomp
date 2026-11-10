@@ -1,5 +1,22 @@
 # What's new
 
+## 0.4.6
+
+**New**
+- While the HD textures are being made, a small line in the bottom-right corner shows how far along they are. When
+  they are done it tells you to restart, and F1 has a button for it that brings you back where you were.
+- F1 > Graphics can stop making the HD textures for this session, and carry on again.
+
+**Changed**
+- The HD textures are now made only while the game is open. They stop when you close it and carry on from where
+  they left off the next time you start it.
+
+**Fixed**
+- HD textures that came out with the wrong colours (green and purple floors in Antarctica on some graphics cards)
+  are no longer used: the game draws its own texture there instead, and the next HD check makes them again.
+- With a DualSense, the HQ's first-time messages (the warp gate, the first Data-Con and the like) now come from the
+  controller's speaker, like the other radio calls.
+
 ## 0.4.5
 
 **Fixed**
