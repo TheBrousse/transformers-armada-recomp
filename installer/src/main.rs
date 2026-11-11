@@ -100,6 +100,7 @@ struct App {
     hd_fast: bool,          // (TODO 219) HD textures: Fast (2K characters, one pass) instead of Best
     hd_while_playing: bool, // keep making them while the game runs
     gpu: Option<(String, u64)>, // the graphics card the suggestion is for (name, video memory)
+    low_end: bool,              // built-in or low-end graphics: no HD textures made (detect_gpu)
     hd_playable: bool,      // the HD step has got to the upscale: the game can be played meanwhile
     phase: Phase,
     steps: Vec<Step>,
@@ -140,6 +141,7 @@ impl App {
             hd_fast: false,
             hd_while_playing: false,
             gpu: None,
+            low_end: false,
             hd_playable: false,
             phase: Phase::Form,
             steps: make_steps(MODS),
@@ -166,6 +168,12 @@ impl App {
         let best = cards.into_iter().filter(|(n, _)| !n.to_ascii_lowercase().contains("basic")).max_by_key(|(_, v)| *v);
         if let Some((name, vram)) = best {
             self.hd_fast = suggest_fast(&name, vram);
+            // (User decision 2026-11-11) Built-in or low-end graphics (no card with 3.5 GB of its own video memory; the
+            // GTX 1650's 4 GB and up are not): no HD textures are made on it - make_hd_textures.ps1 refuses too.
+            self.low_end = vram < 3584 * 1024 * 1024 || std::env::var("TFA_LOW_END").is_ok_and(|v| v == "1"); // (TFA_LOW_END=1: tests)
+            if self.low_end {
+                self.hd = false;
+            }
             self.gpu = Some((name, vram));
         }
     }
@@ -1614,7 +1622,12 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.checkbox(&mut self.hd, "HD textures (recommended; made on your graphics card, you can play meanwhile)");
+        if self.low_end {
+            ui.add_enabled(false, egui::Checkbox::new(&mut self.hd, "HD textures"));
+            ui.label(RichText::new("Your graphics are built-in, so HD textures are off to keep the game smooth.").color(DIM).small());
+        } else {
+            ui.checkbox(&mut self.hd, "HD textures (recommended; made on your graphics card, you can play meanwhile)");
+        }
         if self.hd {
             ui.horizontal(|ui| {
                 ui.add_space(24.0);

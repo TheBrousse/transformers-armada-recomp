@@ -1,5 +1,34 @@
 # What's new
 
+## 0.6.0
+
+**New**
+- F1 is redesigned: each setting has one kind of control (a switch, a slider or a list), the default list is
+  short, and one "Show all settings" switch shows everything. Quit is now its own tab.
+- F1 > Graphics > "Trees close to you": the trees near the camera fade out (as on the console) or stay.
+- F1 > HD textures: making them now says first what it costs (disk space and time on your graphics card). A
+  finished set can be verified, and any broken images can be made again.
+- On laptops with two graphics chips, the game now uses the stronger one.
+- If your Intel graphics driver is very old, the game says so at start and shows where to get a new one. Old
+  Intel drivers scrambled the picture and the F1 menu.
+
+**Changed**
+- HD textures are no longer made on built-in graphics or cards with under 3.5 GB of video memory: making them
+  in the background made the game stutter or crash there. The update removes an HD set made on such a PC (once),
+  and the game uses its own textures.
+
+**Fixed**
+- The warp gates in levels now swirl, as in the HQ. On every graphics card the swirl stood still.
+- The electric shock effect (EMP grenades, the electric weapons) crackles and flickers again instead of showing a
+  still purple coat, and at the same speed at any frame rate.
+- Intel graphics no longer start with a black screen for a moment.
+- The FPS counter showed 600 or more on some PCs instead of the real rate.
+- The bright band in the sky with the modern glow (bloom) is gone.
+- The European disc: "Press ENTER" now works with the keyboard in all five languages.
+- A rare crash when a warp tunnel started.
+- F1 > Graphics > Resolution showed a size that is not the game's ("Auto (2560 x 1344)") with the native renderer.
+  It now says the game is drawn at the screen's size.
+
 ## 0.5.4
 
 **Fixed**

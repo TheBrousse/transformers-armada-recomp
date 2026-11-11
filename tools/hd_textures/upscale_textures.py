@@ -658,7 +658,7 @@ def run_onnx_dir(session, scale, in_dir, out_dir, tile, pad):
 # come out broken, the safer ways are tried on them, in order: a small tile (32), each other graphics card the
 # upscaler sees (a processor's built-in one), the lighter network with a small tile. The first that gives good
 # images makes the whole run. When none does, nothing is made on this card (exit 3, the status says so) and the
-# game's own textures are drawn; every later run (F1 > Check HD textures, an update) tries the card again, so a
+# game's own textures are drawn; every later run (F1 > Make HD textures, an update) tries the card again, so a
 # new graphics driver can fix it. A batch that still comes out mostly broken tries the card again the same way.
 # A single broken image is made again: a small tile, then the lighter network; failing both, it gets no HD image.
 COLOUR_BAD = 20.0
@@ -1241,6 +1241,218 @@ def check_set(src_root, out_root, backup_root, status_path=None, lock=None, coun
     return fixed, removed
 
 
+# ---- Verify HD textures (TODO 281) ----
+# F1 > Graphics > "Verify HD textures": the whole set checked and reported, nothing changed. Written to
+# hd_textures/verify_report.json (the game reads it; "state": "running" with done / total while it works):
+#  - how many images there should be (the unique textures of the disc, and the files they are written to),
+#  - how many are there, and how many passed every check: readable, the size and alpha the maker made, the colour and
+#    structure checks (judge_output: dark, flat, colours shifted, another picture - the 259 rules - and red and blue
+#    exchanged), and the set's made-on-card record (.made_on.json: a card written down as good, the set not set aside),
+#  - by name, the ones missing (not made yet), broken (and why), and not made (the card could not: the game's own).
+# Every image passed is written down with its file's size and sha1 (upscaled/.verified.json): a later verify reads the
+# bytes of each file (seconds) and decodes and judges again only those that changed - so a set can be called intact
+# without looking at every picture again. "Remake N broken images" (--forget-broken): the missing and broken ones of the
+# last report removed with their manifest records, so that the maker's next run makes only those.
+VERIFY_REPORT = "verify_report.json"
+VERIFIED_NAME = ".verified.json"
+
+
+def _write_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    for attempt in range(20):  # (the game reading it a moment)
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.1)
+
+
+def _verify_file(args):
+    """(rel, out path, judged path, source path, made size, alpha class, known [size, sha1] or None) ->
+    (rel, "passed" | "unchanged" | "broken", why, size, sha1)."""
+    rel, out_path, judged, src, made, alpha, known = args
+    try:
+        data = Path(out_path).read_bytes()
+    except OSError as e:
+        return rel, "broken", f"not readable: {e.strerror or e}", 0, ""
+    sha1 = hashlib.sha1(data).hexdigest()
+    if known and known == [len(data), sha1]:
+        return rel, "unchanged", "", len(data), sha1
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            img = im.convert("RGBA")
+        if list(img.size) != made:
+            return rel, "broken", f"size {img.size[0]}x{img.size[1]}, made {made[0]}x{made[1]}", len(data), sha1
+        if alpha_class(img) != alpha:
+            return rel, "broken", f"transparency {alpha_class(img)}, the game's is {alpha}", len(data), sha1
+        if judged != out_path:  # (a level image's colour-match original is what the upscaler made: judged on that one)
+            with Image.open(judged) as im:
+                img = im.convert("RGBA")
+        d, d_swapped, why = judge_output(img, src)
+        if not why and d >= SWAP_CLEAR and d_swapped < 0.6 * d:
+            why = "red and blue exchanged"
+        return rel, ("broken" if why else "passed"), why, len(data), sha1
+    except Exception as e:  # noqa: BLE001
+        return rel, "broken", f"not readable: {e}", len(data), sha1
+
+
+def verify_set(src_root, out_root, hd_dir, quality, lock=None):
+    report_path = hd_dir / VERIFY_REPORT
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    errors = []
+    srcs = scan_sources(src_root, errors)
+    jobs = plan_jobs(srcs, None, "auto", [], quality=quality)
+    recs = load_manifest(out_root)
+    marker = load_marker(out_root)
+    backup_root = out_root.parent / "upscaled_precolour"
+    try:
+        verified = json.loads((out_root / VERIFIED_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        verified = {}
+    missing, not_made, work = [], [], []
+    by_rel = {}
+    for job in jobs:
+        rel0 = job.relpaths[0]
+        r = recs.get(job.sha1)
+        if not r:
+            missing.append({"name": rel0, "sha1": job.sha1, "files": job.relpaths, "why": "not made yet"})
+            continue
+        if r.get("fallback") == "none":
+            not_made.append({"name": rel0, "sha1": job.sha1, "files": job.relpaths,
+                             "why": r.get("why") or "this graphics card could not make it"})
+            continue
+        made = r.get("out") or [job.out_w, job.out_h]
+        absent = [rp for rp in job.relpaths if not (out_root / rp).is_file()]
+        if absent:
+            missing.append({"name": rel0, "sha1": job.sha1, "files": job.relpaths,
+                            "why": "not there" if len(absent) == len(job.relpaths) else f"{len(absent)} of its {len(job.relpaths)} files not there"})
+            continue
+        by_rel[rel0] = job
+        for rp in job.relpaths:  # (each file of it: a copy written to every place the disc has the texture)
+            judged = backup_root / rp
+            judged = judged if (rp == rel0 and judged.is_file()) else out_root / rp
+            work.append((rp, str(out_root / rp), str(judged), str(job.srcs[0].path), made, job.alpha,
+                         verified.get(rp)))
+    total = len(work)
+    state = {"state": "running", "started": started, "done": 0, "total": total}
+    _write_json(report_path, state)
+    from concurrent.futures import ProcessPoolExecutor
+    workers = 2 if lock is not None and game_running(lock) else max(1, min(8, (os.cpu_count() or 2) - 2))
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(_verify_file, work, chunksize=8):
+            results.append(res)
+            if len(results) % 100 == 0 and len(results) < total:
+                state["done"] = len(results)
+                _write_json(report_path, state)
+                print(f"verify: {len(results)} of {total} checked", flush=True)
+    owners = {rp: j for j in by_rel.values() for rp in j.relpaths}
+    broken, passed_files, unchanged, now_verified = {}, 0, 0, {}
+    for rel, status, why, size, sha1 in results:
+        if status == "broken":
+            # (a file of a texture broken: the texture is remade, all its files)
+            owner = owners.get(rel)
+            key = owner.relpaths[0] if owner else rel
+            if key not in broken:
+                broken[key] = {"name": key, "sha1": owner.sha1 if owner else "", "files": owner.relpaths if owner else [rel],
+                               "why": why if rel == key else f"{rel}: {why}"}
+        else:
+            passed_files += 1
+            unchanged += status == "unchanged"
+            now_verified[rel] = [size, sha1]
+    cards = (marker or {}).get("cards", [])
+    good_card = next((c for c in reversed(cards) if c.get("result") == "good"), None)
+    set_aside = bool(marker and marker.get("set_aside"))
+    passed_images = len(by_rel) - len(broken)
+    report = {
+        "state": "done", "started": started, "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "quality": quality,
+        "images_expected": len(jobs), "files_expected": len(srcs),
+        "images_present": len(by_rel), "files_present": total,
+        "images_passed": passed_images, "files_passed": passed_files, "files_unchanged": unchanged,
+        "card": {"name": good_card.get("name", "") if good_card else "", "recorded": bool(good_card),
+                 "set_aside": set_aside, "why": (marker or {}).get("why", "") if set_aside else ""},
+        "missing": missing, "broken": sorted(broken.values(), key=lambda x: x["name"]), "not_made": not_made,
+        # (the ones this card could not make are not counted: made again on it they come out broken again - the game
+        # draws its own for those; Make HD textures after a driver update tries them again)
+        "remake": len(missing) + len(broken),
+        "intact": not missing and not broken and bool(good_card) and not set_aside,
+        "unreadable_sources": len(errors),
+    }
+    # (The lines F1 shows as they are: verify_report.txt, plain words)
+    g = lambda n: f"{n:,}"  # noqa: E731
+    lines = [f"{g(len(jobs))} images should be there ({g(len(srcs))} files). {g(len(by_rel))} are there; "
+             f"{g(passed_images)} passed every check.",
+             "Checked: each file readable, its size and transparency, its colours and picture against the game's."]
+    if set_aside:
+        lines.append("The set is set aside: the game draws its own textures. " + (marker.get("why") or ""))
+    elif good_card:
+        lines.append(f"Made on a graphics card that passed the test ({good_card.get('name', '')}).")
+    else:
+        lines.append("No graphics card is written down as having made the set well.")
+    if missing or broken:
+        lines.append(f"Missing: {g(len(missing))}. Broken: {g(len(broken))}.")
+        shown = report["broken"] + missing
+        for it in shown[:6]:
+            lines.append(f"  {it['name']} ({it['why']})")
+        if len(shown) > 6:
+            lines.append(f"  and {g(len(shown) - 6)} more (hd_textures\\verify_report.json)")
+    elif report["intact"]:
+        lines.append("The set is complete and intact.")
+    if not_made:
+        lines.append(f"Not made on this graphics card: {g(len(not_made))} (the game draws its own for these).")
+    report["lines"] = lines
+    (hd_dir / "verify_report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")  # (before the state says done)
+    _write_json(report_path, report)
+    _write_json(out_root / VERIFIED_NAME, now_verified)
+    print(f"verify: {report['images_expected']} images ({report['files_expected']} files) expected; "
+          f"{report['images_present']} present, {passed_images} passed ({unchanged} files unchanged since the last "
+          f"verify); {len(missing)} missing, {len(broken)} broken, {len(not_made)} not made; "
+          f"made-on-card record: {'good (' + good_card.get('name', '') + ')' if good_card else 'none'}"
+          f"{', the set is set aside' if set_aside else ''}", flush=True)
+    return 0
+
+
+def forget_broken(out_root, hd_dir):
+    """(TODO 281, "Remake N broken images") The last report's missing and broken images removed with their
+    manifest records (their colour-match originals and ledger entries too): the maker's next run makes only those."""
+    try:
+        report = json.loads((hd_dir / VERIFY_REPORT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print("remake: no verify report", flush=True)
+        return 0
+    items = report.get("missing", []) + report.get("broken", [])
+    backup_root = out_root.parent / "upscaled_precolour"
+    ledger_path = backup_root / "colour_gains.json"
+    try:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.exists() else {}
+    except ValueError:
+        ledger = {}
+    drop = set()
+    for it in items:
+        for rp in it.get("files", []):
+            for path in (out_root / rp, backup_root / rp):
+                if path.is_file():
+                    path.unlink()
+            ledger.pop(rp, None)
+        if it.get("sha1"):
+            drop.add(it["sha1"])
+    mf = out_root / MANIFEST_NAME
+    if drop and mf.exists():
+        lines = [ln for ln in mf.read_text(encoding="utf-8").splitlines()
+                 if not any(f'"sha1": "{h}"' in ln for h in drop)]
+        mf.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    if items and ledger_path.exists():
+        ledger_path.write_text(json.dumps(ledger, indent=0, sort_keys=True), encoding="utf-8")
+    report["state"] = "remaking"
+    _write_json(hd_dir / VERIFY_REPORT, report)
+    print(f"remake: {len(items)} image(s) removed to be made again", flush=True)
+    return 0
+
+
 def print_plan(srcs, jobs):
     tiers = Counter(s.tier for s in srcs)
     alphas = Counter(s.alpha for s in srcs)
@@ -1359,6 +1571,11 @@ def main():
     ap.add_argument("--check-colours", action="store_true",
                     help="check an existing set's colours against the sources (red and blue exchanged back, far-off "
                          "images removed to be made again), then exit")
+    ap.add_argument("--verify", action="store_true",
+                    help="(TODO 281) check the whole set and write hd_textures/verify_report.json; nothing is changed")
+    ap.add_argument("--forget-broken", action="store_true",
+                    help="(TODO 281) remove the last verify report's missing and broken images (and their "
+                         "manifest records) so that the next run makes only those, then exit")
     ap.add_argument("--match-colour", action="store_true",
                     help="match each image's colour to the game's as it is made (match_colour.py)")
     args = ap.parse_args()
@@ -1373,6 +1590,12 @@ def main():
 
     if args.audit:
         sys.exit(audit(args.src, args.out))
+    if args.verify:
+        hd_dir = args.hd_dir or args.out.parent
+        sys.exit(verify_set(args.src, args.out, hd_dir, args.quality,
+                            None if args.no_wait_for_game else hd_dir / ".game_running"))
+    if args.forget_broken:
+        sys.exit(forget_broken(args.out, args.hd_dir or args.out.parent))
     if args.check_colours:
         hd_dir = args.hd_dir or args.out.parent
         check_set(args.src, args.out, args.out.parent / "upscaled_precolour", hd_dir / "upscale_status.json",
@@ -1531,7 +1754,7 @@ def main():
             print(f"note: {counts[1]} of the {counts[0]} HD textures already here are broken, and this graphics card's "
                   f"({name or 'unknown'}) test images come out broken too. The set is set aside: the "
                   f"game draws its own textures. Nothing is deleted. After a graphics driver update, F1 > Graphics > "
-                  f"Check HD textures tries the card again and takes them back if it is good.", flush=True)
+                  f"Make HD textures tries the card again and takes them back if it is good.", flush=True)
         elif counts:
             print(f"note: the HD textures already here are good ({counts[0]} checked, {counts[1]} broken and removed): "
                   f"they stay in use" + (", and are used again from the next start of the game." if was_aside else "."), flush=True)
@@ -1689,7 +1912,7 @@ def main():
                     card_failed(gpu_name[0])
                     print(f"note: this graphics card ({gpu_name[0] or 'unknown'}) gives broken images in every way "
                           f"the upscaler has: no HD textures are made on it (the game's own are drawn). A newer "
-                          f"graphics driver may fix it: then F1 > Graphics > Check HD textures tries "
+                          f"graphics driver may fix it: then F1 > Graphics > Make HD textures tries "
                           f"again.", flush=True)
                     write_status(status_path, state="card_broken", done=done_before + done, total=total,
                                  quality=args.quality, gpu=gpu_name[0])
