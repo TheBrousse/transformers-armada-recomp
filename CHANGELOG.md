@@ -1,5 +1,12 @@
 # What's new
 
+## 0.5.1
+
+**New**
+- The European disc (SLES-52388) is supported, as an experimental option: the setup accepts it and marks it as
+  experimental. It plays in all five of its languages (F1 > Gameplay > Language, text and voices), and its 50 Hz
+  mode now runs at the right speed. Thanks to TheBrousse, who maintains it.
+
 ## 0.5.0
 
 **New**

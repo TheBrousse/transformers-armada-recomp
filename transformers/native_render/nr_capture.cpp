@@ -13,6 +13,7 @@
 #include "nr_types.h"
 #include "nr_backend.h"
 #include "nr_install.h"
+#include "game_version.h" // (TF_GA: the code addresses that differ in the PAL release)
 #include "hd_progress.h"
 #include "nr_frame_texture_policy.h"
 #include "view_turn.h"
@@ -4780,7 +4781,7 @@ namespace nr
         // stretches long after, saw every pass with the last pass's block (its 4 patches drawn 80 times, the others not
         // at all). The block copied while it still stands - before the next allocation, the next flush or the frame's end -
         // into the frame (Frame::rainBlocks), and nr_rain.cpp draws each pass's batches from its copy. TF_NATIVE_RAIN=0: not.
-        constexpr uint32_t kListAlloc = 0x00221CC0u, kListAllocFromRain = 0x005656F4u; // (the call in LoadContext + 8)
+        constexpr uint32_t kListAlloc = 0x00221CC0u, kListAllocFromRain = TF_GA(0x005656F4u); // (the call in LoadContext + 8)
         constexpr uint32_t kListFlush = 0x0023AB70u, kListFlush2 = 0x0023AA90u;
         PS2Runtime::RecompiledFunction g_listAlloc = nullptr, g_listFlush = nullptr, g_listFlush2 = nullptr;
         uint32_t g_rainPending = 0u; // (the block of the pass not yet copied: its data's guest address)
