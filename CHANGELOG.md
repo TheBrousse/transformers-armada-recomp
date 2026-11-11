@@ -1,5 +1,21 @@
 # What's new
 
+## 0.5.0
+
+**New**
+- F1 > Graphics > Advanced has Smooth textures (on by default): characters and water no longer look blocky when
+  the game's own textures are drawn at high resolutions. Thanks to galaxyawesome.
+- F1 > Controls has "Invert mouse up / down". The game's own Invert Y option now only turns the controller stick
+  around, so a save that had it on no longer turns the mouse upside down.
+
+**Changed**
+- Quit game is now a button at the bottom right of F1, and the top right shows the game's own frame rate.
+
+**Fixed**
+- When the frame rate stepped down because the PC could not keep up, the game froze for a moment at each step,
+  which could look like the jet bike or the camera jumping. The steps no longer freeze the game.
+- With F1 open, mouse clicks no longer reach the game's menus behind it.
+
 ## 0.4.9
 
 **New**

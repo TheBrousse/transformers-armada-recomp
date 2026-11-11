@@ -1551,6 +1551,23 @@ void tfPostTestKey(int vk, bool down)
     PostMessageW(window, down ? WM_KEYDOWN : WM_KEYUP, static_cast<WPARAM>(vk), lp);
 }
 
+// (Tests: TF_CLICK_TEST, TODO 286) A left click at (x, y) of the window's client area as the mouse would make it: the
+// cursor moved there and the button down, or the button up - no focus needed.
+void tfPostTestClick(int x, int y, bool down)
+{
+    const HWND window = g_tfTestWindow.load();
+    if (!window)
+        return;
+    const LPARAM lp = MAKELPARAM(x, y);
+    if (down)
+    {
+        PostMessageW(window, WM_MOUSEMOVE, 0, lp);
+        PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+    }
+    else
+        PostMessageW(window, WM_LBUTTONUP, 0, lp);
+}
+
 #pragma comment(lib, "winmm.lib")
 
 #endif
@@ -1560,6 +1577,7 @@ bool tfOverlayInputHook() { return false; }
 void tfOverlayTakeInput(std::vector<uint32_t> &, std::vector<int> &, float &, float &) {}
 int tfWheelScrollLines() { return 3; }
 void tfPostTestKey(int, bool) {}
+void tfPostTestClick(int, int, bool) {}
 void tfTakeMenuMouse(int &left, int &right, float &wheel) { left = right = 0, wheel = 0.0f; }
 void tfHideCursorForPad() {}
 bool tfCursorHiddenForPad() { return false; }

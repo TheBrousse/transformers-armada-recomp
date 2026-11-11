@@ -12,6 +12,7 @@
 #include "distance_meter.h"
 #include "hd_movies.h"
 #include "nr_movie.h"
+#include "nr_backend.h" // (the native renderer's backend in use: its slot waits for the slow-frame report)
 #include "speedrun_timer.h"
 #include "start_screens.h"
 #include "tuning.h"
@@ -91,10 +92,6 @@ namespace nr
     double gameWaitMs();
     void largeImageActivity(unsigned &queued, unsigned &heavy, uint64_t &compressed, uint64_t &pngs);
     uint64_t pipelinesMade();
-    namespace d3d
-    {
-        double slotWaitMs();
-    }
     namespace n5
     {
         void install(PS2Runtime &runtime); // (native_render/nr_n5.cpp: N5, the render device native - docs/N5_PLAN.md)
@@ -544,23 +541,25 @@ namespace
         if (index == 1u && invertFlipped() && ctx->pc == getRegU32(ctx, 31))
             SET_GPR_U32(ctx, 2, getRegU32(ctx, 2) == 0u ? 1u : 0u);
     }
-    // The mouse turns as the right stick does with the option (the direct third-person turn below applies it itself,
-    // the other cameras get the mouse as their stick, which the game inverts by the option): the runtime's own mouse
-    // inversion stays off. g_mouseInvertY: the third-person turn's (the camera's effective invert).
-    bool g_mouseInvertY = false;
+    // (TODO 287, the user's choice) The mouse has its own Invert setting, F1 > Controls > "Invert mouse up / down"
+    // (PS2X_MOUSE_INVERT_Y, Off by default: moved up looks up), applied by the runtime to the mouse's travel. A save's own
+    // Invert Y option is the controller stick's alone: saves made before TODO 178 (2026-11-06) carry the game's old
+    // default, Yes, and turned the mouse upside down for good (TODO 187 had the mouse follow the stored option). The
+    // direct third-person turn takes the travel as it is; the other cameras get the mouse as their stick, which the game
+    // inverts by the option - g_stickInvertY, that inversion, is taken back there so only the mouse setting counts.
+    bool g_stickInvertY = false;
     void mouseFollowsInvertOption(const uint8_t *rdram)
     {
         uint32_t options = 0u;
         std::memcpy(&options, rdram + kOptionsPointer, sizeof(options));
         if (options == 0u || (options & PS2_RAM_MASK) + 1u >= PS2_RAM_SIZE)
             return;
-        static bool once = (ps2_host_input::setMouseInvertY(false), true);
-        (void)once;
         const bool stored = rdram[(options & PS2_RAM_MASK) + 1u] != 0u;
-        // (TODO 187) The mouse in the direct third-person turn follows the stored option itself: NO = moved up looks up, as
-        // before 178 (the flip is the stick's - the game's own turn reads it; following the flipped answer turned the mouse
-        // upside down with NO).
-        g_mouseInvertY = stored;
+        // (TODO 178: with the flip, the stored YES inverts the stick; without it, the stored NO does)
+        const bool stick = invertFlipped() ? stored : !stored;
+        if (stick != g_stickInvertY)
+            std::fprintf(stderr, "[tf] the save's Invert Y: the stick %s; the mouse by its own setting\n", stick ? "inverted" : "not inverted");
+        g_stickInvertY = stick;
     }
 
     void copyOptions(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1735,8 +1734,6 @@ namespace
         const uint8_t *idField = camera != 0u ? getConstMemPtr(rdram, camera + 0x18u) : nullptr;
         if (angles && idField && view_turn::takeMouseTravel(pixelsX, pixelsY))
         {
-            if (g_mouseInvertY) // (TODO 178: the camera's invert as the stick gets it - the game's own turn never sees the mouse)
-                pixelsY = -pixelsY;
             // (TODO 189) The aiming view's zoom (R3 / Circle into taTransformerStateLook, R3 again steps the zoom): the game's
             // stick turn is the rate times the state's +0x20 (0x46D74C: 1, then 0.57 and 0.33 at the two zoom steps - measured
             // 135, 77 and 45 deg/s), so zoomed in the view turns as much across the picture as before. The mouse went to the
@@ -1842,7 +1839,9 @@ namespace
             g_owedYaw = g_owedPitch = 0.0f;
             return;
         }
-        // (TODO 178: the mouse up = the stick up - the game inverts it by the option, as the stick)
+        // (TODO 287: the game inverts the stick by the save's option; taken back for the mouse, which has its own setting)
+        if (g_stickInvertY)
+            pixelsY = -pixelsY;
         g_owedYaw = std::clamp(g_owedYaw + pixelsX * kRadiansPerPixel, -kMaxOwedSeconds * kYawPerSecond,
                                kMaxOwedSeconds * kYawPerSecond);
         g_owedPitch = std::clamp(g_owedPitch + pixelsY * kRadiansPerPixel, -kMaxOwedSeconds * kPitchPerSecond,
@@ -3057,10 +3056,45 @@ namespace
     // without (field A, the other pass with a scissor of one pixel). A level from a state made
     // at 30 switched to the PC rate (TF_60FPS=force) gets those of a field a frame, as a level
     // begun at it has.
-    void setViewFields(uint8_t *rdram, int32_t field)
+    // (TODO 287) The scan reads all of main RAM (256 MB): 30-55 ms in one frame, and the frame rate's steps called it each
+    // time (setInBetween) - a step was a visible hitch, four of them on the user's jet bike ride. The views found are kept:
+    // a later call for the same field (`quick`) only checks them - each still a view, already at that field - and scans
+    // again only when one is not (a new level's views, a state loaded, the other field asked for). A view the game makes
+    // in between takes the field from betwixtMode, which setInBetween sets with it. TF_VIEW_SCAN=1: the full scan always.
+    std::vector<uint32_t> g_viewsFound;
+    int32_t g_viewsField = 1; // (none written yet)
+    void setViewFields(uint8_t *rdram, int32_t field, bool quick = false)
     {
         constexpr uint32_t kViewVtable = 0x006B2CA0u;
         constexpr uint32_t kRamBytes = PS2_RAM_SIZE;
+        static const bool alwaysScan = std::getenv("TF_VIEW_SCAN") && *std::getenv("TF_VIEW_SCAN") == '1';
+        if (quick && !alwaysScan && field == g_viewsField && !g_viewsFound.empty())
+        {
+            bool same = true;
+            for (const uint32_t at : g_viewsFound)
+            {
+                uint32_t word = 0u, inner = 0u;
+                int32_t current = 0;
+                std::memcpy(&word, rdram + at, sizeof(word));
+                std::memcpy(&inner, rdram + at + 4u, sizeof(inner));
+                inner &= 0x1FFFFFFFu;
+                if (word != kViewVtable || (inner & 3u) != 0u || inner < 0x00100000u || inner + 0x210u > kRamBytes)
+                {
+                    same = false;
+                    break;
+                }
+                std::memcpy(&current, rdram + inner + 0x20Cu, sizeof(current));
+                if (current != field)
+                {
+                    same = false;
+                    break;
+                }
+            }
+            if (same)
+                return; // (the views as they were: nothing to write)
+        }
+        g_viewsFound.clear();
+        g_viewsField = field;
         uint32_t views = 0u;
         for (uint32_t at = 0u; at + 8u <= kRamBytes; at += 4u)
         {
@@ -3078,6 +3112,7 @@ namespace
             if (current != 0 && current != -1)
                 continue; // (not a view)
             std::memcpy(rdram + inner + 0x20Cu, &field, sizeof(field));
+            g_viewsFound.push_back(at);
             ++views;
         }
         std::fprintf(stderr, "[tf] %u views made to draw %s a frame\n", views, field < 0 ? "one field" : "two fields");
@@ -3199,7 +3234,7 @@ namespace
     void setInBetween(uint8_t *rdram, PS2Runtime *runtime, bool on)
     {
         g_inBetweenHeld = !on;
-        setViewFields(rdram, inBetweenShown() ? 0 : -1);
+        setViewFields(rdram, inBetweenShown() ? 0 : -1, true); // (TODO 287: a rate step's own call checks the views it knows)
         applyVBlankPeriod(runtime);
         const bool inBetween = inBetweenNow();
         rdram[kHalfRate] = inBetween ? 1u : 0u;
@@ -7369,6 +7404,7 @@ namespace
                                                  envOf("TF_GRASS_DISTANCE"));
         nr::setGrassReach(d.grass);
         nr::setTextureSharpness(textureSharpnessOf(envOf("TF_SHARP_TEXTURES")));
+        nr::setTextureSmoothing(envOf("TF_SMOOTH_TEXTURES") != "0");
         g_enemyDetail.store(enemyDetailOf(envOf("TF_ENEMY_DETAIL")));
         g_terrainDetail.store(terrainDetailOf(envOf("TF_TERRAIN_DETAIL"), preset));
         if ((g_staticSceneClear = runtime.lookupFunction(kStaticSceneClear)) != nullptr)
@@ -7785,6 +7821,27 @@ namespace
                 ps2_settings::add(s);
             }
             {
+                // Issue #17: a texture magnified on screen filtered as the draw asks for a magnified one (MMAG), where the
+                // GS's distance rule picked MMIN's nearest texels - the characters' skin, blocky at 1440 lines with the
+                // game's own textures (nr::setTextureSmoothing). On by default; Off: the PS2's choice.
+                Setting s;
+                s.key = "TF_SMOOTH_TEXTURES";
+                s.section = "Graphics";
+                s.label = "Smooth textures";
+                s.order = 45; // (after Sharp textures: the same order, added after it)
+                s.help = "Native renderer: the game's own textures stay smooth up close on a high-resolution screen. The PS2 "
+                         "showed some of them, the characters' among them, as hard texels, which look blocky at 1440p and "
+                         "4K. Off: the PS2's.";
+                s.choices = {Choice{"", "On"}, Choice{"0", "Off"}};
+                s.defaultValue = "";
+                s.apply = [](const std::string &value)
+                {
+                    nr::setTextureSmoothing(value != "0");
+                    return true;
+                };
+                ps2_settings::add(s);
+            }
+            {
                 // N8 item 4 (the user's choice B): the enemies drawn finer at mid range, the animation the game's. Off by
                 // default. Like the other detail settings it moves the run's emulated-time timeline (the finer drawing is
                 // more guest code: a frame can land on another VBlank, and the random rolls follow) - no game rule changes
@@ -8053,14 +8110,14 @@ namespace
         static double cpuBefore = 0.0;
         const double cpu = 0.0;
 #endif
-        static double renderWaitBefore = nr::gameWaitMs(), slotWaitBefore = nr::d3d::slotWaitMs();
+        static double renderWaitBefore = nr::gameWaitMs(), slotWaitBefore = nr::backend().slotWaitMs();
         static uint64_t pipelinesBefore = nr::pipelinesMade(), compressedBefore = 0u, pngsBefore = 0u;
         static auto windowStart = now;
         static int linesInWindow = 0;
         const double intervalMs = std::chrono::duration<double, std::milli>(now - last).count();
         const double idleMs = std::chrono::duration<double, std::milli>(ee.idleHostTime() - idleBefore).count();
         const double cpuMs = cpu - cpuBefore, renderWait = nr::gameWaitMs() - renderWaitBefore,
-                     slotWait = nr::d3d::slotWaitMs() - slotWaitBefore;
+                     slotWait = nr::backend().slotWaitMs() - slotWaitBefore;
         const uint64_t pipelines = nr::pipelinesMade();
         unsigned queued = 0u, heavy = 0u;
         uint64_t compressed = 0u, pngs = 0u;
@@ -8089,7 +8146,7 @@ namespace
         idleBefore = ee.idleHostTime();
         cpuBefore = cpu;
         renderWaitBefore = nr::gameWaitMs();
-        slotWaitBefore = nr::d3d::slotWaitMs();
+        slotWaitBefore = nr::backend().slotWaitMs();
         pipelinesBefore = pipelines;
         compressedBefore = compressed;
         pngsBefore = pngs;

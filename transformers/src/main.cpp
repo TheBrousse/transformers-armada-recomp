@@ -421,7 +421,8 @@ int main(int argc, char *argv[])
                 playrec::draw(); // (the REC mark and its messages: playrec.h)
                 panel->draw(rt);
                 // The panels need the cursor: the game only gets the mouse while both are hidden.
-                menu_mouse::windowFrame(GetScreenWidth(), GetScreenHeight()); // (the pause menu's cursor: menu_mouse.h)
+                // (the pause menu's cursor: menu_mouse.h; none of the clicks while F1 or the debugger is up, TODO 286)
+                menu_mouse::windowFrame(GetScreenWidth(), GetScreenHeight(), panel->isVisible() || mod_menu::isOpen());
                 ps2_host_input::setMouseCaptureAllowed(!panel->isVisible() && !mod_menu::isOpen() && !menu_mouse::wantsCursor());
             },
             [](PS2Runtime &, void *userData)

@@ -31,6 +31,7 @@ param(
     [switch]$SkipRecompile,
     [switch]$NoPatches,     # leave PS2Recomp as it is (when editing it directly)
     [switch]$Public,        # the public build (no overlay\: no mods) into out\build-public, from a tree that has the overlay
+    [switch]$Vulkan,        # the Vulkan backend too (-DTF_VULKAN=ON; in development, off by default). The build folder keeps it.
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$OverlayArgs  # the overlay's own (overlay\build_hooks.ps1)
 )
 
@@ -238,6 +239,7 @@ function Get-GeneratorArgs([string]$Dir) {
 $genArgs = Get-GeneratorArgs $ToolsBuild
 $cmakeArgs = @("-S", $Root, "-B", $Build) + (Get-GeneratorArgs $Build)
 if ($Public) { $cmakeArgs += "-DTF_OVERLAY_DIR=" } # (the overlay left out: transformers\CMakeLists.txt)
+if ($Vulkan) { $cmakeArgs += "-DTF_VULKAN=ON" }     # (the Vulkan backend: transformers\CMakeLists.txt; -DTF_VULKAN=OFF turns it off again)
 
 # What the translation (steps 3-4) depends on, one line per input: "<name> <SHA-256>". The
 # recompiler and analyzer are the programs themselves - MSBuild relinks them only when a source

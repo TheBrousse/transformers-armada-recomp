@@ -11,6 +11,7 @@
 // same ticks, the GS picture beside it). TF_NATIVE_TRACE=<n>: the layout of the first n geometry sets.
 // TF_NATIVE_DUMP=1: each saved frame's draws, as text beside the picture (runs\native_<tick>.txt).
 #include "nr_types.h"
+#include "nr_backend.h"
 #include "nr_install.h"
 #include "hd_progress.h"
 #include "nr_frame_texture_policy.h"
@@ -994,7 +995,7 @@ namespace nr
             static uint64_t lastScan = 0;
             if (tick < lastScan + 30u)
                 return;
-            const uint64_t budget = d3d::largeImageBudget(), used = d3d::largeImageBytes();
+            const uint64_t budget = backend().largeImageBudget(), used = backend().largeImageBytes();
             if (budget == UINT64_MAX || used <= budget)
                 return;
             lastScan = tick;
@@ -5122,7 +5123,7 @@ namespace nr
                                      static_cast<unsigned long long>(tick), flatDrawsMin, flatDrawsMax, flatMovie ? ", a movie played" : "");
                     flatBefore = flat;
                 }
-                const bool emulate = (emu2D && !g_frame.has3D) || !d3d::drawsPictures(); // (the device lost: the GS draws again)
+                const bool emulate = (emu2D && !g_frame.has3D) || !backend().drawsPictures(); // (the device lost: the GS draws again)
                 if (emulate != ps2_host_display::emulatedDrawing())
                 {
                     ps2_host_display::setEmulatedDrawing(emulate);
@@ -6300,7 +6301,7 @@ namespace nr
             s.choices = {{"0", "Off"}, {"1", "FXAA"}, {"2", "SMAA 1x"}};
             s.defaultValue = "1";
             s.apply = [](const std::string &value) {
-                d3d::setAntiAliasing(value == "0" ? 0 : value == "2" ? 2 : 1);
+                backend().setAntiAliasing(value == "0" ? 0 : value == "2" ? 2 : 1);
                 return true;
             };
             s.available = []() {
@@ -6447,7 +6448,7 @@ namespace nr
             s.choices = {{"0", "Off"}, {"1", "On (1.5x)"}};
             s.defaultValue = "0";
             s.apply = [](const std::string &value) {
-                d3d::setSupersampling(value == "1");
+                backend().setSupersampling(value == "1");
                 return true;
             };
             s.available = []() {
@@ -6633,7 +6634,7 @@ namespace nr
         // pairs of the same frames, the GS's shot and the native one)
         if (std::getenv("TF_NATIVE_LOOSE_COMPARE") && *std::getenv("TF_NATIVE_LOOSE_COMPARE") == '1')
             ps2_host_display::setGifObserverAlways(true);
-        d3d::prepare();
+        backend().prepare();
         startLivePicture();
     }
 

@@ -40,6 +40,7 @@
 #include "port_ext.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -321,7 +322,7 @@ namespace menu_mouse
         return started;
     }
 
-    void windowFrame(int windowWidth, int windowHeight)
+    void windowFrame(int windowWidth, int windowHeight, bool overlayOpen)
     {
         if (windowWidth <= 0 || windowHeight <= 0)
             return;
@@ -329,6 +330,27 @@ namespace menu_mouse
         // comes back when the mouse moves (profiler.cpp's window procedure).
         if (padUsedNow())
             tfHideCursorForPad();
+        // (TODO 286 a) The F1 overlay (or the debugger) up: the window's clicks and wheel are the overlay's, never the game
+        // menu's under it - they were also handed to the pause menu, the HQ's screens and the front end, which pressed their
+        // buttons through the overlay. Taken and dropped while it is up, and for a quarter of a second after it closes: the
+        // click on an overlay button that closes it arrives in the frame it closed.
+        static auto overlaySeen = std::chrono::steady_clock::time_point{};
+        const auto nowOverlay = std::chrono::steady_clock::now();
+        if (overlayOpen)
+            overlaySeen = nowOverlay;
+        if (overlayOpen || nowOverlay - overlaySeen < std::chrono::milliseconds(250))
+        {
+            int dropLeft = 0, dropRight = 0;
+            float dropWheel = 0.0f;
+            tfTakeMenuMouse(dropLeft, dropRight, dropWheel);
+            g_u.store(-1.0f, std::memory_order_relaxed);
+            g_v.store(-1.0f, std::memory_order_relaxed);
+            static const bool log = std::getenv("TF_OVERLAY_INPUT_LOG") && *std::getenv("TF_OVERLAY_INPUT_LOG") == '1';
+            if (log && (dropLeft > 0 || dropRight > 0 || dropWheel != 0.0f))
+                std::fprintf(stderr, "[menu mouse] the overlay %s: %d left / %d right clicks, wheel %.2f kept from the game\n",
+                             overlayOpen ? "is up" : "just closed", dropLeft, dropRight, dropWheel);
+            return;
+        }
         // (TODO 175) The clicks and wheel of the window's messages: raylib's pressed / wheel are its last poll's only, and
         // the runtime polls several times a picture - a click between them was lost.
         int clicksLeft = 0, clicksRight = 0;
