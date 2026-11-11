@@ -4436,6 +4436,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                             if (k == 0)
                             {
                                 smooth(g_gpuPictureMs, ms);
+                                nr::noteGpuFrame(ms); // (TODO 290 fps: the rate governor's way up)
                                 g_frameGpu += ms;
                                 ++g_frameGpuFrames;
                             }

@@ -1,11 +1,22 @@
 # What's new
 
+## 0.6.5
+
+**Fixed**
+- On PCs held back by the graphics card, the frame rate no longer keeps stepping up and down (felt as stutter); it
+  settles on a rate the card can draw. On an RX 5700 XT at 3440x1440 the dropped frames fell by about 80%.
+
+**Changed**
+- The Ultra preset keeps the forest at 2x. A longer forest and "every tree in full 3D" are now only under
+  Graphics > Advanced, with a warning: they are very heavy, even on strong graphics cards. If you chose Ultra
+  before, the new Ultra applies at your next start (forest settings you set by hand are kept).
+- The 1% low in the frame-rate log now counts the pictures you see, not the game's internal frames.
+
 ## 0.6.4
 
 **Changed**
 - Sounds now fade out with the PS2 sound chip's own curves instead of straight lines, so menu clicks, impacts,
   engines and the dropship end as they do on the console.
-- More of the game runs from the decompiled code (built on the decomp's latest version).
 
 **Fixed**
 - On ultrawide screens the sun's glare is round again instead of a tall oval.

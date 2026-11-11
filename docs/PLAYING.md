@@ -170,9 +170,11 @@ Your choices are saved in `settings.ini` in the install folder.
 | HD textures | The HD textures made from your disc, on or off (native renderer; takes a restart). Its buttons open their folder, **Make HD textures** (says the disk space and time first), **Verify HD textures** (checks every image and says what it found, changes nothing) and **Remake N broken images** (after a verify that found some). |
 | Texture pack | Emulated renderer only: PCSX2 texture packs from a replacements folder. Not the HD textures. |
 
-The **Ultra** preset sets everything to its highest: the longest distances, every tree in full 3D, full enemy
-detail, 8x multisampling with 1.5x supersampling and Ultra textures. It needs a strong graphics card. If the
-frame rate drops, try **High**.
+The **Ultra** preset sets everything to its highest but the forest: the longest distances, full enemy detail,
+8x multisampling with 1.5x supersampling and Ultra textures, with the forest at 2x. It needs a strong graphics
+card. If the frame rate drops, try **High**. A longer forest (3x, 4x) and every tree in full 3D are under
+Graphics > Advanced (Forest distance, Trees): very heavy, they can drop the frame rate a lot, even on strong
+graphics cards.
 
 If a graphics card makes the HD textures black (some GTX 16-series cards do), the maker notices, tries safer
 ways, and if none works it makes none: F1 says so and the game shows its own textures. After a graphics driver
