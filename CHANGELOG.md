@@ -1,5 +1,11 @@
 # What's new
 
+## 0.5.3
+
+**Fixed**
+- F1 > Controls showed "Invert mouse up / down" twice, with an error message, and changing it (above all with a
+  controller) could switch straight back. It is one row again and keeps your choice.
+
 ## 0.5.2
 
 **Fixed**

@@ -1779,6 +1779,7 @@ namespace mod_menu
 
         // The keys the layouts place (the merged rows' too): left out of the leftover rows.
         const char *const kPlaced[] = {
+            "PS2X_MOUSE_INVERT_Y", // (TODO 287: its own row in Mouse; listed here so it is not drawn a second time)
             "PS2X_FULLSCREEN", "PS2X_MONITOR", "PS2X_WIDESCREEN", "TF_ASPECT", "TF_FOV", "TF_HQ_FOV", "TF_FPS_CAP", "PS2X_SHOW_FPS",
             "TF_FRAME_RATE", "TF_FPS_LOCK", "TF_FRAME_PACING", "TF_CRISP_TEXT", "TF_BUTTON_SYMBOLS", "TF_KEY_PROMPTS", "TF_PAD_PROMPTS",
             "TF_SMALL_CROSSHAIR", "TF_HQ_PANELS", "TF_DISTANCE_METER", "TF_SPEEDRUN_TIMER", "TF_RENDERER", "PS2X_GPU_SCALE",
