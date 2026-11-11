@@ -224,7 +224,20 @@ namespace nr
             if (backend().waitPicture(g_takenSerial.load(std::memory_order_relaxed),
                                  std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count(), lastNs))
                 return 1;
-            if (lastNs == 0 || nowNs() - lastNs > 100000000ll)
+            // (How long without a picture counts as none coming: 100 ms, or three of the recent intervals between them where
+            // the renderer is slower than that - on a low-end PC in full screen it hands over one every 140-200 ms, and at
+            // 100 ms the window dropped back to its own redraws every other picture. A second at most. Unchanged at 30
+            // pictures a second and above: three intervals are then 100 ms or less. PR #18, TheBrousse.)
+            static int64_t seenNs = 0, intervalNs = 0;
+            if (lastNs != 0 && lastNs != seenNs)
+            {
+                const int64_t d = seenNs != 0 ? lastNs - seenNs : 0;
+                if (d > 0 && d < 1000000000ll)
+                    intervalNs = intervalNs == 0 ? d : (intervalNs * 7 + d) / 8;
+                seenNs = lastNs;
+            }
+            const int64_t noneAfterNs = std::clamp<int64_t>(3 * intervalNs, 100000000ll, 1000000000ll);
+            if (lastNs == 0 || nowNs() - lastNs > noneAfterNs)
             {
                 g_pacedLive.store(false, std::memory_order_relaxed);
                 return -1;
@@ -363,7 +376,8 @@ namespace nr
                 // (TODO 284) The picture taken, as the shared path marks it: the paced hand-over (paceWait) waits for one
                 // newer than this. Unmarked, every wait found the CPU hand-over's picture "new" again - the window drew
                 // as fast as it could and counted each draw: the FPS counter read 600-1500 (TF_NATIVE_SHARE=0, Proton, the
-                // Intel fallback).
+                // Intel fallback). (PR #18, TheBrousse: and marked fresh, so it is paced and logged as a shared picture is, below.)
+                fresh = true;
                 g_takenSerial.store(serial, std::memory_order_relaxed);
                 if (shown.id == 0u || shown.width != static_cast<int>(w) || shown.height != static_cast<int>(h))
                 {
@@ -521,6 +535,21 @@ namespace nr
                 width = static_cast<int>(sharedW);
                 height = static_cast<int>(sharedH);
                 return true;
+            }
+            // The CPU hand-over's picture: paced and logged as a shared one (shown when it is handed over). (PR #18, TheBrousse)
+            {
+                const uint64_t skipped = serialBefore != 0u && serial > serialBefore + 1u ? serial - serialBefore - 1u : 0u;
+                if (fresh && g_pacerOn)
+                {
+                    g_pendingShown = true;
+                    g_pendingPicture = d3d::SharedPicture{};
+                    g_pendingSkipped = skipped;
+                }
+                else if (fresh)
+                    noteShown(d3d::SharedPicture{}, skipped);
+                else if (pacingLogOn())
+                    ++g_pacing.repeats;
+                g_pacedLive.store(true, std::memory_order_relaxed);
             }
             texture = shown.id;
             width = shown.width;

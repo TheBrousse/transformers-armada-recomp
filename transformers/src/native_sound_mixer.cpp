@@ -164,6 +164,7 @@ namespace native_sound::mixer
             Phase phase = Phase::Off;
             float level = 0.0f, releaseStep = 0.0f;
             double phaseLeft = 0.0;
+            bool softStop = false; // (TODO 290 (10)) this release is the engine's soft stop at a transformation
             uint32_t counter = 0, position = 0;
             int16_t history[4] = {};
         };
@@ -613,6 +614,45 @@ namespace native_sound::mixer
         double g_mixedUntil = -1.0;
         double g_fraction = 0.0;
 
+        // TF_NATIVE_SOUND_SOLO=<prefix>[,<prefix>...] (a measuring aid, lane D 2026-11-11): only the voices whose tone's
+        // name starts with one of these (any case) are heard, and no stream - the sounds under test alone in a dump
+        // (PS2X_AUDIO_DUMP), for comparing envelopes and fades. Everything still plays on, unheard.
+        const std::vector<std::string> &soloPrefixes()
+        {
+            static const std::vector<std::string> list = [] {
+                std::vector<std::string> v;
+                const char *env = std::getenv("TF_NATIVE_SOUND_SOLO");
+                std::string cur;
+                for (const char *c = env; c && *c; ++c)
+                {
+                    if (*c == ',')
+                    {
+                        if (!cur.empty())
+                            v.push_back(cur);
+                        cur.clear();
+                    }
+                    else
+                        cur.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*c))));
+                }
+                if (!cur.empty())
+                    v.push_back(cur);
+                return v;
+            }();
+            return list;
+        }
+        bool soloHeard(const Voice &v)
+        {
+            const auto &list = soloPrefixes();
+            if (list.empty())
+                return true;
+            std::string name = v.tone ? v.tone->name : v.toneName;
+            for (char &c : name)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const std::string &p : list)
+                if (name.rfind(p, 0) == 0)
+                    return true;
+            return false;
+        }
         // (TODO 213) toPad: the game alerts go to padL / padR instead of the PC's mix (pad_speaker.h).
         void mixVoices(float &dryL, float &dryR, float &sendL, float &sendR, bool toPad, float &padL, float &padR)
         {
@@ -640,6 +680,8 @@ namespace native_sound::mixer
                     v.phase = Phase::Off; // the data ended (no loop): the channel is free at once
                     reqEnd(handle, v, "data ended");
                 }
+                if (!soloHeard(v))
+                    continue;
                 const float l = sample * v.gainLeft, r = sample * v.gainRight;
                 if (reqLog())
                     v.peak = std::max(v.peak, v.level * std::max(std::fabs(v.gainLeft), std::fabs(v.gainRight)));
@@ -658,6 +700,22 @@ namespace native_sound::mixer
 
         void mixStreams(float &dryL, float &dryR, bool toPad, float &padL, float &padR)
         {
+            const float keep[4] = {dryL, dryR, padL, padR}; // (TF_NATIVE_SOUND_SOLO: no stream heard)
+            struct Restore
+            {
+                const float *k;
+                float &a, &b, &c, &d;
+                ~Restore()
+                {
+                    if (!soloPrefixes().empty())
+                    {
+                        a = k[0];
+                        b = k[1];
+                        c = k[2];
+                        d = k[3];
+                    }
+                }
+            } restore{keep, dryL, dryR, padL, padR};
             for (auto &[handle, s] : g_streams)
             {
                 if (!s.playing)
@@ -861,6 +919,61 @@ namespace native_sound::mixer
         v.dry = std::clamp(dry, 0.0f, 1.0f);
     }
 
+    // (TODO 290 (10), the user's choice 2026-11-11) The vehicle's engine loops fade out over 0.15 s when the game keys
+    // them off at a transformation, instead of the PS2's cut: the game keys them off in the frame packet that starts
+    // the transformation's sound (Transform_Car / Transform_Robot / Transform_Fail), and Optimus's truck engine
+    // (Truck_ThrottleOn/Off) has a release time of 0 - the SPU2's fastest, about 2 ms. Only an engine loop (the
+    // truck's, Red Alert's jeep, the shared eng_ ones) whose own release is shorter than the fade, and only at a
+    // transformation; every other key-off is the game's own. TF_ENGINE_SOFT_STOP=0: the console's cut.
+    namespace
+    {
+        constexpr float kSoftStopSeconds = 0.15f;
+        std::vector<int32_t> g_engineStops; // engine loops keyed off in this packet
+        double g_transformKeyed = -1e9;      // the mix clock of the last transformation sound's key-on
+        bool g_transformThisPacket = false;
+
+        bool softStopOn()
+        {
+            static const bool on = [] {
+                const char *env = std::getenv("TF_ENGINE_SOFT_STOP");
+                return !(env && *env == '0');
+            }();
+            return on;
+        }
+
+        bool startsWith(const std::string &s, const char *prefix)
+        {
+            const size_t n = std::strlen(prefix);
+            if (s.size() < n)
+                return false;
+            for (size_t i = 0; i < n; ++i)
+                if (std::tolower(static_cast<unsigned char>(s[i])) != prefix[i])
+                    return false;
+            return true;
+        }
+
+        bool engineLoop(const Voice &v)
+        {
+            return v.tone && v.tone->loop &&
+                   (startsWith(v.toneName, "truck_") || startsWith(v.toneName, "jeep_") || startsWith(v.toneName, "eng_"));
+        }
+
+        bool transformSound(const std::string &tone) { return startsWith(tone, "transform_"); }
+
+        void softStop(int32_t handle, Voice &v)
+        {
+            if (v.phase != Phase::Release || v.envelope.release >= kSoftStopSeconds || v.level <= 0.0f)
+                return;
+            v.phaseLeft = kSoftStopSeconds;
+            v.releaseStep = v.level / static_cast<float>(kSoftStopSeconds * kRate);
+            v.softStop = true;
+            static const bool log = std::getenv("TF_ENGINE_SOFT_STOP_LOG") != nullptr;
+            if (log || reqLog())
+                std::fprintf(stderr, "[ns] %.3f engine loop h %d '%s' fades out over %.2f s (a transformation)\n", g_mixedUntil, handle,
+                             toneOf(v), kSoftStopSeconds);
+        }
+    }
+
     void play(int32_t handle)
     {
         Voice &v = g_voices[handle];
@@ -925,6 +1038,12 @@ namespace native_sound::mixer
         std::fill(std::begin(v.history), std::end(v.history), int16_t(0));
         v.level = 0.0f;
         v.keyedAt = ++g_keyCount;
+        v.softStop = false;
+        if (handle >= 0 && transformSound(v.toneName))
+        {
+            g_transformKeyed = g_mixedUntil;
+            g_transformThisPacket = true;
+        }
         startPhase(v, v.envelope.delay > 0.0f ? Phase::Delay : Phase::Attack);
         fetch(v);
         // TF_NATIVE_SOUND_KON=1: each key-on as the SPU2 register log has it (PS2X_SPU2_LOG=2), to compare.
@@ -955,7 +1074,25 @@ namespace native_sound::mixer
                 std::fprintf(stderr, "[ns req] %.3f koff h %d '%s' after %.3f s peak %.3f\n", g_reqClock, handle, toneOf(it->second),
                              g_reqClock - it->second.keyedTime, it->second.peak);
             startPhase(it->second, Phase::Release);
+            it->second.softStop = false;
+            if (handle >= 0 && softStopOn() && engineLoop(it->second))
+            {
+                if (g_transformThisPacket || g_mixedUntil - g_transformKeyed < 0.25)
+                    softStop(handle, it->second);
+                else
+                    g_engineStops.push_back(handle); // (the transformation's key-on may come later in this packet)
+            }
         }
+    }
+
+    void endPacket()
+    {
+        if (g_transformThisPacket)
+            for (int32_t h : g_engineStops)
+                if (auto it = g_voices.find(h); it != g_voices.end())
+                    softStop(h, it->second);
+        g_engineStops.clear();
+        g_transformThisPacket = false;
     }
 
     void rewind(int32_t handle) { play(handle); }

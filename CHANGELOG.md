@@ -1,5 +1,31 @@
 # What's new
 
+## 0.6.2
+
+**New**
+- On built-in graphics, F1 > Graphics > "I have HD textures (PCSX2 pack)" uses a PCSX2 texture pack you already
+  have: pick its folder, restart, and the game uses its textures. The pack is used where it is, not copied.
+- F1 > Controls > Mouse in the game: turn it off to play with a controller without the mouse moving the camera or
+  pressing buttons.
+
+**Changed**
+- When you transform, the vehicle's engine now fades out over a moment instead of stopping dead (on the PS2 it
+  cuts off). Set TF_ENGINE_SOFT_STOP=0 in settings.ini for the original cut. The README now lists what differs from
+  the PS2 on purpose, and how to turn each one off.
+- The FPS counter on built-in graphics now shows the real number of new pictures, so it can read lower than before.
+  The game itself is not slower: it now shows more frames.
+- The old-driver warning reads more clearly, and its link fits on one line.
+
+**Fixed**
+- Built-in graphics (Intel and others): no more coloured boxes around HUD pieces and see-through effects, and no
+  more flicker on effects such as an opening warp gate, while textures load.
+- Built-in graphics: the window no longer redraws the same picture over and over. In full screen on slow laptops
+  the game runs faster (about 16% more frames on a ThinkPad T480s). Thanks to TheBrousse.
+- The setup no longer stops with "prerequisites installed, but not found yet". It installs each tool and checks it
+  at once, it no longer trusts Windows' "already installed" for Python or the Visual Studio Build Tools, it says
+  clearly when Windows asked for permission and nobody answered, and it says which file your antivirus blocked.
+  Its log now records what it found, so problems can be solved quickly.
+
 ## 0.6.1
 
 **Fixed**
