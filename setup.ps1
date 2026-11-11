@@ -54,7 +54,10 @@ function Fail($msg) { Write-Host "`nsetup: $msg" -ForegroundColor Red; exit 1 }
 if ($Hooks) { . $Hooks }
 
 # --- the remembered choices ---------------------------------------------------------------------
-$state = if (Test-Path $StateFile) { Get-Content $StateFile -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+# (an empty or damaged .setup.json - a write cut off - is taken as missing: give the disc path again if it asks)
+$state = $null
+if (Test-Path $StateFile) { try { $state = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
+if (-not $state) { $state = [pscustomobject]@{} }
 if (-not $state.PSObject.Properties["Iso"]) { $state | Add-Member Iso "" }
 if ($Iso) {
     if (-not (Test-Path -LiteralPath $Iso -PathType Leaf)) { Fail "no such file: $Iso" }

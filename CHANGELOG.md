@@ -1,5 +1,12 @@
 # What's new
 
+## 0.6.3
+
+**Fixed**
+- Updates no longer stop at the HD textures with "upscale_textures.py failed with exit code 1" when one of their
+  record files was left empty (for example after the window was closed or the graphics driver restarted while they
+  were being made): the file is made again. Those files are now always written whole or not at all.
+
 ## 0.6.2
 
 **New**
