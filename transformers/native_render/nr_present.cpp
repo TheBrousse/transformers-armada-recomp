@@ -25,6 +25,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace tf::port
@@ -235,6 +236,14 @@ namespace nr
         d3d::SharedPicture g_pendingPicture;
         uint64_t g_pendingSkipped = 0u;
         bool g_pacerOn = false;
+        // (The CPU hand-over's pictures evened out: they are handed over as their frame's slot is used again, not at their
+        // frame's moment as the shared ones are (nr_d3d.cpp's pacer), so two often came within a millisecond and the next
+        // 60-90 ms later - at the game's 30 in a window on a low-end PC the time between pictures read 1..85 ms. A CPU
+        // picture is shown no sooner than 4/5 of the recent interval between shown pictures after the one before (a newer
+        // one taken meanwhile shown instead); the rate is unchanged. Window thread only.)
+        bool g_cpuPictures = false;   // the picture shown now is the CPU hand-over's (provide)
+        int64_t g_cpuShownNs = 0;     // when the last CPU picture was presented
+        int64_t g_cpuIntervalNs = 0;  // the recent interval between presented CPU pictures (7/8 average)
 
         int paceWait(std::chrono::steady_clock::time_point until)
         {
@@ -243,7 +252,20 @@ namespace nr
             int64_t lastNs = 0;
             if (backend().waitPicture(g_takenSerial.load(std::memory_order_relaxed),
                                  std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count(), lastNs))
+            {
+                if (g_cpuPictures && g_cpuShownNs != 0 && g_cpuIntervalNs != 0)
+                {
+                    const int64_t earliest = g_cpuShownNs + g_cpuIntervalNs * 4 / 5;
+                    const int64_t untilNs = std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count();
+                    if (nowNs() < earliest)
+                    {
+                        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(std::min(earliest, untilNs))));
+                        if (nowNs() < earliest)
+                            return 0; // (not yet: the window polls the input and asks again)
+                    }
+                }
                 return 1;
+            }
             // (How long without a picture counts as none coming: 100 ms, or three of the recent intervals between them where
             // the renderer is slower than that - on a low-end PC in full screen it hands over one every 140-200 ms, and at
             // 100 ms the window dropped back to its own redraws every other picture. A second at most. Unchanged at 30
@@ -267,6 +289,14 @@ namespace nr
 
         void pacePresented()
         {
+            if (g_cpuPictures)
+            {
+                const int64_t t = nowNs();
+                const int64_t d = g_cpuShownNs != 0 ? t - g_cpuShownNs : 0;
+                if (d > 0 && d < 1000000000ll)
+                    g_cpuIntervalNs = g_cpuIntervalNs == 0 ? d : (g_cpuIntervalNs * 7 + d) / 8;
+                g_cpuShownNs = t;
+            }
             if (g_pendingShown)
             {
                 g_pendingShown = false;
@@ -551,6 +581,7 @@ namespace nr
                 else if (pacingLogOn())
                     ++g_pacing.repeats;
                 g_pacedLive.store(true, std::memory_order_relaxed);
+                g_cpuPictures = false;
                 texture = imported[sharedShown].texture;
                 width = static_cast<int>(sharedW);
                 height = static_cast<int>(sharedH);
@@ -570,6 +601,7 @@ namespace nr
                 else if (pacingLogOn())
                     ++g_pacing.repeats;
                 g_pacedLive.store(true, std::memory_order_relaxed);
+                g_cpuPictures = true;
             }
             texture = shown.id;
             width = shown.width;
