@@ -224,11 +224,13 @@ Every key can be changed in **F1 > Controls**. The full list, with the function 
 
 Open the folder you installed into, then `transformers-armada-recomp`.
 
-- **Saves:** in `game\mc0`. In the game, F1 > Saves imports, exports and backs them up into the `Saves` folder.
+- **Saves:** in `game\mc0`. In the game, F1 > Saves imports, exports and backs them up into the `Saves` folder,
+  and "Open saves folder" takes you there.
 - **Settings:** `settings.ini`.
-- **Logs, for a bug report:** the game's logs are in `runs`. Zip the newest `play_...out` and `play_...err` files
-  and attach them. If the install or an update failed, also attach `setup.log` or `update-setup.log` from the
-  folder you installed into.
+- **Logs, for a bug report:** in the game, F1 > About > "Make a report" makes one zip file with the logs, your
+  settings and your PC's details (no saves, nothing of the game's files) and opens its folder. Attach that file.
+  If the game does not start: the logs are in `runs`; zip the newest `play_...out` and `play_...err` files. If the
+  install or an update failed, also attach `setup.log` or `update-setup.log` from the folder you installed into.
 - **Never attach** save files, save states or anything from the `game` folder: they contain game data.
 
 ## Help

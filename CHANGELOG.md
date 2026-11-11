@@ -1,5 +1,29 @@
 # What's new
 
+## 0.4.9
+
+**New**
+- "Match screen" now also fills screens narrower than 16:9, such as 16:10 (1920x1200), 3:2 and 4:3, instead of
+  showing bars above and below.
+- The stick dead zones in F1 > Controls have an Auto choice, now the default: it measures where each stick rests
+  when you do not touch it, so a worn stick no longer moves you on its own. Thanks to TheBrousse.
+- F1 > About has "Make a report", which puts your logs, your settings and a short summary of your PC into one
+  zip file to send with a bug report (no saves and no game files), and "Open logs folder". F1 > Saves has
+  "Open saves folder".
+
+**Changed**
+- VSync is now off by default, so the frame rate is no longer held at your screen's refresh rate. The picture may
+  tear; turn VSync on in F1 > Graphics if you prefer. If you turned VSync on before, it stays on. On FreeSync and
+  G-Sync screens the game still stays just under the screen's top rate.
+
+**Fixed**
+- On some Intel integrated graphics the game window stayed black from start to end. It now notices this and
+  shows the game another way. Thanks to TheBrousse.
+- Changing VSync or the frame rate limit while in the HQ now takes effect at once. Before, the HQ kept its old
+  frame rate until you left it.
+- Exclusive full screen now fills the whole screen. On some screens it was a few lines short.
+- A level loaded from a state that was saved at 30 frames a second now runs at your frame rate.
+
 ## 0.4.8
 
 **Fixed**

@@ -11,6 +11,7 @@
 #if defined(_WIN32)
 
 // Before windows.h, whose macros clash with names in the runtime headers.
+#include "install_layout.h"
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 
@@ -935,10 +936,8 @@ namespace
 
     std::filesystem::path runsDir()
     {
-        std::error_code e;
-        const std::filesystem::path dir = std::filesystem::current_path(e) / "runs";
-        std::filesystem::create_directories(dir, e);
-        return dir;
+        // (TODO 279: logs\ of the new folder layout when it is there, else runs\ as before)
+        return install_layout::logsDir();
     }
 
     std::string stamp()

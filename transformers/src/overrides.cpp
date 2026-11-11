@@ -370,7 +370,10 @@ namespace
             std::memcpy(&pixelAspect, rdram + kDisplayMode + 0x10u, sizeof(pixelAspect));
             // 1 for a 4:3 TV, 0.75 for a 16:9 one, 0.75 / k at an ultrawide shape (ultrawide.h).
             const float tv = width != 0u ? pixelAspect * (640.0f / static_cast<float>(width)) * 0.93f : 1.0f;
-            if (tv > 0.25f && tv < 0.875f)
+            // (TODO 282: narrower than 16:9 the widescreen mode's value goes up to the 4:3 TV's own - 0.75 / k, 1 at
+            // 4:3 - so there it is told by the shape's own value, with the widescreen picture on)
+            const float k = ultrawide::wideFactor();
+            if ((tv > 0.25f && tv < 0.875f) || (k < 1.0f && std::fabs(tv - 0.75f / k) < 0.07f))
                 aspect = ultrawide::shape();
         }
         static float shown = 0.0f;
@@ -3362,8 +3365,10 @@ namespace
             // the limit, fell and climbed every 10 s; with variable refresh a little under its top, as the ladder's
             // "any rate" - 240 Hz: 235. VSync off (the settings', PS2X_PRESENT_SYNC=0 - presents at once, allowed to tear):
             // the cap itself, Unlimited as many as the PC manages - TODO 266.)
+            // (TODO 283: with variable refresh the top stays a little under the screen's also with VSync off - Off is
+            // the default now, and past its range a FreeSync / G-Sync screen stops following the pictures and tears)
             int top = g_frameRate;
-            if (screenHz >= 50.0 && ps2_host_present::sync() != 0)
+            if (screenHz >= 50.0 && (ps2_host_present::sync() != 0 || vrr))
             {
                 const double margin = vrr ? std::max(3.0, 0.02 * screenHz) : 0.0;
                 top = std::max(30, std::min(top, static_cast<int>(std::floor(screenHz - margin + 0.5))));
@@ -4214,7 +4219,11 @@ namespace
         if (g_frameRate > 30)
         {
             const int madeAt = levelRateInMemory(rdram);
-            const int rate = madeAt > 30 || (madeAt == 30 && g_force60) ? g_frameRate : 0;
+            // (TODO 282: a level made at 30 too, whatever made it so - a limit of 30 at the time, the console's rate
+            // asked for then. It stayed at 30 until the next level with a higher limit set now; only TF_60FPS=force
+            // took it to the rate. TF_KEEP_30=1: as before.)
+            static const bool keep30 = std::getenv("TF_KEEP_30") && *std::getenv("TF_KEEP_30") == '1';
+            const int rate = madeAt > 30 || (madeAt == 30 && (g_force60 || !keep30)) ? g_frameRate : 0;
             g_unpinnedCarPeriod = 0.0f;
             if (madeAt > 30)
             {
@@ -4330,7 +4339,21 @@ namespace
         std::fprintf(stderr, "[tf] settings: %d frames a second, %s\n", g_frameRate,
                      g_moments.load() ? "pictures at the screen's refresh"
                                       : (g_pictureLock != 0 ? (g_pictureLock == 120 ? "120 pictures" : "60 pictures") : "unlocked"));
-        if (g_levelRate == 0 || g_inHq) // (the HQ keeps its own rate: g_inHq)
+        // (TODO 282) In the HQ: its rate from the new limit at once, as an HQ begun now would have it (it kept the old
+        // one until the next HQ). Nothing of a level's to convert: the HQ's per-frame steps follow the rate (hq_rate).
+        if (g_inHq)
+        {
+            const int hqRate = g_hqRate < 0 ? g_frameRate : g_hqRate;
+            if (cap >= 0 && g_hqRate < 0 && hqRate != g_levelRate) // (only for a new limit; the rate may have stepped down since)
+            {
+                std::fprintf(stderr, "[tf] the HQ at %d frames a second (the limit changed in it)\n", hqRate);
+                switchFrameRate(rdram, ctx, runtime, hqRate, false, true);
+                if (hqRate > 30)
+                    startAdapting();
+            }
+            return;
+        }
+        if (g_levelRate == 0)
             return;
         if (g_levelRate != g_frameRate)
         {
@@ -4378,6 +4401,45 @@ namespace
         if (runtime->eeScheduler().loadedStateCount() != g_statesSeen)
             adoptLoadedState(rdram, ctx, runtime); // (in case the hook was not there)
         levelAfterHq(rdram, ctx, runtime);
+        // TF_TEST_CAP=<vblank>:<cap>[,<vblank>:<cap>...] (tests, TODO 282): the frame rate limit set at those VBlanks, as
+        // the menu's row sets it (0: Unlimited).
+        {
+            static std::vector<std::pair<uint64_t, int>> plan = []()
+            {
+                std::vector<std::pair<uint64_t, int>> p;
+                for (const char *t = std::getenv("TF_TEST_CAP"); t && *t;)
+                {
+                    char *end = nullptr;
+                    const uint64_t at = std::strtoull(t, &end, 10);
+                    if (end == t || *end != ':')
+                        break;
+                    const int cap = static_cast<int>(std::strtol(end + 1, &end, 10));
+                    p.emplace_back(at, cap);
+                    t = *end == ',' ? end + 1 : end;
+                    if (*end != ',')
+                        break;
+                }
+                return p;
+            }();
+            static size_t next = 0u;
+            if (next < plan.size() && g_levelHooks && runtime->eeScheduler().currentVSyncTick() >= plan[next].first)
+            {
+                std::fprintf(stderr, "[tf] TF_TEST_CAP: the limit set to %d at VBlank %llu\n", plan[next].second,
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()));
+                g_wantCap.store(plan[next++].second);
+            }
+            // TF_TEST_VSYNC=<vblank> (tests): VSync turned off at that VBlank, as the menu's row does it.
+            static const uint64_t syncOffAt = std::getenv("TF_TEST_VSYNC") ? std::strtoull(std::getenv("TF_TEST_VSYNC"), nullptr, 10) : 0u;
+            static bool syncOffDone = false;
+            if (syncOffAt != 0u && !syncOffDone && g_levelHooks && runtime->eeScheduler().currentVSyncTick() >= syncOffAt)
+            {
+                syncOffDone = true;
+                std::fprintf(stderr, "[tf] TF_TEST_VSYNC: VSync off at VBlank %llu\n",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()));
+                ps2_host_present::setSync(0);
+                g_wantCap.store(g_rateSetting >= kUnlimitedRate ? 0 : g_rateSetting);
+            }
+        }
         takeSettings(rdram, ctx, runtime);
         setFrameWords(rdram, ctx, runtime);
         if (g_frameRate > 30 && playrec::keyPresses(kKeyF4, ps2_host_input::takeKeyPresses(kKeyF4)) > 0) // (N12 b)
@@ -7442,17 +7504,20 @@ namespace
             // (TODO 266) VSync: the presents wait for the screen's refresh (On: by the screen, as always - at its refresh,
             // at once with FreeSync / G-Sync) or go at once (Off: allowed to tear; the frame rate cap alone limits the
             // pictures, Unlimited none). Live: the presents at once (ps2_host_present::setSync), a level's rates from the
-            // next frame (taken as a cap change), the HQ's when it is entered next.
+            // next frame (taken as a cap change), and the HQ's too (TODO 282: it was the HQ's only when it was entered next -
+            // VSync turned off in the HQ "did nothing").
             Setting v;
             v.key = "PS2X_PRESENT_SYNC";
             v.section = "Graphics";
             v.label = "VSync";
             v.order = 6;
-            v.help = "On: each picture waits for your screen's refresh, so nothing tears, and the game draws no more pictures "
-                     "than the screen shows. Off: each picture goes to the screen at once, as many as your PC can draw up to the "
-                     "frame rate cap, with less delay to your input; the picture may tear.";
-            v.choices = {{"on", "On"}, {"0", "Off"}};
-            v.defaultValue = "on";
+            // (TODO 283, the user's choice: Off by default. With no line in settings.ini the presents go at once -
+            // the runtime's ps2_host_present::sync, patch 0168; "on" is what the row writes for On.)
+            v.help = "Off: more frames, up to the frame rate cap; the picture may tear. On: no tearing, never above the "
+                     "screen's refresh. With FreeSync or G-Sync the game stays a little under the screen's top rate "
+                     "either way, so the screen keeps following it.";
+            v.choices = {{"0", "Off"}, {"on", "On"}};
+            v.defaultValue = "0";
             v.current = []() { return std::string(ps2_host_present::sync() == 0 ? "0" : "on"); };
             v.apply = [](const std::string &value)
             {

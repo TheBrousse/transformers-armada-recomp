@@ -26,6 +26,7 @@
 #include "discord_presence.h"
 #include "updates.h"
 #include "self_log.h"
+#include "install_layout.h"
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "ps2_debug_panel.h"
 #endif
@@ -77,6 +78,11 @@ namespace
             }
         }
         const fs::path here = fs::current_path(e);
+        // (TODO 279) The new folder layout, when the folder above is marked for it: settings.ini there is the one in
+        // use, and none is made here.
+        install_layout::find();
+        if (!install_layout::settingsFile().empty())
+            return;
         if (!fs::exists(here / "settings.ini", e))
             for (const fs::path &example : {here / "overlay" / "settings.example.ini", here / "settings.example.ini"})
                 if (fs::exists(example, e) && fs::copy_file(example, here / "settings.ini", e))
@@ -251,6 +257,8 @@ int main(int argc, char *argv[])
     // The environment the game was started with (before settings.ini fills it): what the updater and
     // a start again get (updates.h, TODO 104).
     updates::noteLaunchEnvironment();
+    // (TODO 279) The places of the new folder layout that are there, as the switches the game already has.
+    install_layout::apply();
     // A play recording's replay (TF_PLAY_REPLAY, playrec.h): its recorded settings into the environment, settings.ini
     // left out, hidden, silent, turbo.
     playrec::prepareReplay();

@@ -4,6 +4,8 @@
 
 #include "camera_mode.h"
 #include "hd_progress.h"
+#include "install_layout.h"
+#include "support_report.h"
 #include "photo_mode.h"
 #include "menu_style.h"
 #include "menu_mouse.h"
@@ -340,7 +342,8 @@ namespace mod_menu
         size_t g_confirmFound = SIZE_MAX, g_confirmSave = 0;
 
         fs::path gameFolder() { return PS2Runtime::getIoPaths().elfDirectory; }
-        fs::path savesFolder() { return gameFolder().parent_path() / "Saves"; }
+        // (TODO 279: saves\ of the new folder layout when it is there)
+        fs::path savesFolder() { return install_layout::savesDir(gameFolder().parent_path() / "Saves"); }
         fs::path cardFolder() { return PS2Runtime::getIoPaths().mcRoot; }
 
         std::string stampNow()
@@ -367,6 +370,9 @@ namespace mod_menu
                 const std::string name = item.path().filename().string();
                 if (name == "Backups" || name == "Exports" || name == "README.txt")
                     continue;
+                // (TODO 279: in the new folder layout this folder also holds the memory cards and the save states)
+                if (install_layout::isNew() && (name == "mc0" || name == "mc1" || name == "states" || name == "backups" || name == "exports"))
+                    continue;
                 Found f;
                 f.path = item.path();
                 f.saves = save_io::load(item.path(), f.error);
@@ -380,7 +386,7 @@ namespace mod_menu
                     << "Put Transformers saves here to import them in the mod menu (F1, Saves).\n"
                        "Read: .psu, .max, .psv, PCSX2 memory cards (.ps2) and save folders\n"
                        "(\"BASLUS-20668 TRANSFM\" is NTSC, \"BESLES-52388 TRANSFM\" is PAL: both work).\n"
-                       "Exports go to Exports\\, and every import first copies the save it replaces to Backups\\.\n";
+                       "Exports go to Exports\, and every import first copies the save it replaces to Backups\.\n";
         }
 
         // The save on the port's card now (the NTSC one: this game does not read a PAL one there).
@@ -448,6 +454,26 @@ namespace mod_menu
                 ImGui::TextDisabled("    slot saved %s (UTC)", date.c_str());
         }
 
+        // (TODO 279) Where the saves are, opened in Explorer: saves\ of the new folder layout, else the memory card's
+        // folder (game\mc0).
+        void openSavesRow()
+        {
+            static std::string note;
+            if (menu_style::smallButton("Open saves folder"))
+            {
+                std::error_code ec;
+                fs::path folder = install_layout::savesDir(cardFolder());
+                if (!fs::is_directory(folder, ec))
+                    folder = folder.parent_path();
+                note = support_report::openFolder(folder) ? std::string() : "Not there yet: " + folder.string();
+                std::fprintf(stderr, "[mod menu] saves folder: %s\n", folder.string().c_str());
+            }
+            if (ImGui::IsItemHovered())
+                menu_style::setHelp("Your saves on this PC. Copy this folder to back them up.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", note.empty() ? install_layout::savesDir(cardFolder()).string().c_str() : note.c_str());
+        }
+
         void drawSaves()
         {
             if (g_scannedAt < 0.0 || ImGui::GetTime() - g_scannedAt > 3.0)
@@ -477,6 +503,7 @@ namespace mod_menu
                 exportSave(save_io::Region::Pal, true);
             if (ImGui::IsItemHovered())
                 menu_style::setHelp("A folder goes into a PCSX2 folder memory card.");
+            openSavesRow();
 
             menu_style::heading("Import from the Saves folder");
             ImGui::TextWrapped("%s", savesFolder().string().c_str());
@@ -510,7 +537,7 @@ namespace mod_menu
                     if (ImGui::BeginPopupModal("Import this save?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
                     {
                         ImGui::TextUnformatted("It replaces the save on the port's memory card.");
-                        ImGui::TextUnformatted("The current one is copied to Saves\\Backups first.");
+                        ImGui::TextUnformatted("The current one is copied to Saves\Backups first.");
                         if (menu_style::button("Import", true))
                         {
                             if (g_confirmFound < g_found.size() && g_confirmSave < g_found[g_confirmFound].saves.size())
@@ -662,7 +689,7 @@ namespace mod_menu
                     fs::remove(old, e);
                 else
                     fs::rename(old, into, e);
-                std::fprintf(stderr, "[mod menu] keyboard prompts moved to replacements\\keyboard\n");
+                std::fprintf(stderr, "[mod menu] keyboard prompts moved to replacements\keyboard\n");
             }
         }
 
@@ -1386,8 +1413,8 @@ namespace mod_menu
             {"PS2X_GAMEPAD_BACKEND", "Controller support", "Others only leaves a Sony pad to Steam Input."},
             {"PS2X_STICK_RESPONSE", "Stick response", "Modern: a light touch walks, a third of the stick runs. Off: as before."},
             {"PS2X_STICK_VEHICLE_MODE", "Car steering", "Original: the car steers as before. Tuned: gentler near the centre."},
-            {"PS2X_STICK_LEFT_DEADZONE", "Left stick dead zone", "How far the left stick must move before the game sees it. Raise it if the robot walks or a menu scrolls on its own."},
-            {"PS2X_STICK_RIGHT_DEADZONE", "Right stick dead zone", "How far the right stick must move before the game sees it. Raise it if the view turns on its own."},
+            {"PS2X_STICK_LEFT_DEADZONE", "Left stick dead zone", "How far the left stick must move before the game sees it. Auto: as far as the stick rests from the centre when let go. Raise it if the robot walks or a menu scrolls on its own."},
+            {"PS2X_STICK_RIGHT_DEADZONE", "Right stick dead zone", "How far the right stick must move before the game sees it. Auto: as far as the stick rests from the centre when let go. Raise it if the view turns on its own."},
             {"PS2X_STICK_LEFT_LIFT", "Left stick lift", "How much a light touch of the left stick moves the robot."},
             {"PS2X_STICK_LEFT_SENSITIVITY", "Left stick sensitivity", "Higher: running starts earlier on the stick."},
             {"PS2X_STICK_RIGHT_LIFT", "Right stick lift", "Makes small camera moves respond."},
@@ -1977,10 +2004,39 @@ namespace mod_menu
             pageHeading("Saves");
             if (!g_list)
                 drawSaves();
+            else
+                listItem("Open saves folder (button)");
             // (TODO 156) Save states by name (state_manager.h)
             pageHeading("Save states");
             if (!g_list)
                 state_manager::drawStates(*runtime, closeMenu);
+        }
+
+        // (TODO 279) About > "Make a report": support_report.h. One zip with the logs, settings.ini and the PC's
+        // details in the logs folder, which is then opened. No saves, states or game data in it.
+        std::string g_reportNote;
+        void reportRows()
+        {
+            if (g_list)
+            {
+                listItem("Make a report, Open logs folder (buttons)");
+                return;
+            }
+            menu_style::heading("When something goes wrong");
+            ImGui::TextWrapped("A report is one zip file with the game's logs, your settings and your PC's details. "
+                               "No saves and nothing of the game's own files are in it. Send it with your bug report.");
+            if (menu_style::button("Make a report"))
+            {
+                fs::path made;
+                g_reportNote = support_report::make(made);
+                if (!made.empty())
+                    support_report::openFolder(made.parent_path());
+            }
+            ImGui::SameLine();
+            if (menu_style::button("Open logs folder"))
+                support_report::openFolder(install_layout::logsDir());
+            if (!g_reportNote.empty())
+                ImGui::TextWrapped("%s", g_reportNote.c_str());
         }
 
         bool pageShown(Page page)
@@ -2074,6 +2130,7 @@ namespace mod_menu
                     keyRow("TF_UPDATE_CHECK");
                 else
                     updates::drawAbout(runtime, [] { keyRow("TF_UPDATE_CHECK"); settingRows(Page::About); });
+                reportRows();
                 break;
             }
         }
@@ -2848,6 +2905,18 @@ namespace mod_menu
             {
                 opened = true;
                 g_open = true;
+            }
+        }
+        // TF_REPORT_AT=<vblank> (tests, TODO 279): About's "Make a report" at that VBlank, the folder not opened.
+        if (static const unsigned long long reportAt = std::getenv("TF_REPORT_AT") ? std::strtoull(std::getenv("TF_REPORT_AT"), nullptr, 10) : 0ull;
+            reportAt != 0ull)
+        {
+            static bool done = false;
+            if (!done && runtime.eeScheduler().currentVSyncTick() >= reportAt)
+            {
+                done = true;
+                fs::path made;
+                g_reportNote = support_report::make(made);
             }
         }
         // TF_QUIT_BUTTON_AT=<vblank> (tests, TODO 277): the Quit game page's "Yes, quit" at that VBlank.

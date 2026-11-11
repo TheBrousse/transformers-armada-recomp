@@ -25,6 +25,7 @@ namespace ultrawide
     {
         constexpr float kGameWide = 16.0f / 9.0f; // the game's own widescreen shape: the data's base
         constexpr float kMaxShape = 2.4f;
+        constexpr float kNarrowest = 4.0f / 3.0f; // (TODO 282: the narrowest shape of the widescreen picture)
         constexpr uint32_t kWidescreenByte = 0x006CF004u; // the renderer's copy of the WIDESCREEN option
         constexpr uint32_t kFourThirds = 0x006CB1FCu;     // the 4/3 the pixel aspect is multiplied by in widescreen
         constexpr uint32_t kFourThirdsBits = 0x3FAAAAABu;
@@ -299,8 +300,17 @@ namespace ultrawide
             const int w = g_windowW.load(std::memory_order_relaxed), h = g_windowH.load(std::memory_order_relaxed);
             s = h > 0 ? static_cast<float>(w) / static_cast<float>(h) : kGameWide;
         }
-        return std::clamp(s, kGameWide, kMaxShape);
+        // (TODO 282) Narrower than 16:9 too, down to 4:3: a 16:10 screen got the 16:9 picture with a bar above and
+        // below. The view keeps its height and gives up width, down to about the game's own 4:3 view at 4:3; the 2D
+        // is a 4:3 area in the middle at every shape, so it fits. A hidden window (the tests', 640x480) that follows
+        // "the screen" keeps 16:9 as before, so the tests' pictures do not change; a shape asked for by number
+        // (TF_ASPECT=16:10) is taken there too.
+        static const bool hidden = std::getenv("PS2X_WINDOW_HIDDEN") && *std::getenv("PS2X_WINDOW_HIDDEN") == '1';
+        const bool followsWindow = g_chosen.load(std::memory_order_relaxed) == 0.0f;
+        return std::clamp(s, followsWindow && hidden ? kGameWide : kNarrowest, kMaxShape);
     }
+
+    float wideFactor() { return g_k.load(std::memory_order_relaxed); }
 
     void frame(uint8_t *rdram)
     {
@@ -351,12 +361,12 @@ namespace ultrawide
             return;
         float value = (4.0f / 3.0f) * k;
         uint32_t bits = kFourThirdsBits;
-        if (k > 1.0f)
+        if (k != 1.0f) // (TODO 282: narrower than 16:9 too)
             std::memcpy(&bits, &value, sizeof(bits));
         if (bits != current)
             std::memcpy(p, &bits, sizeof(bits));
         lastWritten = bits;
-        constantK = k > 1.0f ? k : 1.0f;
+        constantK = k;
     }
 
     void addSettings()
@@ -367,7 +377,8 @@ namespace ultrawide
         s.label = "Picture shape";
         s.order = 31;
         s.help = "With Widescreen on: the game's own 16:9, or wider (hor+: more at the sides, the HUD at the screen's "
-                 "edges). 'The screen's' follows the window, up to 2.4:1. Movies stay 4:3.";
+                 "edges), or narrower for a 16:10 or 4:3 screen (less at the sides). 'The screen's' follows the window, from "
+                 "4:3 up to 2.4:1. Movies stay 4:3.";
         s.choices = {{"16:9", "16:9 (the game's)"}, {"21:9", "21:9"}, {"screen", "The screen's"}, {"2.4", "2.4:1 (the widest)"}};
         s.defaultValue = "screen"; // (the window's shape: a 16:9 window stays 16:9, an ultrawide one fills)
         s.apply = [](const std::string &value)
