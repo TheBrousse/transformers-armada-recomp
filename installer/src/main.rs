@@ -35,6 +35,7 @@ const REPO_URL: &str = match option_env!("TFA_REPO_URL") {
 };
 const MODS: bool = option_env!("TFA_MODS").is_some();
 const USA_ISO_SIZE: u64 = 2_900_951_040; // Transformers (USA), SLUS-20668
+const PAL_ISO_SIZE: u64 = 4_546_691_072; // Transformers (Europe), SLES-52388: experimental, maintained by a contributor
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const ACCENT: Color32 = Color32::from_rgb(0xF0, 0x8A, 0x24);
@@ -1337,10 +1338,11 @@ impl App {
         ui.label(RichText::new("Built on your PC from your own disc: nothing of the game is downloaded.").color(DIM));
         ui.add_space(20.0);
 
-        file_row(ui, "Transformers (USA) disc image", &mut self.retail, "SLUS-20668, .iso", |v| pick_iso(v, "Transformers (USA) disc image"));
+        file_row(ui, "Transformers disc image", &mut self.retail, "USA SLUS-20668 or Europe SLES-52388, .iso", |v| pick_iso(v, "Transformers disc image"));
         let retail_note = match std::fs::metadata(&self.retail) {
             Ok(m) if m.len() == USA_ISO_SIZE => Some(("the USA release (its checksum is checked by the setup)", GOOD)),
-            Ok(_) => Some(("not the size of the USA release (SLUS-20668): only that disc works", BAD)),
+            Ok(m) if m.len() == PAL_ISO_SIZE => Some(("the European release (SLES-52388): experimental, the game is made for the USA disc", GOOD)),
+            Ok(_) => Some(("not the size of the USA release (SLUS-20668) or the European one (SLES-52388): only those discs work", BAD)),
             Err(_) if !self.retail.is_empty() => Some(("file not found", BAD)),
             Err(_) => None,
         };

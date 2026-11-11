@@ -1,5 +1,11 @@
 # What's new
 
+## 0.5.2
+
+**Fixed**
+- The setup window now accepts the European disc (SLES-52388). In 0.5.1 it still asked for the USA disc and kept
+  the Install button greyed out, so the European support could not be installed. Download the new tfa-setup.exe.
+
 ## 0.5.1
 
 **New**
