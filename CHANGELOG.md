@@ -1,5 +1,11 @@
 # What's new
 
+## 0.6.1
+
+**Fixed**
+- 0.6.0 could not be installed with the European disc: the setup stopped while building the game. Thanks to
+  TheBrousse for the fix.
+
 ## 0.6.0
 
 **New**
