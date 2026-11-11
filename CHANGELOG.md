@@ -1,5 +1,22 @@
 # What's new
 
+## 0.5.4
+
+**Fixed**
+- An update could crash a PC (the screen went black and the graphics driver restarted) while it was making HD
+  textures, and the update stopped half way. The texture maker now works in smaller pieces on graphics cards that
+  need it, notices a driver restart, and carries on where it was instead of stopping.
+- If the setup window closes or crashes during an update, the update keeps going and finishes. Opening the setup
+  again shows how it went. (This part reaches you from the next update on, since an update runs with the setup
+  from the update before.)
+- A setup run as administrator now puts the shortcuts where every user of the PC sees them, and the player who is
+  signed in can change the game's files (settings, saves, HD textures).
+- If Windows asks for permission during the install, the setup now says so, instead of looking stuck.
+
+**New**
+- The game is also in the Start menu, so Steam's "Add a Non-Steam Game" lists it. Started from Steam or another
+  launcher, the game now counts as running until you quit it.
+
 ## 0.5.3
 
 **Fixed**

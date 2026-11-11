@@ -422,6 +422,94 @@ def gpu_priority_idle(proc):
         pass
 
 
+# ---- Graphics driver resets (TODO 289) ----
+# Windows resets a graphics driver whose card has one job running longer than about 2 seconds (TDR): the screen
+# goes black for seconds and the System log gets event 4101 ("Display driver ... stopped responding and has
+# successfully recovered"). The upscaler's job is one piece (tile) of an image; on a slower card the default pieces
+# (about 200 pixels) can take that long. Smaller pieces: shorter jobs, the same images (each piece is padded).
+TILE_NAME = ".tile.json"
+TILE_STEPS = (64, 32)
+
+
+def load_tile(path):
+    try:
+        t = int(json.loads(path.read_text(encoding="utf-8")).get("tile", 0))
+        return t if t in TILE_STEPS else 0
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def save_tile(path, tile, why):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"tile": tile, "why": why, "when": time.strftime("%Y-%m-%dT%H:%M:%S")}),
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def driver_resets_since(t0):
+    """How many graphics driver resets Windows logged since t0 (time.time()); 0 where it cannot be told.
+    (Test: TF_HD_FAKE_RESET=n - the n-th question answers one reset.)"""
+    fake = os.environ.get("TF_HD_FAKE_RESET", "")
+    if fake.isdigit():
+        driver_resets_since.asked = getattr(driver_resets_since, "asked", 0) + 1
+        if driver_resets_since.asked == int(fake):
+            return 1
+    if os.name != "nt":
+        return 0
+    since = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(max(0.0, t0)))
+    query = f"*[System[(EventID=4101) and TimeCreated[@SystemTime>='{since}']]]"
+    try:
+        r = subprocess.run(["wevtutil", "qe", "System", "/q:" + query, "/c:20", "/f:text"],
+                           capture_output=True, text=True, timeout=15, creationflags=0x08000000)
+        return r.stdout.count("Event[") if r.returncode == 0 else 0
+    except (OSError, subprocess.SubprocessError):
+        return 0
+
+
+def device_lost(err):
+    """The upscaler's own log says its graphics card was lost (Vulkan's -4: VK_ERROR_DEVICE_LOST)."""
+    e = (err or "").lower()
+    return "device lost" in e or "device_lost" in e or "failed -4" in e
+
+
+def reset_left_last_run(status_path):
+    """The last run did not finish (its status still says it was working) and a driver reset was logged after its
+    last word: most likely what ended it."""
+    try:
+        st = json.loads(status_path.read_text(encoding="utf-8"))
+        if st.get("state") not in ("working", "checking", "paused"):
+            return False
+        return driver_resets_since(status_path.stat().st_mtime - 60.0) > 0
+    except (OSError, ValueError):
+        return False
+
+
+def card_names():
+    """The graphics cards' names, as Windows has them ("" when it cannot be told)."""
+    if os.name != "nt":
+        return ""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "(Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -join '; '"],
+                           capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def resets_prone(names):
+    """Cards whose upscales with the default pieces can run over Windows' 2 seconds: NVIDIA's before the RTX ones
+    (GTX 16, 10 and older: the GTX 1660 SUPER of TODO 289) and Intel's built-in ones. Only the first card the upscaler
+    uses counts, but which one that is is not known here: any of them in the list is enough (smaller pieces only
+    cost some speed). Intel's only when there is no other card (a laptop's RTX does the work, not its Intel)."""
+    cards = [n.strip() for n in (names or "").split(";") if n.strip()]
+    if any(re.search(r"GeForce (GTX|GT|MX) ?\d|Quadro [KMP]\d", n) for n in cards):
+        return True
+    return bool(cards) and all(re.search(r"Intel\(R\) (UHD|HD|Iris)", n) for n in cards)
+
+
 # ---- Working beside the game (make_hd_textures.ps1 / the setup) ----
 # The game holds <hd_textures>/.game_running (its process id inside) while it runs; Windows deletes the file
 # when the game ends, a crash too. While it is there the upscale waits (the two share the graphics card),
@@ -1330,6 +1418,30 @@ def main():
     def status(state, made):
         write_status(status_path, state=state, done=made, total=total, quality=args.quality)
 
+    # (TODO 289) Graphics driver resets: the upscaler works in pieces (tiles) of the image, each one long job for the
+    # graphics card; one that runs over Windows' 2 seconds is taken as a hung card and the driver is reset (the screen
+    # black for seconds; a GTX 1660 SUPER's setup window died with it, and the update with the window). Smaller
+    # pieces are shorter jobs: a card known for it starts with them, and a reset seen in Windows' log (event 4101)
+    # during a run makes the pieces smaller from then on (remembered in .tile.json beside the images).
+    tile_path = args.out / TILE_NAME
+    if not args.tile:
+        prev_tile = load_tile(tile_path)
+        if prev_tile:
+            args.tile = prev_tile
+            print(f"note: the upscaler works in pieces of {prev_tile} pixels on this PC (a graphics driver reset was "
+                  f"seen with bigger ones)", flush=True)
+        elif reset_left_last_run(status_path):
+            args.tile = TILE_STEPS[0]
+            save_tile(tile_path, args.tile, "a graphics driver reset during the last run, which did not finish")
+            print(f"note: the graphics driver was reset during the last run, which did not finish: the upscaler works "
+                  f"in pieces of {args.tile} pixels from now on", flush=True)
+        else:
+            card = card_names()
+            if card and resets_prone(card):
+                args.tile = TILE_STEPS[0]
+                print(f"note: the upscaler works in pieces of {args.tile} pixels on this graphics card ({card}): "
+                      f"bigger ones can take longer than Windows allows and reset its driver", flush=True)
+
     needs_exe = any(j.backend == "ncnn" for j in todo)
     if needs_exe and not args.exe.is_file():
         print(f"error: upscaler not found: {args.exe}", file=sys.stderr)
@@ -1599,12 +1711,15 @@ def main():
                     errors.append((job.srcs[0].relpath, f"stage: {e}"))
             cur = in_dir
             stopped = False
+            reset = False
             for i in range(1, passes + 1):
                 nxt = gdir / f"p{i}"
                 nxt.mkdir()
                 t0 = time.time()
                 if backend == "ncnn":
                     tile, gpu = (setup[0]["tile"], setup[0]["gpu"]) if setup[0] else (args.tile, args.gpu)
+                    if args.tile and tile and setup[0] and args.tile < tile:
+                        tile = args.tile  # (TODO 289: pieces made smaller after a driver reset)
                     rc, err, stopped = run_binary(args.exe, cur, nxt, model, tile, gpu,
                                                   stop=game_gone if args.game_pid else (None if gentle else should_stop),
                                                   gentle=gentle)
@@ -1615,6 +1730,11 @@ def main():
                     if rc != 0 and not stopped:
                         tail = err.strip().splitlines()[-3:]
                         print("  stderr: " + " | ".join(tail), file=sys.stderr)
+                    # (TODO 289) The graphics driver reset while this ran (Windows' event 4101), or the upscaler lost
+                    # its card: smaller pieces from now on, and this batch made again with them.
+                    if not stopped and (driver_resets_since(t0 - 2.0) or device_lost(err)):
+                        reset = True
+                        break
                 else:  # onnx-dml
                     scale = MODELS.get(model, {}).get("scale", 4)
                     run_onnx_dir(sessions[model], scale, cur, nxt,
@@ -1628,6 +1748,23 @@ def main():
                 cur = nxt
             if stopped:  # (the game started: this batch again, once it may)
                 shutil.rmtree(gdir, ignore_errors=True)
+                continue
+            if reset:
+                shutil.rmtree(gdir, ignore_errors=True)
+                was = tile or 0
+                smaller = next((s for s in TILE_STEPS if was == 0 or s < was), None)
+                if smaller is None:
+                    print("note: the graphics driver was reset even with the smallest pieces: no more HD textures are "
+                          "made on this card in this run (what is made is kept; the next run carries on)", flush=True)
+                    status("working", done_before + done)
+                    break
+                args.tile = smaller
+                if setup[0]:
+                    setup[0]["tile"] = smaller
+                save_tile(tile_path, smaller, f"a graphics driver reset with pieces of {was or 'auto'}")
+                print(f"note: the graphics driver was reset during the upscale (Windows' event 4101): pieces of {smaller} "
+                      f"pixels from now on, and this batch made again", flush=True)
+                time.sleep(5.0)  # (the driver back first)
                 continue
             if pending:
                 pending.result()
