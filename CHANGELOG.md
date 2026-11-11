@@ -1,5 +1,15 @@
 # What's new
 
+## 0.6.4
+
+**Changed**
+- Sounds now fade out with the PS2 sound chip's own curves instead of straight lines, so menu clicks, impacts,
+  engines and the dropship end as they do on the console.
+- More of the game runs from the decompiled code (built on the decomp's latest version).
+
+**Fixed**
+- On ultrawide screens the sun's glare is round again instead of a tall oval.
+
 ## 0.6.3
 
 **Fixed**
