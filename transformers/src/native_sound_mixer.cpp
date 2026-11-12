@@ -184,7 +184,7 @@ namespace native_sound::mixer
             return e;
         }();
 
-        // ---- the SPU2's envelope, as SIRENS3 sets it up (2026-11-11, lane D) ------------------------------
+        // ---- the SPU2's envelope, as SIRENS3 sets it up (2026-11-11) ------------------------------
         // SIRENS3 turns an instrument's ADSR in seconds into the SPU2's ADSR words when it makes the instrument
         // (SIRENS3.IRX 0x375E8, called from the constructor at 0x378B4): the attack and the release are at least
         // 0.0005 s; each of attack, decay, sustain level and release becomes the index of the nearest entry of a
@@ -830,7 +830,7 @@ namespace native_sound::mixer
         double g_mixedUntil = -1.0;
         double g_fraction = 0.0;
 
-        // TF_NATIVE_SOUND_SOLO=<prefix>[,<prefix>...] (a measuring aid, lane D 2026-11-11): only the voices whose tone's
+        // TF_NATIVE_SOUND_SOLO=<prefix>[,<prefix>...] (a measuring aid, 2026-11-11): only the voices whose tone's
         // name starts with one of these (any case) are heard, and no stream - the sounds under test alone in a dump
         // (PS2X_AUDIO_DUMP), for comparing envelopes and fades. Everything still plays on, unheard.
         const std::vector<std::string> &soloPrefixes()

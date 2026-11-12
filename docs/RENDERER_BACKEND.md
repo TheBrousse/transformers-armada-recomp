@@ -17,8 +17,10 @@ a draw list, and draws the list with a modern graphics API.
 | The frame builder: a frame's draw list turned into calls on the device | `nr_frame.cpp`, `nr_frame.h` | none (an `#error` at the end of `nr_frame.cpp` fails the build if a graphics API header reaches it) |
 | The device interface | `nr_device.h` (`nr::gfx::Device`), `nr_backend.h` (the neutral types, the outer calls) | none |
 | Shared helpers: the GS state as neutral values, the constant blocks' layout, clipping runs | `nr_draw.h`, `nr_draw.cpp` | none |
+| The video-memory policy: the quality preset, the anisotropy it sets, the large images' cap and budget, from the backend's video memory figure | `nr_policy.h`, `nr_policy.cpp` | none |
 | The Direct3D 12 backend: the device, the shaders, the pacing, the hand-over to the window | `nr_d3d.cpp` | Direct3D 12 |
 | The window's side of the hand-over | `nr_present.cpp`, `nr_glshare.cpp`, `nr_glshare.h` | OpenGL (raylib) |
+| The pacer: each picture handed over at its frame's moment plus a steady delay (its rules and its thread; the backend gives its fence and the hand-over) | `nr_pace.h`, `nr_pace.cpp` | none |
 
 A Vulkan backend replaces `nr_d3d.cpp` (and, with SDL3, the window's side). Everything above it stays as it is. Every
 rendering fix is made in the shared files, so it reaches every backend.
@@ -47,7 +49,7 @@ and `gfx::device()` are defined there; the Direct3D 12 backend's own are `d3d12B
 | `setSharedPictures(on)`, `latestShared(picture, serial)`, `sharedHeld(index)` | window thread | The newest picture as a texture the window imports, and which one the window still holds. |
 | `waitPicture(serial, untilNs, lastNs)`, `pacingMode()` | window thread | The pacer: wait for the next picture by its due time. |
 | `setWindowLines`, `setAntiAliasing`, `setSupersampling`, `setSpeedupsForced` | any | Settings, used from the next frame. |
-| `largeImageCap`, `largeImageBudget`, `largeImageBytes`, `adapterMemoryMB`, `qualityPreset` | any | The HD textures' video-memory budget and the quality preset. |
+| `largeImageBytes`, `adapterMemoryMB` | any | The HD textures' bytes on the GPU and the graphics card's video memory (nothing while the device's GPU is not chosen yet). The quality preset and the HD textures' cap and budget are made of that figure by the shared rules (`nr::policy`, `nr_policy.h`). |
 | `gpuPictureMs`, `gpuExtraMs`, `cpuPictureMs`, `replayWaitMs`, `slotWaitMs`, `pacerDelayMs` | render or window thread | Timing figures for the frame pacer and the stats lines. |
 
 The backend's `render()` is short: it returns at once while the device is still starting or after it was lost, then
@@ -117,7 +119,7 @@ Vulkan image layouts) and inserts the barriers itself. "D3D12" names the place i
 | `prepareFrame(width, height)` | First call of a frame. A target made with `TargetDesc::shared` is stale after the picture's size changed; the frame builder makes it again when it sees the new size. | `makeTargets` (the picture's colour, depth and read-back), `beginSlot` (the fence wait, `finishSlot`), the pipeline variants and library collected |
 | `beginFrame(tick)` | Second call. | `takeUploaded`, the slot's allocator and list reset, root signature, descriptor heap, `b1`, white texture, topology, `beginRings`, `beginDraws` (the state filter) |
 | `frameSlot()` | The slot being recorded. | `g.slot` |
-| `endFrame(FrameEnd)` | Last call. `pictures` holds at least one picture. False: the recording did not close. | `closeFrame`, then per picture a small list before (its constants and predicate value) and one after (its time stamp, the copy into a shared texture or a read-back, its shot); `replay::` submits extra pictures on a thread of its own; `pace::` hands pictures to the window at their time |
+| `endFrame(FrameEnd)` | Last call. `pictures` holds at least one picture. False: the recording did not close. | `closeFrame`, then per picture a small list before (its constants and predicate value) and one after (its time stamp, the copy into a shared texture or a read-back, its shot); `replay::` submits extra pictures on a thread of its own; the shared pacer (`nr_pace.h`) hands pictures to the window at their time |
 | `setFrameDone(fn)` | Set once. `fn(slot)` is called on the render thread. | `finishSlot` calls `g_frameDone` |
 | `report(Report)` | The device's own log lines: a saved frame's ring use, the profile window's uploads and video memory. Optional. | `D3d12Device::report` |
 | `vendorId()`, `videoMemory(budget)` | The GPU's PCI vendor id; its video memory in use or the budget. The clipping shader is off by default on AMD and at the two lower quality presets. | DXGI adapter queries |
@@ -301,8 +303,11 @@ The native picture reaches the window in one of two ways, chosen at start:
 - **CPU pixels**: the picture is read back and the window uploads it (`latestPicture`). This is the fallback when the
   import fails (for example under Wine/Proton) and with `TF_NATIVE_SHARE=0`.
 
-The pacer (`pace::` in `nr_d3d.cpp`, `waitPicture` on the window's side) hands each picture over at its due time
-(`PictureOut::dueNs`) plus a delay that follows the GPU's times, so pictures reach the screen evenly.
+The pacer (`nr::pace::Pacer` in `nr_pace.cpp`, `waitPicture` on the window's side) hands each picture over at its due
+time (`PictureOut::dueNs`) plus a delay that follows the GPU's times, so pictures reach the screen evenly. Its rules
+and its thread are shared; a backend gives it its GPU side (`pace::Gpu`: how far its fence or timeline has come, a
+wait for a value) and each picture's hand-over (Direct3D 12: the shared texture to the window's thread; a Vulkan
+swapchain: the present). `TF_PACING` (`pace::mode()`) is read there too.
 
 **With SDL3 and a swapchain.** A Vulkan backend can present straight to a swapchain on an SDL3 window. Then:
 
@@ -330,6 +335,16 @@ only the tone mapping's SDR part exists (`ToneMap`). For an HDR mode:
 
 The hand-over is the part of the backend that is least separated today: the window's side lives in `nr_present.cpp`
 and `nr_glshare.cpp`, and calls `nr::d3d` directly. Changing it is part of the SDL3 work.
+
+**As built (milestone 3).** SDL3's window is a run-time choice of the runtime (`PS2X_PLATFORM=sdl3` in a build with
+`PS2X_SDL3`; PS2Recomp's `ps2_platform.h`, runtime patch 0176): the runtime answers raylib's window, input and 2D calls
+from SDL3, and each window picture is one ImGui frame drawn by a presenter. With `TF_GFX_API=vulkan` the Vulkan backend is
+that presenter (`vulkan/nr_vulkan_window.h`): its own swapchain and submit on the main thread; at each frame's end the
+render thread copies the picture into a window picture of its own and signals a timeline semaphore - the shared pacer's
+`Gpu` side - and the pacer hands it over at its moment (its `handOver` makes it the window's newest picture); the
+window's submit waits for it on the GPU; `presentsWindow()` / `latestWindowPicture()` (defaults in `nr_backend.h`: false) give the
+window that picture instead of a shared texture or CPU pixels. The overlays are the ImGui frame's (imgui_impl_vulkan);
+the emulated renderer's screens are a texture of the presenter's. Direct3D 12 keeps the raylib window.
 
 ## 8. Build integration
 

@@ -15,8 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 
-// The return address a wrapped function was called with: $ra, or in a decomp-bridge build where a call out from native
-// code carries the bridge's sentinel there, the original call site's (decomp_bridge/bridge_runtime.cpp defines it).
+// The return address a wrapped function was called with: $ra, or in a build where native code calls out with a
+// sentinel there, the original call site's (such a build links its own definition).
 // Every other build links the default below (MSVC /alternatename).
 extern "C" uint32_t tfCallerReturnAddress(R5900Context *ctx);
 extern "C" uint32_t tfCallerReturnAddressDefault(R5900Context *ctx) { return GPR_U32(ctx, 31); }
