@@ -1,5 +1,28 @@
 # What's new
 
+## 0.6.6
+
+**New**
+- Your things now have their own folders in the folder you installed into: `saves` (memory cards, save states,
+  backups and exports), `logs`, `settings.ini` and `data` (the game's files from your disc and the HD movies). The
+  game itself stays in `transformers-armada-recomp`. The README's "Where things are" shows what is where.
+- `Transformers Armada.exe` in the folder you installed into starts the game. Give it to Steam or any other
+  launcher: it stays open until the game closes.
+- The whole folder can be copied to another drive, another PC or a Steam Deck and plays from there.
+
+**Changed**
+- This update moves your saves, settings and the disc's files into the new folders, once, by itself. It first makes
+  a backup of your saves and settings in `saves\backups`. If the backup cannot be made (for example a full disk),
+  nothing moves and the game plays on as before; the next update tries again. Your desktop shortcut keeps working.
+- Playing on a Steam Deck or another PC with a copied folder? After this update copy the whole game folder again
+  (not only the folder inside it), back up the Deck's saves first, and point Steam at `Transformers Armada.exe` in
+  the main folder.
+- RecompLauncher: its manifest names the new folders, so its save backups keep working after the move.
+
+**Fixed**
+- On the USA disc a change of picture shape (4:3 and 16:9) shows at once again, as in 0.5.0; the European disc
+  keeps its 50 Hz fixes. Thanks to TheBrousse.
+
 ## 0.6.5
 
 **Fixed**

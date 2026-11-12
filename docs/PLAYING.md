@@ -58,7 +58,9 @@ For a manual build, see [BUILDING.md](BUILDING.md).
 
 ## Starting the game
 
-Start **`Play.bat`** in the install folder. The setup program also has a Play button.
+Start the game with the desktop shortcut, or with **`Transformers Armada.exe`** in the folder you installed into.
+The setup program also has a Play button. To add the game to Steam or another launcher, give it
+`Transformers Armada.exe`.
 
 On the first start the game uses good default settings for most PCs. Press **F1** to change them.
 
@@ -128,8 +130,8 @@ Change any key in **F1 > Controls**: click **Change** and press the new key, or 
 | F8 | Photo mode |
 | F11 | Switches between a window and full screen |
 
-Save states are kept in the `states` folder. They are a copy of the game's memory, so keep them private, like
-your disc image.
+Save states are kept in `saves\states` in the folder you installed into. They are a copy of the game's memory, so
+keep them private, like your disc image.
 
 ## Settings (F1)
 
@@ -137,7 +139,7 @@ Press **F1** to open the menu over the game. Use the mouse, the arrow keys or a 
 at once. A few (marked **RESTART**) need the game to start again: the menu offers **Restart now**, which brings
 you back to the same moment.
 
-Your choices are saved in `settings.ini` in the install folder.
+Your choices are saved in `settings.ini` in the folder you installed into.
 
 ### Display
 
@@ -204,7 +206,8 @@ Volume, from Off to full.
 
 ### Saves
 
-Your memory card saves, and import or export of PS2 saves (from the `Saves` folder). Save states by name.
+Your memory card saves, and import or export of PS2 saves (through `saves\backups` and `saves\exports` in the
+folder you installed into). Save states by name.
 
 ### About
 
@@ -237,17 +240,24 @@ To turn the automatic check off: **F1 > About > Check for updates automatically*
 
 ## Your files
 
-Everything the setup makes from your disc stays on your PC, in folders that Git ignores:
+Everything the setup makes from your disc stays on your PC. In the folder you installed into:
 
 | Folder or file | What it is |
 |---|---|
-| `game\` | Your extracted disc, and your memory cards (`game\mc0`, `game\mc1`) |
-| `work\`, `out\` | The game built from your disc |
-| `hd_textures\` | The HD textures made from your disc |
-| `states\` | Your save states |
+| `Transformers Armada.exe` | Starts the game (give this one to Steam or another launcher) |
 | `settings.ini` | Your settings |
+| `saves\` | Your memory cards (`mc0`, `mc1`), save states (`states`) and F1 > Saves' `backups` and `exports` |
+| `logs\` | The game's, the setup's and the updates' logs |
+| `data\` | Your extracted disc (`game`), the HD movies and the shader cache |
+| `transformers-armada-recomp\` | The game built from your disc (`work\`, `out\`), and the HD textures (`hd_textures\`) |
 
-Never share or upload these: they contain game data.
+To back up your saves, copy `saves`. To move the game to another drive, another PC or a Steam Deck, copy the whole
+folder you installed into: the game finds everything from where it is.
+
+Never share or upload `saves`, `data` or the built game: they contain game data.
+
+An install from before this layout is moved by its next update, after a backup of your saves and settings in
+`saves\backups`. The old files stay where they were.
 
 ## The European disc
 
