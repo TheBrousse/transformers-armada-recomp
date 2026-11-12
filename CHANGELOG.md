@@ -1,5 +1,11 @@
 # What's new
 
+## 0.6.7
+
+**Fixed**
+- The setup could stop at "Disc and game" with "Cannot convert ... to type System.Version" on a PC with more than one
+  Visual Studio installed. Installing and updating work again.
+
 ## 0.6.6
 
 **New**
