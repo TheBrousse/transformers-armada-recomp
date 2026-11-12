@@ -302,7 +302,14 @@ namespace nr
                 else
                     std::fprintf(stderr, "[native render] no upscaled textures at %s\n", g.upscaled.string().c_str());
                 g.fontsOnly = true;
-                if (g.native.empty() || !fs::is_directory(g.native / "TFA2" / "FONTS", ec)) return;
+                if (g.native.empty() || !fs::is_directory(g.native / "TFA2" / "FONTS", ec))
+                {
+                    // (the sharp fonts are matched with the game's own font images: without them none is used)
+                    if (!g.crispSet.empty() || !g.keysSet.empty() || !g.xboxSet.empty())
+                        std::fprintf(stderr, "[native render] crisp fonts: not used, the game's own font images are missing (%s); "
+                                             "tools\\make_hd_textures.ps1 -FontsOnly makes them again\n", (g.native / "TFA2" / "FONTS").string().c_str());
+                    return;
+                }
             }
             size_t files = 0;
             for (auto it = fs::recursive_directory_iterator(g.native, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
