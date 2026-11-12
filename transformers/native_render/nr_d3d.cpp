@@ -1120,7 +1120,7 @@ float3 aaSharpen(int2 c, float3 col, float sharp)
     const float3 east = aaLoadOff(c, int2(1, 0)), s = aaLoadOff(c, int2(0, 1));
     const float3 mn = min(min(min(n, w), min(east, s)), e);
     const float3 mx = max(max(max(n, w), max(east, s)), e);
-    const float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1.0 / 256.0)));
+    const float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1.0 / 256.0)));
     const float3 k = amp * (-1.0 / lerp(8.0, 5.0, saturate(sharp)));
     const float3 sharpened = (n * k + w * k + east * k + s * k + e) / (1.0 + 4.0 * k);
     return saturate(col + (sharpened - e));
