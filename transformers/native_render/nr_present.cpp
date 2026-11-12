@@ -239,11 +239,14 @@ namespace nr
         // (The CPU hand-over's pictures evened out: they are handed over as their frame's slot is used again, not at their
         // frame's moment as the shared ones are (nr_d3d.cpp's pacer), so two often came within a millisecond and the next
         // 60-90 ms later - at the game's 30 in a window on a low-end PC the time between pictures read 1..85 ms. A CPU
-        // picture is shown no sooner than 4/5 of the recent interval between shown pictures after the one before (a newer
-        // one taken meanwhile shown instead); the rate is unchanged. Window thread only.)
+        // picture is taken at once and presented no sooner than 4/5 of the recent interval between the hand-over's arrivals
+        // after the one before. Based on the arrivals, not on when pictures were shown, and the take never held: holding the
+        // take slowed the renderer, which lengthened the shown interval and so the next hold - on a ~10 fps laptop the frame
+        // rate fell to 3-6 (kayliox, PR #21). Window thread only.)
         bool g_cpuPictures = false;   // the picture shown now is the CPU hand-over's (provide)
         int64_t g_cpuShownNs = 0;     // when the last CPU picture was presented
-        int64_t g_cpuIntervalNs = 0;  // the recent interval between presented CPU pictures (7/8 average)
+        int64_t g_cpuArrivalNs = 0;   // when the newest picture seen by paceWait was handed over
+        int64_t g_cpuIntervalNs = 0;  // the recent interval between the hand-over's arrivals (7/8 average)
 
         int paceWait(std::chrono::steady_clock::time_point until)
         {
@@ -253,16 +256,12 @@ namespace nr
             if (backend().waitPicture(g_takenSerial.load(std::memory_order_relaxed),
                                  std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count(), lastNs))
             {
-                if (g_cpuPictures && g_cpuShownNs != 0 && g_cpuIntervalNs != 0)
+                if (lastNs != 0 && lastNs != g_cpuArrivalNs)
                 {
-                    const int64_t earliest = g_cpuShownNs + g_cpuIntervalNs * 4 / 5;
-                    const int64_t untilNs = std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count();
-                    if (nowNs() < earliest)
-                    {
-                        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(std::min(earliest, untilNs))));
-                        if (nowNs() < earliest)
-                            return 0; // (not yet: the window polls the input and asks again)
-                    }
+                    const int64_t d = g_cpuArrivalNs != 0 ? lastNs - g_cpuArrivalNs : 0;
+                    if (d > 0 && d < 1000000000ll)
+                        g_cpuIntervalNs = g_cpuIntervalNs == 0 ? d : (g_cpuIntervalNs * 7 + d) / 8;
+                    g_cpuArrivalNs = lastNs;
                 }
                 return 1;
             }
@@ -290,13 +289,7 @@ namespace nr
         void pacePresented()
         {
             if (g_cpuPictures)
-            {
-                const int64_t t = nowNs();
-                const int64_t d = g_cpuShownNs != 0 ? t - g_cpuShownNs : 0;
-                if (d > 0 && d < 1000000000ll)
-                    g_cpuIntervalNs = g_cpuIntervalNs == 0 ? d : (g_cpuIntervalNs * 7 + d) / 8;
-                g_cpuShownNs = t;
-            }
+                g_cpuShownNs = nowNs();
             if (g_pendingShown)
             {
                 g_pendingShown = false;
@@ -602,6 +595,9 @@ namespace nr
                     ++g_pacing.repeats;
                 g_pacedLive.store(true, std::memory_order_relaxed);
                 g_cpuPictures = true;
+                // (Taken already: only its present waits - no sooner than 4/5 of the arrivals' interval after the one before.)
+                if (fresh && g_pacerOn && g_cpuShownNs != 0 && g_cpuIntervalNs != 0)
+                    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(g_cpuShownNs + g_cpuIntervalNs * 4 / 5)));
             }
             texture = shown.id;
             width = shown.width;
