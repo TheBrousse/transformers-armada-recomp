@@ -20,9 +20,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    # (the public repository only: the private home repository's Actions minutes are not spent on it)
+  linux:
+    # (TODO 31 / home PR #40) The Linux tfa-setup, built on Ubuntu 22.04 (glibc 2.35: runs on SteamOS 3.5+, Bazzite,
+    # Fedora, Arch, newer Ubuntu). A failure here never stops the Windows release: it is published without it.
     if: github.repository == 'kayliox/transformers-armada-recomp'
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools for the window (X11 / Wayland / OpenGL headers)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+      - name: Test
+        run: cargo test --release --locked --manifest-path installer/Cargo.toml
+      - name: Build tfa-setup (installer/build.sh)
+        run: bash installer/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfa-setup-linux
+          path: installer/target/release/tfa-setup
+  build:
+    needs: linux
+    if: always() && github.repository == 'kayliox/transformers-armada-recomp'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,8 +50,14 @@ jobs:
       - name: "Build tfa-setup.exe (no build-machine paths in it, deterministic: installer/build.ps1)"
         shell: pwsh
         run: ./installer/build.ps1
+      - name: The Linux tfa-setup, when it was built
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: tfa-setup-linux
+          path: linux-setup
       - name: Publish it as a release of its own
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: ./installer/publish_release.ps1 -Exe installer/target/release/tfa-setup.exe -Commit $env:GITHUB_SHA
+        run: ./installer/publish_release.ps1 -Exe installer/target/release/tfa-setup.exe -LinuxExe linux-setup/tfa-setup -Commit $env:GITHUB_SHA

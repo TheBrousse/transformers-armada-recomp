@@ -181,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // (cmd.exe and a job object)
     fn a_process_started_again_inside_the_job_is_waited_for() {
         use std::os::windows::process::CommandExt;
         use std::sync::atomic::{AtomicBool, Ordering};

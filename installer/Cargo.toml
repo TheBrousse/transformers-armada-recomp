@@ -9,7 +9,15 @@ build = "build.rs"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+
+[target.'cfg(windows)'.dependencies]
 rfd = "0.17"
+
+# Linux (tfa-setup for SteamOS, Bazzite and the other distributions): the window on X11 or Wayland, both loaded when
+# it starts (nothing to install); the file dialogs are the desktop's own (kdialog, zenity); libc for signals and time.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+libc = "0.2"
 
 [build-dependencies]
 embed-resource = "3.0"

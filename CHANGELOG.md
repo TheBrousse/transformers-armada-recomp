@@ -1,5 +1,11 @@
 # What's new
 
+## 0.7.9
+
+**New**
+- A setup program for Linux, SteamOS and Bazzite (tfa-setup-linux on the release page): the same steps as on
+  Windows, builds the game in a container on SteamOS and Bazzite, and can add it to Steam. Thanks to TPepperoni666.
+
 ## 0.7.8
 
 **Fixed**

@@ -11,6 +11,10 @@ fn main() {
     println!("cargo:rerun-if-changed=tfa-setup.rc.in");
     println!("cargo:rerun-if-changed=tfa-setup.manifest");
     println!("cargo:rerun-if-env-changed=TFA_REPO_URL");
+    // (Linux: no resources - a program there has no version tab or manifest)
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
 
     // "0.2.3" -> 0,2,3,0 (a version that does not read as three numbers counts as 0.0.0)
     let text = std::fs::read_to_string(&version_file).unwrap_or_default();

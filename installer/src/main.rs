@@ -18,8 +18,16 @@
 // The install is <folder>\<the repository's name>, a clone of it.
 #![windows_subsystem = "windows"]
 
+#[cfg(windows)]
+mod winapi;
+// (Linux: the same functions from /proc, sysfs and the desktop's programs, and the build container, the shortcuts and
+// Steam - linux.rs; under winapi's name, so the rest of this file is the same on both)
+#[cfg(not(windows))]
+#[path = "linux.rs"]
 mod winapi;
 mod launcher;
+#[cfg(not(windows))]
+use winapi::{desktop_shortcut_once, start_hd_maker};
 
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use std::path::{Path, PathBuf};
@@ -35,7 +43,22 @@ const REPO_URL: &str = match option_env!("TFA_REPO_URL") {
 const MODS: bool = option_env!("TFA_MODS").is_some();
 const USA_ISO_SIZE: u64 = 2_900_951_040; // Transformers (USA), SLUS-20668
 const PAL_ISO_SIZE: u64 = 4_546_691_072; // Transformers (Europe), SLES-52388: experimental, maintained by a contributor
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// This program's copy in the install folder, and the update script's name in the checkout.
+#[cfg(windows)]
+const SETUP_EXE: &str = "tfa-setup.exe";
+#[cfg(not(windows))]
+const SETUP_EXE: &str = "tfa-setup";
+#[cfg(windows)]
+const UPDATE_SCRIPT: &str = "update.ps1";
+#[cfg(not(windows))]
+const UPDATE_SCRIPT: &str = "update.sh";
+/// What the last screen says starts the game.
+#[cfg(windows)]
+const PLAY_WITH: &str = "Start the game with Play.bat in the install folder";
+#[cfg(not(windows))]
+const PLAY_WITH: &str = "Start the game from Steam or the app menu, or with \"Transformers Armada\" in the install folder";
 
 const ACCENT: Color32 = Color32::from_rgb(0xF0, 0x8A, 0x24);
 const GOOD: Color32 = Color32::from_rgb(0x4C, 0xC3, 0x6A);
@@ -124,6 +147,8 @@ struct App {
     shot: Option<String>,
     shot_state: Arc<Mutex<u8>>, // 0 waiting, 1 asked, 2 written
     settled_at: Option<Instant>,
+    #[cfg(not(windows))]
+    tools_note: String, // (Linux: where the build tools come from - the form's last line)
 }
 
 const STEP_TOOLS: usize = 0;
@@ -134,13 +159,21 @@ const STEP_MODS: usize = 4;
 
 impl App {
     fn new() -> Self {
+        #[cfg(windows)]
         let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+        #[cfg(not(windows))]
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
         Self {
             repo_url: REPO_URL.to_string(),
             mods: MODS,
             retail: String::new(),
             prototype: String::new(),
+            #[cfg(windows)]
             folder: format!("{home}\\Games\\TFA"), // (short: Windows' path limit, see exec)
+            #[cfg(not(windows))]
+            folder: format!("{home}/Games/TFA"), // (the same place as on Windows)
+            #[cfg(not(windows))]
+            tools_note: winapi::tools_note(),
             hd: true,
             hd_quality: HdQuality::Balanced,
             hd_saved: None,
@@ -321,13 +354,13 @@ impl App {
         let _ = tx.send(Msg::Step(first));
         let _ = tx.send(Msg::Detail(first, "the setup closed while this was running: it went on by itself, followed here".into()));
         std::thread::spawn(move || {
-            let pid = left.pid;
+            let (pid, started) = (left.pid, left.started);
             let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let code = Arc::new(Mutex::new(None::<i32>));
             let waiter = {
                 let (done, code) = (done.clone(), code.clone());
                 std::thread::spawn(move || {
-                    *code.lock().unwrap() = winapi::wait_for_exit(pid);
+                    *code.lock().unwrap() = wait_for_left_step(pid, started);
                     done.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
             };
@@ -428,7 +461,10 @@ impl App {
 /// The steps the window shows (the Mods step only with the mods' parts).
 fn make_steps(mods: bool) -> Vec<Step> {
     let mut steps = vec![
+        #[cfg(windows)]
         ("Tools", "Git, Python and the Visual Studio C++ tools"),
+        #[cfg(not(windows))]
+        ("Tools", "Git and the build tools (in a container of their own on SteamOS and Bazzite)"),
         ("Download", "the game's code, from GitHub"),
         ("Disc and game", "your disc checked, the game compiled (15-25 minutes)"),
         ("HD textures", "every texture upscaled on your graphics card"),
@@ -471,10 +507,20 @@ fn game_folder(repo: &Path) -> PathBuf {
 trait NoWindow {
     fn creation_flags_no_window(&mut self) -> &mut Self;
 }
+#[cfg(windows)]
 impl NoWindow for Command {
     fn creation_flags_no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         self.creation_flags(CREATE_NO_WINDOW)
+    }
+}
+/// (Linux: no console window to hide. A process group of its own: a step goes on when this window's terminal closes,
+/// as on Windows, where the steps are not ended with the window either)
+#[cfg(not(windows))]
+impl NoWindow for Command {
+    fn creation_flags_no_window(&mut self) -> &mut Self {
+        use std::os::unix::process::CommandExt;
+        self.process_group(0)
     }
 }
 
@@ -514,6 +560,7 @@ impl Job {
         log.with_file_name(if self.update { "update_steps.log" } else { "setup_steps.log" })
     }
 
+    #[cfg_attr(not(windows), allow(unreachable_code, unused_mut))]
     fn run(&self, tx: &Sender<Msg>) -> Result<(), String> {
         std::fs::create_dir_all(&self.folder).map_err(|e| format!("cannot make {}: {e}", self.folder.display()))?;
         let log_path = self.log_path();
@@ -538,6 +585,9 @@ impl Job {
         // not the game; a player's report. Installs from before the mark have none: finished.)
         let _ = std::fs::write(self.folder.join(UNFINISHED_MARK), b"");
         let _ = std::fs::write(self.step_log_path(), b"");
+        // (Linux: setup.sh / update.sh, in the build container on SteamOS and Bazzite - linux.rs)
+        #[cfg(not(windows))]
+        return self.run_linux(tx, &log, &log_path, &path_env);
 
         if self.update {
             // update.ps1 does it all (and, for the game's own update, starts it again: -Play).
@@ -686,7 +736,25 @@ impl Job {
     /// Runs a program, its output into the log and turned into steps/details. Err = its last lines.
     fn exec(&self, exe: &str, args: &[&str], dir: Option<&Path>, path_env: &str, tx: &Sender<Msg>, step: usize,
             log: &Arc<Mutex<Option<std::fs::File>>>) -> Result<(), String> {
+        // (Linux: the scripts run in the build container when the install builds there; every process of the step
+        // carries its mark, so Cancel finds the ones in the container too)
+        #[cfg(not(windows))]
+        let mark = winapi::new_mark();
+        #[cfg(not(windows))]
+        let wrapped = winapi::wrap(exe, args, &[
+            ("GIT_CONFIG_COUNT", "1".into()), ("GIT_CONFIG_KEY_0", "safe.directory".into()), ("GIT_CONFIG_VALUE_0", "*".into()),
+            ("TFA_UPDATE_NO_PAUSE", "1".into()), ("TF_STEP_LOG", self.step_log_path().to_string_lossy().to_string()),
+            (winapi::TREE_VAR, mark.clone())]);
+        #[cfg(not(windows))]
+        let wrapped_args: Vec<&str> = wrapped.1.iter().map(String::as_str).collect();
+        #[cfg(not(windows))]
+        let (exe, args): (&str, &[&str]) = (wrapped.0.as_str(), &wrapped_args);
         let mut cmd = Command::new(program(exe));
+        // (on this PC the mark goes in the environment; never on distrobox's own command - see linux.rs's ProcessTree)
+        #[cfg(not(windows))]
+        if exe != "distrobox" {
+            cmd.env(winapi::TREE_VAR, &mark);
+        }
         let path_env = with_system_dirs(path_env);
         // (PSModulePath dropped: started from PowerShell 7, Windows PowerShell would inherit its
         // module folders and miss its own commands - Get-FileHash, found in the first test)
@@ -845,13 +913,44 @@ fn follow_log(log_path: &Path, start_at: u64, step: usize, tx: &Sender<Msg>, tai
     }
 }
 
+/// A line without a terminal's colour codes ("\x1b[32m [ OK ]": distrobox's, on Linux).
+#[cfg(not(windows))]
+fn without_colours(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+        } else if chars.next() == Some('[') {
+            for d in chars.by_ref() {
+                if ('@'..='~').contains(&d) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One line of a step's output: the steps and details it marks, and the tail kept for an error.
 fn show_line(line: &str, current: &mut usize, tx: &Sender<Msg>, tail: &Arc<Mutex<Vec<String>>>) {
+    #[cfg(windows)]
     let text = line.trim().to_string();
+    // (Linux: without a terminal's colour codes - distrobox's "[ OK ]" lines)
+    #[cfg(not(windows))]
+    let text = without_colours(line).trim().to_string();
     if text.is_empty() {
         return;
     }
-    if let Some(title) = text.strip_prefix("==> ") {
+    #[cfg(windows)]
+    let step_title = text.strip_prefix("==> ");
+    // (Linux: build.sh's own steps are "== " lines)
+    #[cfg(not(windows))]
+    let step_title = text.strip_prefix("==> ").or_else(|| text.strip_prefix("== "));
+    if let Some(title) = step_title {
+        // (Linux: ninja's "[120/329] ..." lines count while the game itself is compiled, not the recompiler's tools)
+        #[cfg(not(windows))]
+        GAME_COMPILE.with(|c| c.set(title.to_ascii_lowercase().starts_with("building transformersrecomp")));
         let (s, p) = classify(title, *current);
         if s != *current {
             *current = s;
@@ -865,6 +964,18 @@ fn show_line(line: &str, current: &mut usize, tx: &Sender<Msg>, tail: &Arc<Mutex
         if *current == STEP_GAME {
             if let Some(p) = compile_progress(&text) {
                 let _ = tx.send(Msg::Progress(p));
+            }
+            // (Linux: ninja's own lines are long and many: shown as build.ps1's "compiling the game: 120 of about 329 files")
+            #[cfg(not(windows))]
+            if let Some((done, total)) = ninja_counts(&text).filter(|_| GAME_COMPILE.with(|c| c.get())) {
+                let _ = tx.send(Msg::Progress(0.40 + 0.20 * (done / total).clamp(0.0, 1.0)));
+                let _ = tx.send(Msg::Detail(*current, format!("compiling the game: {done} of {total} files")));
+                let mut t = tail.lock().unwrap();
+                t.push(text);
+                if t.len() > 12 {
+                    t.remove(0);
+                }
+                return;
             }
         }
         if *current == STEP_HD {
@@ -946,6 +1057,21 @@ fn compile_progress(text: &str) -> Option<f32> {
         return None;
     }
     Some(0.40 + 0.20 * (done / total).clamp(0.0, 1.0))
+}
+
+#[cfg(not(windows))]
+thread_local! {
+    /// (Linux) The step that runs is the game's own compile (build.sh's "Building TransformersRecomp"): ninja's counts count.
+    static GAME_COMPILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// (Linux) ninja's "[120/329] Building CXX object ...": (120, 329).
+#[cfg(not(windows))]
+fn ninja_counts(text: &str) -> Option<(f32, f32)> {
+    let inner = text.strip_prefix('[')?.split(']').next()?;
+    let (done, total) = inner.split_once('/')?;
+    let (done, total): (f32, f32) = (done.trim().parse().ok()?, total.trim().parse().ok()?);
+    (total > 0.0).then_some((done, total))
 }
 
 /// The mark a setup run keeps in the install folder until it has finished every step.
@@ -1073,6 +1199,7 @@ fn dir_size(dir: &Path) -> Option<u64> {
 
 /// (PR #20) The HD step in its own small window (make_hd_textures.ps1 -Resume, as the game starts it for an unfinished
 /// set): it waits while the game runs and carries on when it closes.
+#[cfg(windows)]
 fn start_hd_maker(repo: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let game = game_folder(repo);
@@ -1151,8 +1278,17 @@ fn suggest_fast(name: &str, vram: u64) -> bool {
 }
 
 /// Where the install finished last, so a setup started from somewhere else (a launcher's own copy, Quiver) finds it.
+#[cfg(windows)]
 fn remembered_folder_file() -> Option<PathBuf> {
     std::env::var("LOCALAPPDATA").ok().map(|v| Path::new(&v).join("TransformersArmadaSetup").join("install_folder.txt"))
+}
+
+/// (Linux: the same file under the user's data folder, ~/.local/share/TransformersArmadaSetup)
+#[cfg(not(windows))]
+fn remembered_folder_file() -> Option<PathBuf> {
+    let data = std::env::var("XDG_DATA_HOME").ok().filter(|v| !v.is_empty()).map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| Path::new(&h).join(".local").join("share")))?;
+    Some(data.join("TransformersArmadaSetup").join("install_folder.txt"))
 }
 
 fn remember_folder(folder: &Path) {
@@ -1173,6 +1309,7 @@ fn remembered_folder() -> Option<String> {
 /// A "Transformers Armada" shortcut on the desktop, made once after the first finished install (deleted by the
 /// player, it stays deleted). It starts the setup's copy in the install folder, which starts the game when the
 /// install is finished and carries on the setup when it is not; its icon is the game's own.
+#[cfg(windows)]
 fn desktop_shortcut_once(folder: &Path, repo: &Path) {
     grant_player(folder);
     shortcut_once(folder, repo, "Desktop", "desktop_shortcut_made");
@@ -1185,6 +1322,7 @@ fn desktop_shortcut_once(folder: &Path, repo: &Path) {
 /// account. The signed-in player (who owns Windows' desktop - explorer.exe) is given the right to change them, so the
 /// game's settings, saves, HD textures and updates work when he plays without being administrator. Nothing happens
 /// when the setup is not elevated, or elevated as the player himself (the folder's own rights already cover him).
+#[cfg(windows)]
 fn grant_player(folder: &Path) {
     let script = "if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 }; $o = Get-CimInstance Win32_Process -Filter \"name='explorer.exe'\" | Select-Object -First 1 | Invoke-CimMethod -MethodName GetOwner; if (-not $o.User) { exit 0 }; $u = \"$($o.Domain)\\$($o.User)\"; if ($u -ieq [Security.Principal.WindowsIdentity]::GetCurrent().Name) { exit 0 }; icacls $env:TFA_DIR /grant \"${u}:(OI)(CI)M\" /Q | Out-Null";
     let _ = Command::new(program("powershell"))
@@ -1200,6 +1338,7 @@ fn grant_player(folder: &Path) {
 
 /// The shortcut in one of Windows' special folders (`Desktop`, `Programs`: the Start menu's), once (its flag file
 /// beside the remembered folder's).
+#[cfg(windows)]
 fn shortcut_once(folder: &Path, repo: &Path, place: &str, flag_name: &str) {
     let Some(flag) = remembered_folder_file().and_then(|f| f.parent().map(|d| d.join(flag_name))) else { return };
     if flag.exists() {
@@ -1228,14 +1367,21 @@ fn shortcut_once(folder: &Path, repo: &Path, place: &str, flag_name: &str) {
 }
 
 /// The built game's exe in an install.
+#[cfg(windows)]
 fn game_exe(repo: &Path) -> PathBuf {
     game_folder(repo).join("out").join("build").join("transformers").join("RelWithDebInfo").join("TransformersRecomp.exe")
 }
 
-/// A copy of this program in the install folder (tfa-setup.exe), for the game's own "Update now".
+/// (Linux: build.sh's Ninja build has no configuration folder)
+#[cfg(not(windows))]
+fn game_exe(repo: &Path) -> PathBuf {
+    game_folder(repo).join("out").join("build").join("transformers").join("TransformersRecomp")
+}
+
+/// A copy of this program in the install folder (tfa-setup.exe; tfa-setup on Linux), for the game's own "Update now".
 fn copy_self(folder: &Path) {
     let Ok(me) = std::env::current_exe() else { return };
-    let target = folder.join("tfa-setup.exe");
+    let target = folder.join(SETUP_EXE);
     let same = std::fs::canonicalize(&me).ok().zip(std::fs::canonicalize(&target).ok()).is_some_and(|(a, b)| a == b);
     if !same {
         let _ = std::fs::copy(&me, &target);
@@ -1249,7 +1395,11 @@ fn git_out(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 /// git_out with variables of its own (GIT_INDEX_FILE: keep_local_work).
 fn git_out_env(repo: &Path, args: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Result<String, String> {
-    let out = Command::new("git")
+    #[cfg(windows)]
+    let mut git = Command::new("git");
+    #[cfg(not(windows))]
+    let mut git = winapi::git_command(vars); // (this PC's Git, else the build container's)
+    let out = git
         .envs(vars.iter().copied())
         .arg("-C")
         .arg(repo)
@@ -1341,8 +1491,15 @@ struct LocalTime {
     millis: u16,
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn GetLocalTime(time: *mut LocalTime);
+}
+
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+unsafe fn GetLocalTime(time: *mut LocalTime) {
+    winapi::local_time(unsafe { &mut *time });
 }
 
 /// The install's own work kept on a branch (Job::keep_local_work; the steps are there).
@@ -1475,7 +1632,7 @@ fn check_updates(repo: &Path) -> Check {
     };
     if let Err(e) = git_out(repo, &["fetch", "--quiet", "--no-tags", "origin", &branch]) {
         c.error = if e.contains("could not read Username") || e.contains("terminal prompts disabled") || e.contains("Authentication") {
-            "the repository asked for a sign-in: run update.ps1 once in the install folder (it asks), then check again".into()
+            format!("the repository asked for a sign-in: run {UPDATE_SCRIPT} once in the install folder (it asks), then check again")
         } else {
             e
         };
@@ -1558,8 +1715,14 @@ fn git_failure_text(e: &str) -> String {
     }
 }
 
+#[cfg(windows)]
 fn has(path_env: &str, exe: &str) -> bool {
     path_env.split(';').any(|d| !d.is_empty() && Path::new(d).join(format!("{exe}.exe")).exists())
+}
+
+#[cfg(not(windows))]
+fn has(path_env: &str, exe: &str) -> bool {
+    path_env.split(':').any(|d| !d.is_empty() && Path::new(d).join(exe).is_file())
 }
 
 /// PATH plus the folder of an installed Git that is not on it (the usual install folders), if any.
@@ -1582,6 +1745,12 @@ fn with_git_dir(path_env: &str) -> String {
 /// Windows' own folders added to a PATH that lacks them (at its end: the player's order stays). A player's PC had a PATH
 /// without them and the setup stopped at once: "powershell could not be started: program not found" (2026-11-09);
 /// setup.ps1 also runs cmd and winget, which need System32.
+#[cfg(not(windows))]
+fn with_system_dirs(path: &str) -> String {
+    path.to_string()
+}
+
+#[cfg(windows)]
 fn with_system_dirs(path: &str) -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let mut out = path.trim_end_matches(';').to_string();
@@ -1771,9 +1940,20 @@ fn status_icon(ui: &mut egui::Ui, status: Status) {
 }
 
 fn pick_iso(target: &mut String, title: &str) {
-    if let Some(f) = rfd::FileDialog::new().set_title(title).add_filter("Disc image", &["iso"]).pick_file() {
+    #[cfg(windows)]
+    let picked = rfd::FileDialog::new().set_title(title).add_filter("Disc image", &["iso"]).pick_file();
+    #[cfg(not(windows))]
+    let picked = winapi::pick_file(title); // (the desktop's own dialog: KDE's, GNOME's)
+    if let Some(f) = picked {
         *target = f.to_string_lossy().to_string();
     }
+}
+
+fn pick_folder(title: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    return rfd::FileDialog::new().set_title(title).pick_folder();
+    #[cfg(not(windows))]
+    return winapi::pick_folder(title);
 }
 
 fn file_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, pick: impl FnOnce(&mut String)) {
@@ -1986,7 +2166,7 @@ impl App {
                 }
                 // (or the small copy of it that the mods' make_prototype_extract.py makes)
                 if ui.add_sized([80.0, 28.0], egui::Button::new("Folder…")).on_hover_text("The small copy made by make_prototype_extract.py").clicked() {
-                    if let Some(f) = rfd::FileDialog::new().set_title("Prototype files folder").pick_folder() {
+                    if let Some(f) = pick_folder("Prototype files folder") {
                         self.prototype = f.to_string_lossy().to_string();
                     }
                 }
@@ -1994,7 +2174,7 @@ impl App {
         }
         ui.add_space(10.0);
         file_row(ui, "Install folder", &mut self.folder, "", |v| {
-            if let Some(f) = rfd::FileDialog::new().set_title("Install folder").pick_folder() {
+            if let Some(f) = pick_folder("Install folder") {
                 *v = f.to_string_lossy().to_string();
             }
         });
@@ -2047,8 +2227,13 @@ impl App {
         // (TODO 310) Not only the HD textures: the build too (a player's PC reset with 8 BIOS beeps near the end of the last bar)
         ui.checkbox(&mut self.hd_gentle, "Go easy on my PC (slower)").on_hover_text(
             "For a PC that restarts, freezes or overheats while it is set up or updated: the build uses half the processor at a lower priority, and the HD textures are made in short bursts with rests, never at full power for minutes. Takes about twice as long.");
+        #[cfg(not(windows))]
+        winapi::steam_checkbox(ui);
         ui.add_space(6.0);
+        #[cfg(windows)]
         ui.label(RichText::new("Missing tools (Git, Python, Visual Studio Build Tools) are installed with winget; Windows may ask for permission.").color(DIM).small());
+        #[cfg(not(windows))]
+        ui.label(RichText::new(&self.tools_note).color(DIM).small());
 
         let ready = matches!(retail_note, Some((_, c)) if c == GOOD) && !self.folder.trim().is_empty();
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
@@ -2059,13 +2244,15 @@ impl App {
     }
 
     fn progress_view(&mut self, ui: &mut egui::Ui) {
+        let (updated, ready, ready_mods) = (format!("{PLAY_WITH} (or Play below)."), format!("{PLAY_WITH}. F5 = settings."),
+                                            format!("{PLAY_WITH}. F5 = settings, F1 = mods and cheats."));
         let (title, sub) = match (&self.phase, self.update) {
             (Phase::Done(true), true) if self.play => ("Updated", "The game is starting again, where you were."),
-            (Phase::Done(true), true) => ("Updated", "Start the game with Play.bat in the install folder (or Play below)."),
+            (Phase::Done(true), true) => ("Updated", updated.as_str()),
             (Phase::Done(false), true) if self.play => ("The update stopped", "The game starts again as it was; try the update later (the log says why)."),
             (Phase::Done(false), true) => ("The update stopped", "Try again: finished steps are kept."),
-            (Phase::Done(true), false) if self.mods => ("Ready to play", "Start the game with Play.bat in the install folder. F5 = settings, F1 = mods and cheats."),
-            (Phase::Done(true), false) => ("Ready to play", "Start the game with Play.bat in the install folder. F5 = settings."),
+            (Phase::Done(true), false) if self.mods => ("Ready to play", ready_mods.as_str()),
+            (Phase::Done(true), false) => ("Ready to play", ready.as_str()),
             (Phase::Done(false), false) => ("Setup stopped", "Run the setup again to carry on: finished steps are kept."),
             (_, true) if self.mods => ("Updating", "The new version is built on this PC. Your mods, their choices and your settings are kept."),
             (_, true) => ("Updating", "The new version is built on this PC. Your settings and saves are kept."),
@@ -2077,6 +2264,12 @@ impl App {
         if !self.kept.is_empty() {
             ui.add_space(6.0);
             ui.label(RichText::new(kept_text(&self.kept)).color(GOOD));
+        }
+        // (Linux: what adding the game to Steam did)
+        #[cfg(not(windows))]
+        if let (Phase::Done(true), Some((ok, t))) = (&self.phase, winapi::steam_result()) {
+            ui.add_space(6.0);
+            ui.label(RichText::new(t).color(if ok { GOOD } else { Color32::from_rgb(240, 180, 0) }));
         }
         ui.add_space(22.0);
         for s in &self.steps {
@@ -2165,6 +2358,11 @@ fn main() -> eframe::Result {
         std::process::exit(launcher::run(&args));
     }
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([760.0, 560.0]).with_min_inner_size([640.0, 520.0]).with_title("Transformers Armada - Setup");
+    // (Linux: the window's name to the desktop - its taskbar entry, KDE's window rules)
+    #[cfg(not(windows))]
+    {
+        viewport = viewport.with_app_id("tfa-setup");
+    }
     // (tests on a worker: --offscreen puts the window where no screen is, out of the taskbar)
     if std::env::args().any(|a| a == "--offscreen") {
         viewport = viewport.with_position([-20000.0, -20000.0]).with_taskbar(false);
@@ -2199,6 +2397,14 @@ fn main() -> eframe::Result {
         }
     }
     app.load_hd_options();
+    // (Linux: --add-to-steam [--folder <dir>] adds the installed game to Steam now and prints what was done)
+    #[cfg(not(windows))]
+    if all.iter().any(|a| a == "--add-to-steam") {
+        if let Some(dir) = all.iter().position(|a| a == "--folder").and_then(|i| all.get(i + 1)) {
+            app.folder = dir.clone();
+        }
+        std::process::exit(winapi::add_to_steam_cli(Path::new(&app.folder), &app.repo()));
+    }
     // Started with nothing on its command line on a finished install (a launcher's Play button, a shortcut to
     // the setup): the game starts, no setup window. Shift held while starting, or --setup: the setup's window.
     if all.is_empty() && app.installed() && game_exe(&app.repo()).exists() && !Path::new(&app.folder).join(UNFINISHED_MARK).exists()
@@ -2277,7 +2483,19 @@ fn main() -> eframe::Result {
     }))
 }
 
-#[cfg(test)]
+/// (TODO 370) The step a setup before this one left running (LeftStep::find), waited for: on Linux through its pidfd,
+/// checked against the start time written down for it (linux.rs); on Windows as before.
+#[cfg(windows)]
+fn wait_for_left_step(pid: u32, _started: u64) -> Option<i32> {
+    winapi::wait_for_exit(pid)
+}
+
+#[cfg(not(windows))]
+fn wait_for_left_step(pid: u32, started: u64) -> Option<i32> {
+    winapi::wait_for_exit_checked(pid, started)
+}
+
+#[cfg(all(test, windows))]
 mod path_tests {
     use super::*;
 

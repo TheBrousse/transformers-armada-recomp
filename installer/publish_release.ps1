@@ -21,6 +21,7 @@
 #>
 param(
     [Parameter(Mandatory)] [string]$Exe,
+    [string]$LinuxExe,           # optional: the Linux tfa-setup, attached as tfa-setup-linux when it exists
     [string]$VersionFile,        # default: VERSION at the repository's top
     [string]$Commit,             # default: HEAD (the workflow passes GITHUB_SHA)
     [string]$Repo,               # owner/name; default: the repository gh finds from this folder
@@ -79,6 +80,9 @@ if ($DryRun) {
 }
 $zip = & (Join-Path $PSScriptRoot 'package_recomplauncher.ps1') -Exe $Exe
 if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw 'RecompLauncher package was not created' }
-& gh release create $tag $Exe $zip @repoArgs --target $Commit --title $title --notes $notes --latest
+$assets = @($Exe, $zip)
+if ($LinuxExe -and (Test-Path -LiteralPath $LinuxExe -PathType Leaf)) { $lin = Join-Path ([IO.Path]::GetTempPath()) "tfa-setup-linux"; Copy-Item -LiteralPath $LinuxExe -Destination $lin -Force; $assets += $lin }
+elseif ($LinuxExe) { Write-Warning "no Linux tfa-setup at ${LinuxExe}: published without it" }
+& gh release create $tag @assets @repoArgs --target $Commit --title $title --notes $notes --latest
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
 Write-Host "publish_release: $tag published."
