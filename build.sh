@@ -37,6 +37,9 @@ done
 game=$root/game work=$root/work build=$root/out/build tools_build=$root/out/tools tools=$root/transformers/tools
 ps2recomp=$root/PS2Recomp elf=SLUS_206.68
 python=${PYTHON:-python3}
+# (cpucheck) The processor first: the game needs SSE4.1 (2008 or newer) - said now, not after the long build.
+cpu=0; "$python" "$tools/cpu_check.py" || cpu=$?
+[ "$cpu" -ne 3 ] || exit 3
 # (TODO 310) Each step with its time to TF_STEP_LOG when the setup or the update set it, synced to the disk at once: it
 # names the step even when the PC went off (tools/step_log.ps1's, on Windows).
 steplog() { if [ -n "${TF_STEP_LOG:-}" ]; then printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$TF_STEP_LOG" && sync "$TF_STEP_LOG" 2>/dev/null; fi; return 0; }

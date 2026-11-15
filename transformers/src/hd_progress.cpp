@@ -88,6 +88,7 @@ namespace hd_progress
             std::string state;
             long long done = 0, total = 0;
             std::string quality; // (PR #20) the preset the set was made for ("" in sets from before)
+            std::string stopReason; // (TODO 382) why the upscale stopped on the card: "driver_reset", "device_lost" or ""
         };
         Status g_lastStatus; // (TODO 352: the status file as last read, for statusLine; g_mutex)
 
@@ -170,6 +171,7 @@ namespace hd_progress
             s.done = std::atoll(field(text, "done").c_str());
             s.total = std::atoll(field(text, "total").c_str());
             s.quality = field(text, "quality");
+            s.stopReason = field(text, "stop_reason");
             s.ok = !s.state.empty();
 #if defined(__linux__)
             in.close();
@@ -221,6 +223,19 @@ namespace hd_progress
             bool linePaused = false, cornerPaused = false;
             if (s.ok && s.state == "card_broken")
                 line = "HD TEXTURES: NOT MADE (THIS GRAPHICS CARD'S COME OUT BLACK)";
+            else if (s.ok && s.state == "resets_stopped")
+            {
+                // (TODO 382, public issue #32: "525 of 1707" for good read as stuck) the maker stopped trying on this card:
+                // the upscale stopped on it in each of the last runs - a driver reset Windows logged, or only the upscaler
+                // losing its card on this driver (nothing to see: not called a reset). F1 > Make HD textures tries again;
+                // so does another driver. Two lines: the header's right has room for about one of them at 4:3.
+                char text[192];
+                std::snprintf(text, sizeof text, "HD TEXTURES STOPPED AT %lld OF %lld\n%s - F1 > MAKE HD TEXTURES", s.done, s.total,
+                              s.stopReason == "device_lost" ? "THE UPSCALER STOPS ON THIS GRAPHICS DRIVER" : "GRAPHICS DRIVER RESETS");
+                line = text;
+            }
+            else if (s.ok && s.state == "starting")
+                line = "HD TEXTURES: STARTING IN A MOMENT"; // (TODO 382: the upscaler waits for a game just started)
             else if (s.ok && s.state == "checking" && s.total > 0)
             {
                 char text[96];
@@ -236,7 +251,9 @@ namespace hd_progress
             }
             // (TODO 267) The corner's, in plain words; the counts as the status file has them.
             std::string corner;
-            if (s.ok && s.total > 0 && s.state != "done" && s.state != "card_broken")
+            if (s.ok && s.state == "starting")
+                corner = "HD textures: starting in a moment";
+            else if (s.ok && s.total > 0 && s.state != "done" && s.state != "card_broken" && s.state != "resets_stopped")
             {
                 const bool finishing = s.state != "checking" && s.done >= s.total;
                 corner = finishing ? std::string("Finishing HD textures") // (all made: their colours matched, the sharp text again)
@@ -608,7 +625,9 @@ namespace hd_progress
         holdRunningSign(); // (so that the upscale waits while the game runs)
         if (makerRunning(g_dir))
             return "Being made already, in its own window";
-        startMaker(g_dir.parent_path());
+        // (TODO 382) The button tries again on a card the maker stopped trying on after its driver was reset in each
+        // of the last runs (-RetryResets); a start of the game does not.
+        startMaker(g_dir.parent_path(), L"-Resume -RetryResets");
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             if (g_line.empty())
@@ -955,7 +974,16 @@ namespace hd_progress
             std::lock_guard<std::mutex> lock(g_mutex);
             s = g_lastStatus;
         }
-        const bool counting = s.ok && s.total > 0 && s.state != "done" && s.state != "card_broken";
+        // (TODO 382) Stopped on this card after the last runs: said, with why and the way to try again.
+        if (s.ok && s.state == "resets_stopped")
+            return "Stopped at " + grouped(s.done) + " of " + grouped(s.total) + ": " +
+                   (s.stopReason == "device_lost" ? std::string("the upscaler stops on this graphics driver (no driver reset was logged) - "
+                                                                "another driver version may help.")
+                                                  : std::string("the graphics driver was reset in each of the last runs.")) +
+                   " What is made is used. Make HD textures tries again.";
+        if (s.ok && s.state == "starting")
+            return "Being made in a small window: starting in a moment (the game has just started).";
+        const bool counting = s.ok && s.total > 0 && s.state != "done" && s.state != "card_broken" && s.state != "resets_stopped";
         const std::string counts = counting ? grouped(s.done) + " of " + grouped(s.total) + " made" : std::string();
         if (g_makerAlive)
         {

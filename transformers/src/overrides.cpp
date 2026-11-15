@@ -49,6 +49,7 @@
 #include "iop_tripwire.h"
 #include "vrr_probe.h"
 #include "menu_mouse.h"
+#include "menu_fade_speed.h"
 #include "mod_menu.h"
 #include "frustum_native.h"
 #include "nr_pace.h" // (TODO 336: the frame-rate cap holds for the pictures everywhere)
@@ -76,6 +77,7 @@
 #include <cmath>
 #include <deque>
 #include <thread>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3953,6 +3955,21 @@ namespace
     // it are judged as before (the bars and hold-offs against flapping).
     std::chrono::steady_clock::time_point g_rateRecoverUntil{};
     std::deque<std::chrono::steady_clock::time_point> g_rateFalls; // (TODO 165: the falls of the last 2 minutes)
+    // (TODO 377) A spike is not a fall. (1) A miss whose last 2 s keep the period - their median and mean frame within it -
+    // does not take the rate down: a moment's dip (a render-thread stall, an EE spike, a scheduling gap) is a hitch,
+    // not a sign the PC cannot hold the rate, and the bar and climb hold-off after a fall kept the lower rate for 15-30 s
+    // (deep_amazon_gate1 at cap 240: 210 -> 161 on a 2 s median of 4.05 ms in a 4.76 ms period, 161 for the last 30 s;
+    // amazon_gate2: 212 -> 152, 16 s there, then only 205). (2) A fall taken while the last 2 s's median frame was
+    // inside the period it fell from: that rate tried again after 3 s if the frames, the EE's work and the drawing show
+    // room for it, its bar lifted - once; a fall within 10 s of that is held as before. (3) While held below a rate it
+    // fell from, the reason is told every 10 s. TF_RATE_SPIKE_GUARD=0: as before (none of the three).
+    size_t g_spikeRetryIndex = SIZE_MAX;
+    std::chrono::steady_clock::time_point g_spikeRetryAt{}, g_spikeRetriedAt{};
+    bool spikeGuard()
+    {
+        static const bool v = !(std::getenv("TF_RATE_SPIKE_GUARD") && *std::getenv("TF_RATE_SPIKE_GUARD") == '0');
+        return v;
+    }
     std::chrono::steady_clock::time_point g_lastKickTime{};
     std::chrono::nanoseconds g_lastKickIdle{0};
     std::chrono::steady_clock::time_point g_rateHeldUntil{}, g_raiseHeldUntil{}, g_rateRaisedAt{};
@@ -4357,6 +4374,7 @@ namespace
         g_failedAt.assign(g_rates.size(), {});
         g_failCount.assign(g_rates.size(), 0);
         g_barredUntil.assign(g_rates.size(), {});
+        g_spikeRetryIndex = SIZE_MAX; // (TODO 377)
         std::string ladder;
         for (int r : g_rates)
             ladder += (ladder.empty() ? "" : "/") + std::to_string(r);
@@ -4828,6 +4846,32 @@ namespace
             const std::vector<float> longer = lastOf(sustainMs, &RateSample::interval);
             behind = !longer.empty() && percentile(longer, 0.5) > 1.05 * periodMs(g_levelRate);
         }
+        // (TODO 377, (1)) Not when the last 2 s kept the period on the whole: their median and mean frame within it (a
+        // half second over 1.5 periods still goes at once, as before).
+        if (behind && spikeGuard() && percentile(recent, 0.5) <= 1.5 * periodMs(g_levelRate))
+        {
+            const std::vector<float> two = lastOf(2000.0, &RateSample::interval);
+            if (two.size() >= 16u)
+            {
+                double mean = 0.0;
+                for (float v : two)
+                    mean += v;
+                mean /= static_cast<double>(two.size());
+                const double p = periodMs(g_levelRate), median = percentile(two, 0.5);
+                if (median <= p && mean <= p)
+                {
+                    behind = false;
+                    static auto said = std::chrono::steady_clock::time_point{};
+                    if (now - said >= std::chrono::seconds(2))
+                    {
+                        said = now;
+                        std::fprintf(stderr, "[tf] rate %d kept: a spike, not a fall - the last 2 s's frames %.2f ms (median) / %.2f (mean) within "
+                                             "the period %.2f, the last half second's %.2f (TF_RATE_SPIKE_GUARD=0: down as before)\n",
+                                     g_levelRate, median, mean, p, percentile(recent, 0.5));
+                    }
+                }
+            }
+        }
         // (TODO 165) The drawing behind: the game's frames keep their time (the drawing leaves pictures out) but a lasting share
         // of them left out - over 10% of the last half second's frames and of the last 1.5 s's - is a PC that cannot draw the
         // rate; it goes down to what was drawn. (A short hitch leaves a few out and nothing changes.)
@@ -4867,6 +4911,19 @@ namespace
                 // The work is the EE's; a host held back by the GS or the GPU shows it only in the
                 // frames' intervals - what it managed, with 5% to spare.
                 double needed = std::max(1.1 * percentile(lastOf(500.0, &RateSample::work), 0.5), 1.05 * percentile(recent, 0.5));
+                // (TODO 377) Where the last half second was a burst - not far behind (its median under 1.5 periods) - the
+                // frames' and the EE's work's parts of the target are their last 2 s's medians, not the half second's: a burst of slow frames sent
+                // 235 -> 158 and 212 -> 162 on a 2 s median of 4.36 and 4.55 ms (amazon_gate2, deep_amazon_gate1 at cap 240),
+                // a drop of a third for a few late frames. The EE's work and the drawing's own time still count as before.
+                if (spikeGuard() && percentile(recent, 0.5) <= 1.5 * periodMs(g_levelRate))
+                {
+                    const std::vector<float> two = lastOf(2000.0, &RateSample::interval);
+                    // (and the EE's work by its last 2 s too: a half second's burst of game work - 5.7 ms against a 2 s
+                    // median of 3.87 at amazon_gate2 - set 235 -> 157 by itself)
+                    const std::vector<float> twoWork = lastOf(2000.0, &RateSample::work);
+                    if (two.size() >= 16u && twoWork.size() >= 16u)
+                        needed = std::max(1.1 * percentile(twoWork, 0.5), 1.05 * percentile(two, 0.5));
+                }
                 // (TODO 290 fps: the drawing's own measured time where it is known - a rate whose period holds its 90th
                 // percentile with 5% to spare, between the way up's 92% and the period itself, so the rate it lands on is not
                 // one the way up leaves at once. The share drawn overshot: 108 -> 78 on the user's RX 5700 XT.)
@@ -4889,6 +4946,40 @@ namespace
                 if (!longer.empty() && percentile(longer, 0.5) > 1.05 * periodMs(g_levelRate) &&
                     (!moments || ps2_host_display::momentCap() == 1))
                     inBetweenChange = -1;
+            }
+        }
+        else if (spikeGuard() && g_spikeRetryIndex < g_rateIndex && now >= g_spikeRetryAt)
+        {
+            // (TODO 377, (2)) The rate it fell from on a spike, tried again: the last 2 s on time at this rate, the EE's work
+            // and the drawing inside that rate's period (as the way up asks), nothing left out. Given up after 10 s.
+            const double back = periodMs(g_rates[g_spikeRetryIndex]);
+            const std::vector<float> work = lastOf(2000.0, &RateSample::work), intervals = lastOf(2000.0, &RateSample::interval);
+            if (!work.empty() && !intervals.empty())
+            {
+                double mean = 0.0;
+                for (float v : intervals)
+                    mean += v;
+                mean /= static_cast<double>(intervals.size());
+                const double w50 = percentile(work, 0.5), w98 = percentile(work, 0.98);
+                const bool room = mean < 1.03 * periodMs(g_levelRate) && w50 < 0.80 * back && w98 < 0.95 * back && drawFits(back, 2000.0) &&
+                                  !drawWalled(g_rates[g_spikeRetryIndex]) && leftOutShare(2000.0) < 0.01;
+                if (room)
+                {
+                    index = g_spikeRetryIndex;
+                    g_barredUntil[index] = now;
+                    g_ceilingUntil = now;
+                    g_spikeRetriedAt = now;
+                    g_spikeRetryIndex = SIZE_MAX;
+                    std::fprintf(stderr, "[tf] %d tried again after a spike: the frames %.2f ms (mean), the EE's work %.2f / %.2f (median / 98%%), "
+                                         "the drawing %.2f against %.2f\n", g_rates[index], mean, w50, w98, nativeDraw ? drawnP90(2000.0) : 0.0, back);
+                }
+                else if (now - g_spikeRetryAt > std::chrono::seconds(10))
+                {
+                    std::fprintf(stderr, "[tf] %d not tried again: no room for it 10 s after the spike (the frames %.2f ms mean, the EE's work "
+                                         "%.2f / %.2f, the drawing %.2f against %.2f)\n", g_rates[g_spikeRetryIndex], mean, w50, w98,
+                                 nativeDraw ? drawnP90(2000.0) : 0.0, back);
+                    g_spikeRetryIndex = SIZE_MAX;
+                }
             }
         }
         else if (now >= g_raiseHeldUntil)
@@ -4989,8 +5080,9 @@ namespace
                             }
                         }
                     }
-                    else if (g_rateLog || now < g_rateExplainUntil)
+                    else if (g_rateLog || now < g_rateExplainUntil || (spikeGuard() && g_lastDownAt != std::chrono::steady_clock::time_point{}))
                     {
+                        // (TODO 377, (3): also while below a rate it fell from, every 10 s)
                         static auto lastSaid = std::chrono::steady_clock::time_point{};
                         if (now - lastSaid >= std::chrono::seconds(10))
                         {
@@ -5139,6 +5231,22 @@ namespace
                          percentile(recent, 0.5), percentile(recent, 1.0), percentile(work, 0.5), percentile(work, 1.0),
                          periodMs(from));
         }
+        if (spikeGuard() && index > g_rateIndex)
+        {
+            // (TODO 377, (2)) A fall while the last 2 s's median frame was inside the period it fell from: a spike - that rate
+            // tried again in 3 s (above), unless it was tried again within the last 10 s and fell once more.
+            const std::vector<float> two = lastOf(2000.0, &RateSample::interval);
+            const bool spike = two.size() >= 16u && percentile(two, 0.5) <= periodMs(from);
+            const bool again = g_spikeRetriedAt != std::chrono::steady_clock::time_point{} && now - g_spikeRetriedAt < std::chrono::seconds(10);
+            g_spikeRetryIndex = spike && !again ? g_rateIndex : SIZE_MAX;
+            g_spikeRetryAt = now + std::chrono::seconds(3);
+            if (spike)
+                std::fprintf(stderr, again ? "[tf]   (a spike, but %d fell again within 10 s of being tried again: held as before)\n"
+                                           : "[tf]   (a spike: %d tried again in 3 s if the frames show room)\n",
+                             from);
+        }
+        else if (index < g_rateIndex)
+            g_spikeRetryIndex = SIZE_MAX;
         g_rateIndex = index;
         playrec::noteRate(2, to); // (N12 b)
         const auto switchStart = std::chrono::steady_clock::now();
@@ -5669,6 +5777,28 @@ namespace
     float g_forestFit = 1.0f;               // (the reach's share of the setting's, 1/draw distance .. 1)
     uint32_t g_forestPeak = 0u, g_forestRefused = 0u, g_forestCreated = 0u, g_forestRefusedTotal = 0u;
     uint32_t g_forestMadeFrame = 0u, g_forestMadeFrameMax = 0u; // (made in one frame: a group coming at once)
+    // (TODO 376, S1) New 3D trees spread over frames, nearest first. Turning to thick forest asked for up to 401 new
+    // instances in ONE frame (175-197 ms on the 7900 XTX, 44 ms on the Testbench, with or without the D budget): each new
+    // tree costs its making and its first drawing. Now at most TF_FOREST_MAKE_PER_FRAME (32) are made in a frame; the
+    // others stay the game's flat tree for now (asked again the next frame: nothing is missing). And the nearest first:
+    // the frame after one with trees left over takes only those as near as the 32nd nearest of them, so a far tree is
+    // never made before a near one is. 0 = no limit (as before).
+    uint32_t g_forestMakePerFrame = 32u;
+    float g_forestMakeGate = 0.0f;             // (this frame's: only candidates this near are made; 0 = no gate)
+    std::vector<float> g_forestDeferred;       // (this frame's candidates left over, their distances)
+    uint32_t g_forestDeferredTotal = 0u;       // (since the last log line)
+    uint32_t g_forestCandLog = 0u;             // (TF_FOREST_CAND_LOG=<n>: the first n candidates' words - a test aid)
+    // (TODO 376, S2) Hysteresis at the reach: a tree becomes 3D only inside TF_FOREST_HYSTERESIS (0.95) of its kind's
+    // reach, and stays 3D until the game drops it at the reach itself (1.0). Before, one compare did both, so a tree
+    // standing at the reach turned 3D and back with every small move of the camera. A candidate (0x430190's list, CreateInstance's
+    // a1, 0x2C bytes) has its kind at +0x20 (measured: 0-9 with the kind's geometry at +0x18); its kind's reach is the
+    // one 0x430190 uses (forestKindReach, as the diag's). 1 = off. And two counters for the plan's point 1 (in the log
+    // line): "back within 2 s" - a tree made 3D again within 2 s of being dropped, the flip; "made inside 0.9" - a tree
+    // made 3D well inside its reach, where its model appears at full strength (the late pop).
+    constexpr uint32_t kEcoCandidateKind = 0x20u;
+    float g_forestHysteresis = 0.95f;
+    std::unordered_map<uint64_t, double> g_forestDropped; // (keys dropped by DeleteAll, the forest's clock: 2 s)
+    uint32_t g_forestFlips = 0u, g_forestMadeInside = 0u, g_forestHeldBack = 0u;
     bool g_forestBehind = false;
     struct ForestFrame
     {
@@ -6077,6 +6207,20 @@ namespace
         const float factor = g_forestOld ? forestFactor() : std::max(1.0f, forestFactor() * g_forestFit);
         if (factor != 1.0f)
             scale *= factor;
+        // (TODO 376, a test aid for pictures: TF_FOREST_REACH_RAMP=<from>:<to>:<seconds>[:<start>] - the 3D trees' reach
+        // times a factor going from <from> to <to> over <seconds> of the forest's game time, from <start> seconds on: with a
+        // still camera every tree crosses the hand-over in place, one after the other, for frame-by-frame shots)
+        static const std::array<float, 4> ramp = [] {
+            std::array<float, 4> r{0.0f, 0.0f, 0.0f, 0.0f};
+            if (const char *e = std::getenv("TF_FOREST_REACH_RAMP"); e && *e)
+                std::sscanf(e, "%f:%f:%f:%f", &r[0], &r[1], &r[2], &r[3]);
+            return r;
+        }();
+        if (ramp[2] > 0.0f)
+        {
+            const float u = std::clamp((static_cast<float>(g_forestClock) - ramp[3]) / ramp[2], 0.0f, 1.0f);
+            scale *= ramp[0] + (ramp[1] - ramp[0]) * u;
+        }
         std::memcpy(rdram + kEcoScaleWord, &scale, sizeof(scale));
         // (TODO 194: the leaves' budget - every frame and after a state loads; off, the game's 800 back if ours is there)
         // (TODO 346, the second hole) The game's 800 placements a frame are sized for the console's reach. A longer
@@ -6386,12 +6530,62 @@ namespace
         std::fprintf(stderr, "[forest] the node pool grown from %u to %u nodes (%08x, %08x)\n", count, want, newUsed, newNodes);
     }
 
+    // A kind's reach as 0x430190 works it out (see forestDiagLeaf): its size x +0x148 x instanceFar0 x the eco scale x
+    // the detail scale over the zoom's factor; 0 when unknown.
+    float forestKindReach(const uint8_t *rdram, uint32_t kindIndex)
+    {
+        const uint32_t kinds = ecoLoadWord(rdram, 0x006CF8E0u);
+        const float zoom = ecoLoadFloat(rdram, 0x006CF8E8u);
+        if (kinds == 0u || kindIndex >= 10u || !(zoom > 0.0f))
+            return 0.0f;
+        const uint32_t kind = kinds + 0x520u * kindIndex;
+        const float common = ecoLoadFloat(rdram, kEcoFar0) * ecoLoadFloat(rdram, kEcoScaleWord) * ecoLoadFloat(rdram, 0x006CD974u);
+        return ecoLoadFloat(rdram, kind + 0x12Cu) * (ecoLoadFloat(rdram, kind + 0x148u) * common) / zoom;
+    }
+
     void ecoCreateInstance(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ecoGrowPool(rdram, runtime);
         const uint32_t cap = ecoCap(rdram);
         std::memcpy(rdram + kEcoCapWord, &cap, sizeof(cap));
         const uint32_t candidate = getRegU32(ctx, 5);
+        if (g_forestCandLog > 0u && !g_forestOld)
+        {
+            --g_forestCandLog;
+            uint32_t w[12] = {};
+            std::memcpy(w, rdram + (candidate & PS2_RAM_MASK), sizeof(w));
+            std::fprintf(stderr, "[forest] candidate %08x d %.1f words %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                         candidate, ecoDistance(rdram, candidate), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+        }
+        bool madeInside = false;
+        if (!g_forestOld && (g_forestHysteresis < 1.0f || g_forestLog))
+        {
+            const float d = ecoDistance(rdram, candidate);
+            const float reach = forestKindReach(rdram, ecoLoadWord(rdram, candidate + kEcoCandidateKind));
+            if (reach > 0.0f && g_forestHysteresis < 1.0f && d > g_forestHysteresis * reach)
+            {
+                ++g_forestHeldBack; // (in the band between: stays the game's flat tree until it comes nearer)
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+            madeInside = reach > 0.0f && d < 0.9f * reach;
+            if (!g_forestDropped.empty())
+                if (const auto e = g_forestDropped.find(ecoKey(rdram, candidate + kEcoCandidateKey)); e != g_forestDropped.end())
+                {
+                    ++g_forestFlips;
+                    g_forestDropped.erase(e);
+                }
+        }
+        if (!g_forestOld && g_forestMakePerFrame > 0u)
+        {
+            const float d = ecoDistance(rdram, candidate);
+            if (g_forestMadeFrame >= g_forestMakePerFrame || (g_forestMakeGate > 0.0f && d > g_forestMakeGate))
+            {
+                g_forestDeferred.push_back(d); // (stays the game's flat tree this frame; asked for again the next)
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+        }
         if (ecoInstanceCount(rdram) >= cap)
         {
             // (the game's own refusal - its compare is ==: a count over the word, after a lower cap, would pass)
@@ -6403,6 +6597,8 @@ namespace
         }
         ++g_forestCreated;
         ++g_forestMadeFrame;
+        if (madeInside)
+            ++g_forestMadeInside;
         if (g_forestDiag)
         {
             const float d = ecoDistance(rdram, candidate);
@@ -6533,7 +6729,18 @@ namespace
         if (!g_forestOld)
         {
             askedCount = 0u;
-            ecoForEachNode(rdram, [&](uint32_t node) { askedCount += (rdram[node + kEcoNodeFlags] & kEcoNodeAsked) ? 1u : 0u; });
+            ecoForEachNode(rdram, [&](uint32_t node) {
+                if (rdram[node + kEcoNodeFlags] & kEcoNodeAsked)
+                    ++askedCount;
+                else if (g_forestLog) // (dropped at the end of this frame AT ITS REACH - not one that left the view: kept 2 s
+                {                     // for the flip counter; the node's source info at +0x70, its kind at +0x90)
+                    const float reach = forestKindReach(rdram, ecoLoadWord(rdram, node + kEcoNodePosition + kEcoCandidateKind));
+                    if (reach > 0.0f && ecoDistance(rdram, node + kEcoNodePosition) > 0.9f * reach)
+                        g_forestDropped[ecoKey(rdram, node + kEcoNodeKey)] = clock;
+                }
+            });
+            for (auto e = g_forestDropped.begin(); e != g_forestDropped.end();)
+                e = clock - e->second > 2.0 ? g_forestDropped.erase(e) : std::next(e);
         }
         const uint32_t cap = ecoCap(rdram);
         // (Only as many as next frame's free slots - the cap less the instances asked for - cannot take: a new view
@@ -6633,10 +6840,10 @@ namespace
         {
             g_forestLogAt = now + std::chrono::seconds(2);
             std::fprintf(stderr,
-                         "[forest] tick %llu: %u 3D trees (peak %u, cap %u), %u made (at most %u in a frame) / %u refused / %u given up (%u back within 1 s) in 2 s, reach x%.2f of the setting (%u turns), the forest %.2f ms a frame%s\n",
+                         "[forest] tick %llu: %u 3D trees (peak %u, cap %u), %u made (at most %u in a frame) / %u refused / %u given up (%u back within 1 s) in 2 s, reach x%.2f of the setting (%u turns), %u left for a later frame, %u held back at the edge, %u back within 2 s, %u made inside 0.9 of the reach, the forest %.2f ms a frame%s\n",
                          static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), count, g_forestPeak, ecoCap(rdram), g_forestCreated,
                          g_forestMadeFrameMax, g_forestRefusedTotal, g_forestEvictions, g_forestComebacks, g_forestOld ? 1.0f : g_forestFit, g_forestTurns,
-                         forestCostMedian(static_cast<size_t>(std::max(30, g_levelRate))), g_forestBehind ? ", frames late" : "");
+                         g_forestDeferredTotal, g_forestHeldBack, g_forestFlips, g_forestMadeInside, forestCostMedian(static_cast<size_t>(std::max(30, g_levelRate))), g_forestBehind ? ", frames late" : "");
             if (g_layoutRender && g_layoutFrames)
                 std::fprintf(stderr, "[forest] a frame: the leaves' trees %.3f ms, the drawing %.3f ms - of it the mesh surfaces (their capture included) %.3f ms "
                                      "and the secondary layouts %.3f ms (%.0f calls; of it their draws %.3f ms)\n",
@@ -6664,9 +6871,20 @@ namespace
             g_layoutUsSum = g_layoutDrawUsSum = 0.0;
             g_layoutCalls = g_layoutFrames = 0u;
             g_forestCreated = g_forestRefusedTotal = g_forestMadeFrameMax = g_forestEvictions = g_forestComebacks = g_forestTurns = 0u;
+            g_forestDeferredTotal = g_forestHeldBack = g_forestFlips = g_forestMadeInside = 0u;
         }
         g_forestRefused = 0u;
         g_forestRefusals.clear();
+        // (S1: the next frame makes only the nearest of what was left over)
+        g_forestDeferredTotal += static_cast<uint32_t>(g_forestDeferred.size());
+        if (g_forestDeferred.size() >= g_forestMakePerFrame && g_forestMakePerFrame > 0u)
+        {
+            std::nth_element(g_forestDeferred.begin(), g_forestDeferred.begin() + (g_forestMakePerFrame - 1u), g_forestDeferred.end());
+            g_forestMakeGate = g_forestDeferred[g_forestMakePerFrame - 1u];
+        }
+        else
+            g_forestMakeGate = 0.0f;
+        g_forestDeferred.clear();
         g_ecoDeleteAll(rdram, ctx, runtime);
     }
 
@@ -6696,6 +6914,12 @@ namespace
         else
             g_forestCap = forestSlots();
         g_forestLog = std::getenv("TF_FOREST_LOG") && *std::getenv("TF_FOREST_LOG") == '1';
+        if (const char *m = std::getenv("TF_FOREST_MAKE_PER_FRAME"); m && *m)
+            g_forestMakePerFrame = static_cast<uint32_t>(std::clamp(std::atol(m), 0L, 100000L));
+        if (const char *h = std::getenv("TF_FOREST_HYSTERESIS"); h && *h)
+            g_forestHysteresis = std::clamp(static_cast<float>(std::atof(h)), 0.5f, 1.0f);
+        if (const char *c = std::getenv("TF_FOREST_CAND_LOG"); c && *c)
+            g_forestCandLog = static_cast<uint32_t>(std::clamp(std::atol(c), 0L, 100000L));
         g_forestPcClock = std::getenv("TF_FOREST_CLOCK") && std::string(std::getenv("TF_FOREST_CLOCK")) == "pc";
         if (const char *a = std::getenv("TF_FOREST_ADAPTIVE"); a && *a == '1')
             g_forestAdaptive.store(true);
@@ -10334,6 +10558,7 @@ namespace
         // debugging hooks below, which then wrap them like any other.
         decomp::install(runtime);
         menu_mouse::install(runtime); // the mouse in the HQ's screens (menu_mouse.h, TODO 175)
+        menu_fade_speed::install(runtime); // TF_MENU_FADE_SPEED=2|4: the screens' fades faster (TODO 386; after menu_mouse, whose base-update hook it wraps)
         // The native PC renderer (native_render/), wrapping the render calls (TF_NATIVE_RENDER).
         nr::install(runtime);
         // The extensions that hook the native renderer (port_ext.h AfterRender: e.g. the overlay's Playable Decepticons,

@@ -241,6 +241,7 @@ namespace nr::frame
         uint32_t g_aaFrames = 0, g_aaGpuFrames = 0, g_smaaFrames = 0;
         uint64_t g_clipCulled[2] = {};
         uint64_t g_ringFull = 0; // (TODO 99 check: draws or meshes left out because a frame's ring was full)
+        uint64_t g_treeMergeDropped = 0; // (TODO 376 A1: merged trees' instances not drawn - expected 0)
         uint64_t g_meshesMade = 0, g_meshVertices = 0, g_ringMeshes = 0, g_pictureReads = 0; // (TF_NATIVE_PROFILE: buffers made, their vertices; meshes in the frame's ring)
         // (TODO 99, a check: TF_NATIVE_PSTATS=1 - on a saved frame, each pass's pipeline statistics (what the GPU's stages took
         // in and let through: triangles into and out of the clipper, pixels shaded) into runs\pstats_<tick>.txt)
@@ -1904,6 +1905,142 @@ namespace nr::frame
         }
     }
 
+    // (TODO 376, a measuring aid: TF_NATIVE_TREELOG=<n> - every n frames, the mean per frame of the trees' draws:
+    // category 1 = 0x1ac0 instances (image bec5: one mesh at several places), 2 = 0x21f0 (two lights and a highlight),
+    // 0 = the rest. Per category: draws, passes, GPU draws (passes less those merged into an instanced draw), the
+    // render thread's time on them (each draw's whole turn of the loop), kinds (meshes), state sets (mesh + TEX0/TEX1/
+    // ALPHA/TEST), instances per kind; 0x21f0 draws that clip; matrices seen again from the frame before (the same
+    // mesh + matrix: still trees with a still camera); and the depth order of consecutive tree passes (far to near vs
+    // near to far, the w of the matrix's translation). No change to the drawing.)
+    namespace treelog
+    {
+        int every()
+        {
+            static const int n = std::getenv("TF_NATIVE_TREELOG") ? std::atoi(std::getenv("TF_NATIVE_TREELOG")) : 0;
+            return n;
+        }
+        struct Window
+        {
+            double draws[3] = {}, passes[3] = {}, merged[3] = {}, ms[3] = {}, kinds[3] = {}, states[3] = {}, maxPerKind[3] = {};
+            double clipping = 0, matrices = 0, seenAgain = 0, farToNear = 0, nearToFar = 0, mergedAway = 0;
+            uint32_t frames = 0;
+        } win;
+        std::unordered_map<uint64_t, uint32_t> kindCount[3];
+        // (the rest by its routines: "1410+0480" etc., draws and passes, for the cards - A1b)
+        struct Routines
+        {
+            double draws = 0, passes = 0;
+            std::unordered_set<uint64_t> meshes;
+        };
+        std::unordered_map<std::string, Routines> rest;
+        std::string routinesOf(const Draw &d)
+        {
+            std::string s;
+            char b[8];
+            for (uint32_t k = 0; k < d.shader.count; ++k)
+            {
+                std::snprintf(b, sizeof(b), "%s%04x", k ? "+" : "", d.shader.address[k]);
+                s += b;
+            }
+            if (d.mesh && d.mesh->sprites)
+                s += " sprites";
+            if (d.mesh && d.mesh->immediate)
+                s += " 2D";
+            return s.empty() ? std::string("none") : s;
+        }
+        void restDraw(const Draw &d, size_t passes)
+        {
+            Routines &r = rest[routinesOf(d)];
+            r.draws += 1.0;
+            r.passes += static_cast<double>(passes);
+            if (d.mesh && r.meshes.size() < 100000u)
+                r.meshes.insert(d.mesh->id);
+        }
+        std::unordered_set<uint64_t> states[3];
+        std::unordered_set<uint64_t> matricesNow, matricesBefore;
+        float lastDepth = -1.0f;
+        int category(const Draw &d)
+        {
+            if (d.shader.blockOf(Routine::Instances))
+                return 1;
+            if (d.shader.blockOf(Routine::LightWithHighlight))
+                return 2;
+            return 0;
+        }
+        uint64_t hashOf(const void *p, size_t n, uint64_t k = 0xCBF29CE484222325ull)
+        {
+            const uint8_t *b = static_cast<const uint8_t *>(p);
+            for (size_t i = 0; i < n; ++i)
+                k = (k ^ b[i]) * 0x100000001B3ull;
+            return k;
+        }
+        void pass(int cat, const Draw &d, const Pass &p)
+        {
+            if (cat == 0)
+                return;
+            const uint64_t id = d.mesh ? d.mesh->id : 0u;
+            ++kindCount[cat][id];
+            const uint64_t st[5] = {id, p.tex0, p.tex1, p.alpha, p.test};
+            states[cat].insert(hashOf(st, sizeof(st)));
+            const uint64_t mk = hashOf(p.matrix, sizeof(p.matrix), id * 0x9E3779B97F4A7C15ull + 1u);
+            matricesNow.insert(mk);
+            win.matrices += 1.0;
+            if (matricesBefore.count(mk))
+                win.seenAgain += 1.0;
+            const float depth = p.matrix[15];
+            if (lastDepth >= 0.0f && depth > 0.0f)
+                (depth < lastDepth ? win.farToNear : win.nearToFar) += 1.0;
+            lastDepth = depth;
+        }
+        void frameEnd()
+        {
+            for (int c = 1; c < 3; ++c)
+            {
+                win.kinds[c] += static_cast<double>(kindCount[c].size());
+                win.states[c] += static_cast<double>(states[c].size());
+                uint32_t most = 0;
+                for (const auto &k : kindCount[c])
+                    most = std::max(most, k.second);
+                win.maxPerKind[c] = std::max(win.maxPerKind[c], static_cast<double>(most));
+                kindCount[c].clear();
+                states[c].clear();
+            }
+            matricesBefore.swap(matricesNow);
+            matricesNow.clear();
+            lastDepth = -1.0f;
+            if (++win.frames < static_cast<uint32_t>(every()))
+                return;
+            const double f = win.frames;
+            {
+                std::vector<std::pair<double, std::string>> top;
+                for (const auto &r : rest)
+                    top.push_back({r.second.passes, r.first});
+                std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+                std::string line;
+                for (size_t i = 0; i < top.size() && i < 6u; ++i)
+                {
+                    const Routines &r = rest[top[i].second];
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "%s%s %.1f draws %.1f passes (%zu meshes)", i ? "; " : "", top[i].second.c_str(), r.draws / f, r.passes / f, r.meshes.size());
+                    line += b;
+                }
+                std::fprintf(stderr, "[native render] trees, the rest by routines (means a frame): %s\n", line.c_str());
+                rest.clear();
+            }
+            std::fprintf(stderr,
+                         "[native render] trees (%u frames, means a frame): 0x1ac0 %.1f draws %.1f passes %.1f GPU draws %.2f ms %.1f kinds "
+                         "%.1f state sets (most instances of one kind %.0f) | 0x21f0 %.1f draws %.1f passes %.1f GPU draws %.2f ms %.1f kinds "
+                         "%.1f state sets (most %.0f), %.1f clipping | the rest %.1f draws %.1f passes %.2f ms | matrices seen again %.1f%% | "
+                         "order far-to-near %.1f%% | batches merged away %.1f\n",
+                         win.frames, win.draws[1] / f, win.passes[1] / f, (win.passes[1] - win.merged[1]) / f, win.ms[1] / f, win.kinds[1] / f,
+                         win.states[1] / f, win.maxPerKind[1], win.draws[2] / f, win.passes[2] / f, (win.passes[2] - win.merged[2]) / f,
+                         win.ms[2] / f, win.kinds[2] / f, win.states[2] / f, win.maxPerKind[2], win.clipping / f, win.draws[0] / f,
+                         win.passes[0] / f, win.ms[0] / f, win.matrices > 0 ? 100.0 * win.seenAgain / win.matrices : 0.0,
+                         win.farToNear + win.nearToFar > 0 ? 100.0 * win.farToNear / (win.farToNear + win.nearToFar) : 0.0, win.mergedAway / f);
+            win = Window{};
+        }
+    }
+
 
     void render(const Frame &input, const std::string &shotPath)
     {
@@ -3315,8 +3452,109 @@ namespace nr::frame
                 std::fprintf(stderr, "[native render] bloom: the glow's profile down the screen:%s\n", p.c_str());
             }
         }
+        // (TODO 376: TF_NATIVE_TREELOG - each draw's turn of this loop timed by its category)
+        const bool treeLog = treelog::every() > 0;
+        int treeCat = -1;
+        prof::clock::time_point treeT{};
+        auto treeTurn = [&](int next) {
+            if (!treeLog)
+                return;
+            const auto now = prof::clock::now();
+            if (treeCat >= 0)
+                treelog::win.ms[treeCat] += std::chrono::duration<double, std::milli>(now - treeT).count();
+            treeT = now;
+            treeCat = next;
+        };
+        // (TODO 376 A1) The 3D trees: the game draws them as 0x1ac0 batches of about 8 instances (image bec5: one mesh at
+        // several places), each already one instanced draw here (TODO 94) - but a few hundred to ~1,900 batches a frame at
+        // Near to Very far 3D in Deep Amazon, each costing the render thread ~4 us (constants, ring, texture, states): 1.7 to
+        // 8.2 ms a frame. Batches that differ only in their instances - the same mesh, textures, states, target and the
+        // block's shared data (q0-q12: the field registers, field B's rule, the guard band) - are drawn as one: the host
+        // batch draws every member's instances (each with its own matrix, its frame-before pose from the member's instB and
+        // its colour), the members are left out. TF_NATIVE_TREEMERGE=first (the host is the group's first batch: the others
+        // drawn earlier than the game drew them), =last (its last: the others later), =0 off.
+        static const int treeMerge = [] {
+            const char *e = std::getenv("TF_NATIVE_TREEMERGE");
+            return !e || !*e ? 1 : *e == '0' ? 0 : std::strcmp(e, "last") == 0 ? 2 : 1;
+        }();
+        static std::vector<int32_t> mergeHost;                 // (a member's host, -1 none; the host itself: its own index)
+        static std::vector<std::vector<uint32_t>> mergeMembers; // (a host's members, in draw order, itself not among them)
+        static std::vector<float> mergeExtra;                   // (the host's members' instance entries, 52 floats each, lean)
+        mergeHost.assign(input.draws.size(), -1);
+        for (auto &mm : mergeMembers)
+            mm.clear();
+        if (mergeMembers.size() < input.draws.size())
+            mergeMembers.resize(input.draws.size());
+        if (treeMerge)
+        {
+            static const bool instOff = !speedupOn(std::getenv("TF_NATIVE_INSTANCING"));
+            auto keyOf = [&](const Draw &d) -> uint64_t {
+                const Qword *block = d.shader.blockOf(Routine::Instances);
+                if (instOff || !block || !d.mesh || d.cloud || d.meshB || layersoft::isLayer(d) || d.mesh->immediate || d.mesh->sprites ||
+                    block - d.shader.data.data() + 13 > static_cast<std::ptrdiff_t>(d.shader.data.size()))
+                    return 0u;
+                if (glow.found && glow.role[static_cast<size_t>(&d - input.draws.data())] != 0u)
+                    return 0u;
+                uint64_t k = treelog::hashOf(block, 12u * sizeof(Qword), d.mesh->id * 0x9E3779B97F4A7C15ull + 7u); // (q12.x: the batch's count)
+                const void *ptrs[5] = {d.mesh.get(), d.texture.get(), d.fogPalette.get(), d.topPalette.get(), nullptr};
+                k = treelog::hashOf(ptrs, sizeof(ptrs), k);
+                const uint64_t words[9] = {d.tex0, d.alpha, d.test, d.zbuf, d.tex1, d.clamp,
+                                           (static_cast<uint64_t>(d.target) << 32) | d.fbmsk, d.scanmsk,
+                                           (d.hasB ? 1u : 0u) | (d.turned ? 2u : 0u) | (d.sceneMotion ? 4u : 0u) | (static_cast<uint64_t>(d.camera) << 8)};
+                k = treelog::hashOf(words, sizeof(words), k);
+                const float places[8] = {d.originX, d.originY, d.width, d.height, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]};
+                k = treelog::hashOf(places, sizeof(places), k);
+                k = treelog::hashOf(d.shader.address, sizeof(d.shader.address), treelog::hashOf(&d.shader.count, sizeof(d.shader.count), k));
+                return k ? k : 1u;
+            };
+            auto same = [](const Draw &a, const Draw &b) {
+                // (the key's inputs compared for real: a hash collision never merges)
+                const Qword *ba = a.shader.blockOf(Routine::Instances), *bb = b.shader.blockOf(Routine::Instances);
+                return a.mesh == b.mesh && a.texture == b.texture && a.fogPalette == b.fogPalette && a.topPalette == b.topPalette &&
+                       a.tex0 == b.tex0 && a.alpha == b.alpha && a.test == b.test && a.zbuf == b.zbuf && a.tex1 == b.tex1 && a.clamp == b.clamp &&
+                       a.target == b.target && a.fbmsk == b.fbmsk && a.scanmsk == b.scanmsk && a.hasB == b.hasB && a.turned == b.turned &&
+                       a.sceneMotion == b.sceneMotion && a.camera == b.camera && a.originX == b.originX && a.originY == b.originY &&
+                       a.width == b.width && a.height == b.height && std::memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 &&
+                       a.shader.count == b.shader.count && std::memcmp(a.shader.address, b.shader.address, sizeof(a.shader.address)) == 0 &&
+                       std::memcmp(ba, bb, 12u * sizeof(Qword)) == 0;
+            };
+            std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+            for (uint32_t i = 0; i < input.draws.size(); ++i)
+                if (const uint64_t k = keyOf(input.draws[i]))
+                    groups[k].push_back(i);
+            for (auto &kv : groups)
+            {
+                std::vector<uint32_t> &list = kv.second;
+                if (list.size() < 2u)
+                    continue;
+                const uint32_t host = treeMerge == 2 ? list.back() : list.front();
+                mergeHost[host] = static_cast<int32_t>(host);
+                for (const uint32_t j : list)
+                    if (j != host && same(input.draws[host], input.draws[j]))
+                    {
+                        mergeHost[j] = static_cast<int32_t>(host);
+                        mergeMembers[host].push_back(j);
+                    }
+            }
+        }
         for (const Draw &draw : input.draws)
         {
+            if (treeMerge)
+            {
+                const size_t index = static_cast<size_t>(&draw - input.draws.data());
+                if (mergeHost[index] >= 0 && static_cast<size_t>(mergeHost[index]) != index)
+                {
+                    if (treeLog)
+                        treelog::win.mergedAway += 1.0;
+                    continue; // (drawn by its host)
+                }
+            }
+            if (treeLog)
+            {
+                const int cat = treelog::category(draw);
+                treeTurn(cat);
+                treelog::win.draws[cat] += 1.0;
+            }
             if (glow.found)
             {
                 const uint8_t role = glow.role[static_cast<size_t>(&draw - input.draws.data())];
@@ -3420,6 +3658,77 @@ namespace nr::frame
                 continue;
             g.passes.clear();
             buildPasses(draw, g.passes);
+            if (treeMerge)
+            {
+                // (TODO 376 A1: a host's members' instances after its own - the loop below draws them as one instanced draw)
+                const size_t index = static_cast<size_t>(&draw - input.draws.data());
+                mergeExtra.clear();
+                if (mergeHost[index] == static_cast<int32_t>(index))
+                {
+                    // (The lean way: each member's instances straight into the instance stream's form - its matrix, its
+                    // frame-before pose (the member's instB), the pose halfway (midPose, as buildPasses) and its colour -
+                    // with no Pass of ~1.5 KB built and copied per instance: that, not the batch, was the cost. Not for a
+                    // group whose alpha test fails RGB_ONLY (drawn in two parts, not instanced) or with instancing off:
+                    // then the members' full passes, drawn as the host's. TF_NATIVE_TREEMERGE_LEAN=0: always those.)
+                    static const bool instOnHere = speedupOn(std::getenv("TF_NATIVE_INSTANCING"));
+                    const bool ate = (draw.test & 1u) != 0u, afailRgb = ((draw.test >> 12) & 3u) == 3u;
+                    static const bool leanOff = std::getenv("TF_NATIVE_TREEMERGE_LEAN") && *std::getenv("TF_NATIVE_TREEMERGE_LEAN") == '0';
+                    if (!leanOff && instOnHere && !(ate && afailRgb))
+                    {
+                        static const bool linear = std::getenv("TF_POSES_LINEAR") && *std::getenv("TF_POSES_LINEAR") == '1';
+                        for (const uint32_t j : mergeMembers[index])
+                        {
+                            const Draw &md = input.draws[j];
+                            const Qword *block = md.shader.blockOf(Routine::Instances);
+                            const int32_t count = static_cast<int32_t>(md.shader.data.size()) - static_cast<int32_t>(block - md.shader.data.data());
+                            const int32_t instances = std::max(0, (count - 13) / 5);
+                            for (int32_t i = 0; i < instances; ++i)
+                            {
+                                float e[52];
+                                for (int r = 0; r < 4; ++r)
+                                    std::memcpy(e + 4 * r, block[14 + 5 * i + r].v, 16u);
+                                std::memcpy(e + 16, block[13 + 5 * i].v, 16u);
+                                if (md.instB.size() >= 16u * static_cast<size_t>(i + 1))
+                                    std::memcpy(e + 20, md.instB.data() + 16 * i, 64u);
+                                else
+                                    std::memcpy(e + 20, e, 64u);
+                                bool posed = true;
+                                if (linear)
+                                    for (int k = 0; k < 16; ++k)
+                                        e[36 + k] = 0.5f * (e[k] + e[20 + k]);
+                                else
+                                    posed = midPose(e + 20, e, e + 36);
+                                if (!posed)
+                                    std::memcpy(e + 20, e, 64u), std::memcpy(e + 36, e, 64u);
+                                mergeExtra.insert(mergeExtra.end(), e, e + 52);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (treeMerge == 2) // (the host last: the members' instances first, the game's order kept)
+                            g.passes.clear();
+                        for (const uint32_t j : mergeMembers[index])
+                            buildPasses(input.draws[j], g.passes);
+                        if (treeMerge == 2)
+                            buildPasses(draw, g.passes);
+                    }
+                }
+            }
+            if (treeLog && treeCat >= 0)
+            {
+                treelog::win.passes[treeCat] += static_cast<double>(g.passes.size());
+                if (treeCat == 0)
+                    treelog::restDraw(draw, g.passes.size());
+                bool clips = false;
+                for (const Pass &tp : g.passes)
+                {
+                    treelog::pass(treeCat, draw, tp);
+                    clips = clips || tp.clips;
+                }
+                if (treeCat == 2 && clips)
+                    treelog::win.clipping += 1.0;
+            }
             size_t passesDone = 0; // (the passes an instanced draw drew already)
             for (size_t passIndex = 0; passIndex < g.passes.size(); ++passIndex)
             {
@@ -4203,7 +4512,32 @@ namespace nr::frame
                                 break;
                             ++instCount;
                             passesDone = k + 1;
+                            if (treeLog && treeCat >= 0)
+                                treelog::win.merged[treeCat] += 1.0;
                         }
+                    // (TODO 376 A1) The merged members' instances, lean, once the host's own are all in.
+                    if (!mergeExtra.empty() && (passesDone == g.passes.size() || passIndex + 1 == g.passes.size()))
+                    {
+                        if (instOn && pass.mode[0] == 9.0f && !rgbOnlyFail && !clipGs)
+                        {
+                            const size_t n = mergeExtra.size() / 52u;
+                            for (size_t x = 0; x < n; ++x)
+                            {
+                                const float *e = mergeExtra.data() + 52u * x;
+                                if (!entry(e, e + 20, e + 36, e + 16))
+                                {
+                                    ++g_ringFull;
+                                    break;
+                                }
+                                ++instCount;
+                            }
+                            if (treeLog && treeCat >= 0)
+                                treelog::win.passes[treeCat] += static_cast<double>(n), treelog::win.merged[treeCat] += static_cast<double>(n);
+                        }
+                        else
+                            ++g_treeMergeDropped; // (not expected: the group was checked for this when its entries were made)
+                        mergeExtra.clear();
+                    }
                 }
                 // (TODO 99) A clipping draw's triangles wholly outside one of its planes (the clipping matrix's |x|, |y|, |z| <= w,
                 // in this frame's pose and the frame before's - the pictures between lie between) are left out here, on the CPU,
@@ -4669,6 +5003,8 @@ namespace nr::frame
                 }
             }
         }
+        if (treeLog)
+            treeTurn(-1), treelog::frameEnd(); // (TODO 376: the last draw's time, the frame's counts)
         predicate(false);
         // (Debug: a target saved beside the picture, TF_NATIVE_SAVE_TARGET=<key in hex>.)
         gfx::ReadbackId savedRead = 0;

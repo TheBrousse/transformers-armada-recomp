@@ -257,6 +257,9 @@ def sample_srcs(srcs, n, seed):
     return keep
 
 
+GPU_MIN_EDGE = 12  # (TODO 382: the smallest source side the upscaler makes a picture of; smaller: on the processor)
+
+
 def plan_jobs(srcs, model_override, alpha_mode, notes, requested_backend=None,
               quality=tier_rules.DEFAULT_QUALITY):
     by_sha = defaultdict(list)
@@ -280,6 +283,12 @@ def plan_jobs(srcs, model_override, alpha_mode, notes, requested_backend=None,
         if long_edge <= cfg.get("small_max", 0):
             model = cfg["small_model"]
         model = model_override or model
+        # (TODO 382) A source under GPU_MIN_EDGE texels on a side comes out of realesrgan-ncnn-vulkan black (both its
+        # networks; measured 4..10 px black, 12 px and up right, GTX 1080) - and a run that held one broke the next
+        # image in it and could lose the graphics card. Such textures are made on the processor, as the smallest UI
+        # ones are.
+        if min(w, h) < GPU_MIN_EDGE and not model.startswith("pil-"):
+            model = "pil-lanczos"
         backend = resolve_backend(model, requested_backend)
         if backend == "pil":
             passes = 0
@@ -325,10 +334,18 @@ def load_manifest(out_root):
     return recs
 
 
-def job_done(job, recs, out_root, settings, also_good=()):
+def job_done(job, recs, out_root, settings, also_good=(), mark_valid=None):
     r = recs.get(job.sha1)
     if not r:
         return False
+    # (TODO 382 (a)) A texture that stopped the upscaler on this card: left to the game's own image while the same
+    # driver and upscaler are there (mark_valid); another driver, another upscaler or F1 > Make HD textures tries it again.
+    # (TODO 382) A "no HD image" record holds only for the way it was tried: one made with another network (0.7.7 sent
+    # sources under 12 px to the graphics card, where they came out black; now the processor makes them) is made again.
+    if r.get("fallback") == "none" and r.get("model") != job.model:
+        return False
+    if r.get("fallback") == "none" and r.get("why_code") == STOPS_UPSCALER:
+        return r.get("settings") == settings and bool(mark_valid and mark_valid(r))
     # (TODO 241: a texture this card could not make well is left to the game's own image, not tried each run)
     if r.get("fallback") == "none" and r.get("settings") == settings:
         return True
@@ -569,14 +586,24 @@ def driver_resets_since(t0):
             return 1
     if os.name != "nt":
         return 0
+    return len(driver_reset_times(t0))
+
+
+def driver_reset_times(t0):
+    """(TODO 382) The times Windows logged graphics driver resets (event 4101) since t0, as its log gives them."""
+    if os.name != "nt":
+        return []
     since = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(max(0.0, t0)))
     query = f"*[System[(EventID=4101) and TimeCreated[@SystemTime>='{since}']]]"
     try:
         r = subprocess.run(["wevtutil", "qe", "System", "/q:" + query, "/c:20", "/f:text"],
                            capture_output=True, text=True, timeout=15, creationflags=0x08000000)
-        return r.stdout.count("Event[") if r.returncode == 0 else 0
+        if r.returncode != 0:
+            return []
+        times = re.findall(r"^\s*Date:\s*(\S+)", r.stdout, re.M)
+        return times or ["?"] * r.stdout.count("Event[")
     except (OSError, subprocess.SubprocessError):
-        return 0
+        return []
 
 
 def device_lost(err):
@@ -680,13 +707,22 @@ def job_priority(job):
     return min(tier_rules.priority_for(rp) for rp in job.relpaths)
 
 
+def staged_channels(job):
+    """The channels of the images a job hands the upscaler (stage_job): 4 for "direct" (RGBA), else 3 ("rgb", and
+    "split": its colour and its alpha as two RGB images)."""
+    return 4 if job.alpha_mode == "direct" else 3
+
+
 def make_batches(jobs, max_files, max_mp):
     """The jobs in the order they are made (the textures seen first, first), cut into batches of one
     (backend, model, passes) each: at most max_files images and max_mp megapixels of output."""
-    order = sorted(jobs, key=lambda j: (job_priority(j), j.backend, j.model, j.passes, j.relpaths[0]))
+    # (TODO 382) Never 3- and 4-channel images in one upscaler run: realesrgan-ncnn-vulkan given an RGB and an RGBA
+    # image together breaks the RGBA one (noise or nothing) and can lose the graphics card ("vkQueueSubmit failed -4"),
+    # measured on a GTX 1080 with the pair after count 416 that stopped two players' sets. Each alone is fine.
+    order = sorted(jobs, key=lambda j: (job_priority(j), j.backend, j.model, j.passes, staged_channels(j), j.relpaths[0]))
     batches, cur, key, mp = [], [], None, 0.0
     for j in order:
-        k = (j.backend, j.model, j.passes)
+        k = (j.backend, j.model, j.passes, staged_channels(j))
         jmp = j.out_w * j.out_h / 1e6
         if cur and (k != key or len(cur) >= max_files or mp + jmp > max_mp):
             batches.append(cur)
@@ -773,7 +809,74 @@ CARD_BROKEN_EXIT = 3
 # set is NOT finished (make_hd_textures.ps1 leaves it unfinished, so the next run - the game's start, an update, F1 -
 # carries on); 0.6.9 marked such a set done with two thirds of it missing.
 STOPPED_BY_RESETS_EXIT = 5
+# (TODO 382, public issue #32) A card whose driver is reset at every run: each start of the game cost a minute of black
+# screens for nothing (525 of 1707 for good). The runs stopped by resets are counted, one after another, in
+# hd_textures/.reset_runs.json with the graphics driver's version; after RESET_RUNS_LIMIT of them no run tries again
+# by itself (the set's state "resets_stopped": the game shows it and starts no maker for it); F1 > Make HD textures
+# (--retry-resets) tries again, and so does a new graphics driver (its version differs) or a run that makes images
+# without a reset (the count back to 0).
+STOPS_UPSCALER = "stops_upscaler"  # (TODO 382 (a): a no-HD-image record's why_code: the one image that stopped it)
+RESET_RUNS_NAME = ".reset_runs.json"
+RESET_RUNS_LIMIT = 3
+RESETS_GAVE_UP_EXIT = 6  # (that state found at the start: nothing tried, said quietly - the message came once already)
+RESET_PAUSE_S = 15.0  # (after a reset: the driver back first; the game's own picture too)
+GAME_START_WAIT_S = 30.0  # (made beside a game that has just started: its start is the card's busiest moment)
+# (TODO 382) Graphics driver versions known to stop the upscaler, as Windows writes them (Win32_VideoController's
+# DriverVersion, e.g. NVIDIA 582.66 = 32.0.15.8266) -> a short note for the message. Only confirmed ones go here.
+KNOWN_BAD_DRIVERS = {}
+
+
+def known_bad_driver(versions):
+    for v in (versions or "").split(";"):
+        note = KNOWN_BAD_DRIVERS.get(v.strip())
+        if note:
+            return note
+    return ""
 PROBE_N = 4
+
+
+def driver_versions():
+    """The graphics cards' driver versions, as Windows has them ("" when they cannot be told)."""
+    fake = os.environ.get("TF_HD_FAKE_DRIVER")
+    if fake is not None:
+        return fake
+    if os.name != "nt":
+        return ""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "(Get-CimInstance Win32_VideoController | ForEach-Object { $_.DriverVersion }) -join '; '"],
+                           capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def upscaler_identity(exe):
+    """(TODO 382 (a)) Which upscaler program this is (its file's SHA-1, short): a mark made with another is tried again."""
+    try:
+        return hashlib.sha1(Path(exe).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+def load_reset_runs(path, driver):
+    """How many runs in a row the driver's resets stopped, for this driver (0 for another: a new driver starts over),
+    and why the last one stopped ("driver_reset" / "device_lost", "" when not known)."""
+    rr = read_json(path, {}, "the count of runs stopped by driver resets (.reset_runs.json)")
+    if not isinstance(rr, dict) or str(rr.get("driver", "")) != driver:
+        return 0, ""
+    reason = str(rr.get("reason", ""))
+    try:
+        return max(0, int(rr.get("runs", 0))), reason
+    except (TypeError, ValueError):
+        return 0, reason
+
+
+def save_reset_runs(path, runs, driver, reason=""):
+    try:
+        write_json(path, {"runs": runs, "driver": driver, "reason": reason, "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    except OSError:
+        pass
 
 
 def _src_stats(path):
@@ -789,8 +892,9 @@ def _src_stats(path):
 
 def pick_probe_jobs(jobs, n=PROBE_N):
     """A few small textures with plenty in them (bright and varied: what a broken upscale cannot pass), of the
-    network most of the run uses."""
-    cands = [j for j in jobs if j.backend == "ncnn" and j.passes >= 1 and j.alpha_mode in ("rgb", "direct")
+    network most of the run uses. (TODO 382: opaque ones only - one upscaler run never mixes 3- and 4-channel
+    images, which breaks the 4-channel ones; that read as a broken card before.)"""
+    cands = [j for j in jobs if j.backend == "ncnn" and j.passes >= 1 and j.alpha_mode == "rgb"
              and j.srcs[0].w * j.srcs[0].h >= 32 * 32]
     if not cands:
         return []
@@ -1651,6 +1755,9 @@ def main():
                          "Also on when hd_options.json says \"gentle\": true")
     ap.add_argument("--no-wait-for-game", action="store_true",
                     help="never wait while the game runs")
+    ap.add_argument("--retry-resets", action="store_true",
+                    help=f"(TODO 382) try again on a card whose driver resets stopped {RESET_RUNS_LIMIT} runs in a row "
+                         f"(F1 > Make HD textures); without it such a set is not tried again by itself")
     ap.add_argument("--game-pid", type=int, default=0,
                     help="(TODO 267) made only while this game process runs: gently beside it, never waiting for it; "
                          "when it ends the upscale stops (exit 4) and the next start carries on")
@@ -1720,8 +1827,24 @@ def main():
         shrink_larger(jobs, recs, args.out, args.out.parent / "upscaled_precolour", args.src, settings, also_good,
                       mc=mc0, status=lambda i, n, left="": print(f"HD textures: adjusting to the preset, {i} of {n} shrunk{left}",
                                                                  flush=True))
+    # (TODO 382 (a)) A mark is kept for this driver and this upscaler only; F1 > Make HD textures (--retry-resets) clears
+    # them (a quality preset of its own is another settings hash: tried again too).
+    driver = driver_versions()
+    upscaler_id = upscaler_identity(args.exe)
+    marks_kept = 0
+
+    def mark_valid(r):
+        nonlocal marks_kept
+        ok = not args.retry_resets and r.get("driver") == driver and r.get("upscaler") == upscaler_id
+        marks_kept += 1 if ok else 0
+        return ok
+
     todo = [j for j in jobs
-            if args.force or not job_done(j, recs, args.out, settings, also_good)]
+            if args.force or not job_done(j, recs, args.out, settings, also_good, mark_valid)]
+    if marks_kept:
+        print(f"note: {marks_kept} texture{'s' if marks_kept != 1 else ''} that stopped the upscaler on this graphics card "
+              f"before keep{'' if marks_kept != 1 else 's'} the game's own look (F1 > Graphics > Make HD textures tries "
+              f"{'them' if marks_kept != 1 else 'it'} again; so does a new graphics driver)", flush=True)
     print(f"to do: {len(todo)} uniques ({len(jobs) - len(todo)} already done)")
 
     hd_dir = args.hd_dir or args.out.parent
@@ -1770,6 +1893,22 @@ def main():
                 args.tile = TILE_STEPS[0]
                 print(f"note: the upscaler works in pieces of {args.tile} pixels on this graphics card ({card}): "
                       f"bigger ones can take longer than Windows allows and reset its driver", flush=True)
+
+    # (TODO 382) A card whose driver resets stopped the last runs one after another: not tried again by itself.
+    reset_runs_path = hd_dir / RESET_RUNS_NAME
+    reset_runs, last_reason = load_reset_runs(reset_runs_path, driver) if todo else (0, "")
+    # (said as it was: a reset Windows logged, or the upscaler losing its card with no reset logged)
+    stopped_by = ("the upscaler lost its graphics card on this graphics driver (no driver reset was logged)"
+                  if last_reason == "device_lost" else "the graphics driver was reset")
+    if todo and reset_runs >= RESET_RUNS_LIMIT and not args.retry_resets:
+        write_status(status_path, state="resets_stopped", done=done_before, total=total, quality=args.quality,
+                     stop_reason=last_reason or "driver_reset", driver=driver)
+        print(f"note: not tried again: {stopped_by} in each of the last {reset_runs} runs, even with "
+              f"the smallest pieces ({done_before} of {total} made, and used). F1 > Graphics > Make HD textures tries "
+              f"again; so does the next run after a graphics driver update.", flush=True)
+        sys.exit(RESETS_GAVE_UP_EXIT)
+    if args.retry_resets and reset_runs:
+        print(f"note: trying again after {reset_runs} runs stopped on the graphics card (F1)", flush=True)
 
     needs_exe = any(j.backend == "ncnn" for j in todo)
     if needs_exe and not args.exe.is_file():
@@ -1832,6 +1971,7 @@ def main():
     probed = [False]
     card_broken = [False]
     stopped_by_resets = [False]
+    reset_signs = []  # (TODO 382: what showed each reset - "event" (Windows' 4101) or "upscaler" (its own words only))
     batch_bad = [False]
     had_images = set_has_images(args.out)
 
@@ -1971,6 +2111,130 @@ def main():
         def should_stop():
             return game_running(lock) and not read_options(options_path).get("while_playing")
 
+        # (TODO 382) Beside a game that has just started (made while playing, or beside it): its start - the window, the
+        # renderer's shaders, the first level - is the card's busiest moment, and a player's card was reset in the
+        # first minute of every run. The first batch waits until the game has run GAME_START_WAIT_S.
+        if lock is not None and game_running(lock) and (args.game_pid or read_options(options_path).get("while_playing")):
+            try:
+                left = GAME_START_WAIT_S - (time.time() - lock.stat().st_ctime)
+            except OSError:
+                left = 0.0
+            if left > 0:
+                # (the game shows "starting in a moment" meanwhile - no counter standing still)
+                status("starting", done_before)
+                print(f"note: the game has just started: the upscale begins in {left:.0f} s", flush=True)
+                time.sleep(left)
+                status("working", done_before)
+
+        def stop_signs(t0, err, jobs_in):
+            """(TODO 289, 382) Whether the upscaler's run since t0 stopped on its graphics card: Windows' event 4101 in
+            its time, or the upscaler's own words (its card lost). Returns the signs said (empty: it did not)."""
+            events = driver_resets_since(t0 - 2.0)
+            lost = device_lost(err)
+            # (tests, TODO 382: TF_HD_FAKE_LOST=n - the n-th run of the upscaler "said" its card was lost;
+            # TF_HD_FAKE_LOST_IMAGE=<text> - every run with an image whose path holds that text does)
+            fake_lost = os.environ.get("TF_HD_FAKE_LOST", "")
+            if fake_lost.isdigit():
+                main.lost_asked = getattr(main, "lost_asked", 0) + 1
+                if main.lost_asked == int(fake_lost):
+                    lost, err = True, (err or "") + "\n[0 NVIDIA GeForce (test)]  vkQueueSubmit failed -4"
+            fake_image = os.environ.get("TF_HD_FAKE_LOST_IMAGE", "")
+            if fake_image and any(fake_image in rp for j in jobs_in for rp in j.relpaths):
+                lost, err = True, (err or "") + "\n[0 NVIDIA GeForce (test)]  vkQueueSubmit failed -4"
+            signs = []
+            if events:
+                times = driver_reset_times(t0 - 2.0)
+                signs.append(f"Windows' graphics driver reset (event 4101 at {', '.join(times) if times else 'a time in this run'}, "
+                             f"while the upscaler ran)")
+            if lost:
+                said = next((x.strip() for x in reversed(err.splitlines()) if device_lost(x)), "")
+                signs.append(f"the upscaler's own words: {said[:160]}")
+            if signs:
+                reset_signs.append("event" if events else "upscaler")
+            return signs
+
+        def note_gpu(err):
+            """(TODO 382 (b)) The card the upscaler picked, as it names it, said once."""
+            if gpu_name[0]:
+                return
+            gpus = parse_gpus(err)
+            if gpus:
+                pick = args.gpu or 0
+                gpu_name[0] = gpus.get(pick, next(iter(gpus.values())))
+                print(f"note: the upscaler's graphics card: [{pick} {gpu_name[0]}]", flush=True)
+
+        marked = []  # (TODO 382 (a): the textures marked in this run: they stopped the upscaler by themselves)
+
+        def bump_done():
+            nonlocal done
+            done += 1
+
+        def isolate(staged, model, passes, tile, gpu, gentle):
+            """(TODO 382 (a)) A batch stopped the upscaler even in the smallest pieces: its images one at a time. One that
+            stops it again is marked (no HD image: the game's own look, named) and the others are made. Returns False
+            when the first two images alone stopped it too, or no image could be made and the set has none: the card, not one image - the run
+            stops as before. None: the game started meanwhile (the rest of the batch again later)."""
+            print(f"note: this batch's {len(staged)} images one at a time, to find the one that stops the upscaler", flush=True)
+            time.sleep(RESET_PAUSE_S)
+            # (the card made images: in this run, or the set has some already - a run that only tries a marked image
+            # again, F1's, marks it again instead of taking the card for broken)
+            made_one = (done - len(marked)) > 0 or had_images
+            failed, finished = [], []
+            for job in staged:
+                sdir = args.work / f"single_{job.sha1}"
+                shutil.rmtree(sdir, ignore_errors=True)
+                (sdir / "in").mkdir(parents=True)
+                try:
+                    stage_job(job, sdir / "in")
+                except Exception as e:  # noqa: BLE001
+                    errors.append((job.srcs[0].relpath, f"stage: {e}"))
+                    continue
+                cur1, signs1 = sdir / "in", []
+                for i in range(1, passes + 1):
+                    nxt1 = sdir / f"p{i}"
+                    nxt1.mkdir()
+                    t1 = time.time()
+                    _rc, err1, stopped1 = run_binary(args.exe, cur1, nxt1, model, tile, gpu,
+                                                     stop=game_gone if args.game_pid else (None if gentle else should_stop),
+                                                     gentle=gentle or gentle_card)
+                    if stopped1:  # (the batch again later, without the images made meanwhile)
+                        shutil.rmtree(sdir, ignore_errors=True)
+                        batches[bi] = [j for j in staged if j not in finished]
+                        return None
+                    signs1 = stop_signs(t1, err1, [job])
+                    if signs1:
+                        break
+                    cur1 = nxt1
+                if signs1:
+                    shutil.rmtree(sdir, ignore_errors=True)
+                    failed.append(job)
+                    print(f"note: {job.srcs[0].relpath} alone stopped the upscaler too ({'; '.join(signs1)})", flush=True)
+                    if len(failed) >= 2 and not finished:
+                        return False  # (the first two alone stopped it too: the card, not one image)
+                    time.sleep(RESET_PAUSE_S)
+                    continue
+                made_one = True
+                finished.append(job)
+                finish_batch([job], cur1, sdir)
+            if not made_one:
+                return False
+            for job in failed:
+                rec = no_image_record(job, settings, "it stopped the upscaler on this graphics card, by itself")
+                rec.update({"why_code": STOPS_UPSCALER, "driver": driver, "upscaler": upscaler_id, "gpu": gpu_name[0]})
+                for rp in job.relpaths:  # (an older image of it goes too: the game's own is drawn)
+                    for path in (args.out / rp, backup_root / rp):
+                        if path.is_file():
+                            path.unlink()
+                    if ledger is not None:
+                        ledger.pop(rp, None)
+                mf.write(json.dumps(rec) + "\n")
+                mf.flush()
+                marked.append(job)
+                bump_done()
+                print(f"note: no HD image for {job.srcs[0].relpath}: it stops the upscaler on this graphics card, so it "
+                      f"keeps the game's own look; the rest of the set is made", flush=True)
+            return True
+
         batches = make_batches(todo, max(1, args.batch_files), max(1.0, args.batch_mp))
         bi = 0
         while bi < len(batches):
@@ -2004,6 +2268,7 @@ def main():
                                                  skip=({"plain"} | tried) if again else ())
                 if gpus and not gpu_name[0]:
                     gpu_name[0] = gpus.get(args.gpu or 0, next(iter(gpus.values())))
+                    print(f"note: the upscaler's graphics card: [{args.gpu or 0} {gpu_name[0]}]", flush=True)  # (TODO 382 (b))
                 if isinstance(got, dict):
                     setup[0] = got
                     tried.add(got["what"])
@@ -2053,16 +2318,17 @@ def main():
                     rc, err, stopped = run_binary(args.exe, cur, nxt, model, tile, gpu,
                                                   stop=game_gone if args.game_pid else (None if gentle else should_stop),
                                                   gentle=gentle or gentle_card)
-                    if not gpu_name[0]:
-                        gpus = parse_gpus(err)
-                        if gpus:
-                            gpu_name[0] = gpus.get(args.gpu or 0, next(iter(gpus.values())))
+                    note_gpu(err)
                     if rc != 0 and not stopped:
                         tail = err.strip().splitlines()[-3:]
                         print("  stderr: " + " | ".join(tail), file=sys.stderr)
                     # (TODO 289) The graphics driver reset while this ran (Windows' event 4101), or the upscaler lost
                     # its card: smaller pieces from now on, and this batch made again with them.
-                    if not stopped and (driver_resets_since(t0 - 2.0) or device_lost(err)):
+                    # (TODO 382) Which sign it was, said: Windows' event 4101 in this run's time (its time), or only the
+                    # upscaler's own words (its card lost: no reset Windows logged - a player saw none, on a new driver).
+                    signs = stop_signs(t0, err, staged) if not stopped else []
+                    if signs:
+                        print(f"note: the upscale stopped on its graphics card: {'; '.join(signs)}", flush=True)
                         reset = True
                         break
                 else:  # onnx-dml
@@ -2087,8 +2353,23 @@ def main():
                 was = tile or 0
                 smaller = next((s for s in TILE_STEPS if was == 0 or s < was), None)
                 if smaller is None:
-                    print("note: the graphics driver was reset even with the smallest pieces: no more HD textures are "
-                          "made on this card in this run (what is made is kept; the next run carries on)", flush=True)
+                    # (TODO 382 (a)) First the batch's images one at a time: one image that stops the upscaler is
+                    # marked and the rest made; only a card that makes nothing at all ends the run.
+                    if pending:
+                        pending.result()
+                        pending = None
+                    if len(staged) >= 1:
+                        alone = isolate(staged, model, passes, tile, gpu, gentle)
+                        if alone is None:  # (the game started: this batch again, once it may)
+                            continue
+                        if alone:
+                            status("working", done_before + done)
+                            bi += 1
+                            continue
+                    print(f"note: the upscale stopped on the graphics card even with the smallest pieces "
+                          f"({'a graphics driver reset' if reset_signs[-1:] == ['event'] else 'the upscaler lost its card, no reset in Windows log'}): "
+                          "no more HD textures are made on this card in this run (what is made is kept; the next run carries on) "
+                          f"({'the game was running' if game_running(lock) else 'the game was not running'})", flush=True)
                     status("working", done_before + done)
                     stopped_by_resets[0] = True
                     break
@@ -2096,9 +2377,10 @@ def main():
                 if setup[0]:
                     setup[0]["tile"] = smaller
                 save_tile(tile_path, smaller, f"a graphics driver reset with pieces of {was or 'auto'}")
-                print(f"note: the graphics driver was reset during the upscale (Windows' event 4101): pieces of {smaller} "
-                      f"pixels from now on, and this batch made again", flush=True)
-                time.sleep(5.0)  # (the driver back first)
+                print(f"note: the upscale stopped on the graphics card: pieces of {smaller} "
+                      f"pixels from now on, and this batch made again ({'the game was running' if game_running(lock) else 'the game was not running'})",
+                      flush=True)
+                time.sleep(RESET_PAUSE_S)  # (the driver back first; TODO 382: 15 s, was 5)
                 continue
             if pending:
                 pending.result()
@@ -2169,10 +2451,40 @@ def main():
         sys.exit(CARD_BROKEN_EXIT)
     if stopped_by_resets[0]:
         # (the images left are made by the next run: the set stays "working", never "upscaled" / "done")
-        status("working", done_before + done)
-        print(f"upscaled {done}/{len(todo)} uniques: stopped after graphics driver resets; the next run carries on "
-              f"({done_before + done} of {total} made)", flush=True)
+        # (TODO 382: counted; after RESET_RUNS_LIMIT runs in a row, "resets_stopped": not tried again by itself)
+        # (TODO 382) Said as it was: a graphics driver reset Windows logged, or only the upscaler losing its card on this
+        # driver (no reset logged: the player sees none - another driver version is then the thing to try).
+        reason = "driver_reset" if "event" in reset_signs else "device_lost"
+        # (TODO 382 (a)) Only runs that made no image count toward giving up: one that made some carried the set on.
+        reset_runs = reset_runs + 1 if done - len(marked) == 0 else 0
+        save_reset_runs(reset_runs_path, reset_runs, driver, reason)
+        what = ("graphics driver resets" if reason == "driver_reset" else
+                f"the upscaler losing its graphics card on this driver ({gpu_name[0] or card_names() or 'the card'}, driver "
+                f"{driver or 'unknown'}; no driver reset in Windows' log - another driver version may help)")
+        bad = known_bad_driver(driver)
+        if bad:
+            what += f"; this driver is known to do it: {bad}"
+        if reset_runs >= RESET_RUNS_LIMIT:
+            write_status(status_path, state="resets_stopped", done=done_before + done, total=total, quality=args.quality,
+                         stop_reason=reason, driver=driver)
+            print(f"upscaled {done}/{len(todo)} uniques: stopped by {what}, in {reset_runs} runs in a row now: no more "
+                  f"tries by themselves ({done_before + done} of {total} made, and used). F1 > Graphics > Make HD textures "
+                  f"tries again; so does the next run after a graphics driver change.", flush=True)
+        else:
+            write_status(status_path, state="working", done=done_before + done, total=total, quality=args.quality,
+                         stop_reason=reason, driver=driver)
+            print(f"upscaled {done}/{len(todo)} uniques: stopped by {what}; the next run carries on "
+                  f"({done_before + done} of {total} made; runs stopped so in a row: {reset_runs} of {RESET_RUNS_LIMIT})",
+                  flush=True)
         sys.exit(STOPPED_BY_RESETS_EXIT)
+    if done and reset_runs:
+        save_reset_runs(reset_runs_path, 0, driver)  # (TODO 382: images made without a reset: the count starts over)
+    if marked:
+        n = len(marked)
+        print(f"warning: {n} texture{'s' if n != 1 else ''} could not be made on this graphics card and keep"
+              f"{'' if n != 1 else 's'} {'their' if n != 1 else 'its'} original look: "
+              f"{', '.join(j.srcs[0].relpath for j in marked[:5])}{' ...' if n > 5 else ''} (F1 > Graphics > Make HD "
+              f"textures tries again; so does a new graphics driver)", flush=True)
     status("upscaled" if not errors else "upscaled_with_errors", done_before + done)
     total_outputs = sum(len(j.relpaths) for j in todo) - len(errors)
     print(f"upscaled {done}/{len(todo)} uniques -> ~{total_outputs} files, "

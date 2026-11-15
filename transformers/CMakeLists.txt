@@ -458,6 +458,30 @@ if(MSVC AND TF_LTCG)
         set_property(TARGET ps2_runtime APPEND PROPERTY STATIC_LIBRARY_OPTIONS $<$<CONFIG:RelWithDebInfo>:/LTCG>)
     endif()
 endif()
+# (linkflags, 2026-11-15, the Shinobi study's B6) The game itself (not the launcher) linked with /OPT:REF: RelWithDebInfo's
+# /DEBUG leaves it off, so code and data nothing uses stayed in the image. (Its /INCREMENTAL never took effect here:
+# /FORCE:MULTIPLE above turns incremental linking off - LNK4075 - so a player's update relinks in full either way;
+# /INCREMENTAL:NO only says so.) /OPT:NOICF on purpose: identical-code folding gives several guest functions one host
+# body (144 such groups, 7 of them holding addresses our overrides name), and code here compares function pointers.
+# The Testbench at Unlimited: the game thread 1.3-3.5% faster, the exe 1.4 MB smaller, the same pictures; the link no
+# slower (.165 3.8-3.9 s, the ThinkPad 4.7-5.6 s against 5.4-7.6 s), its peak about 170 MB higher (1.3 GB).
+# -DTF_LINK_INCREMENTAL=ON: the link as before (A/B). TF_LTCG keeps its own link flags. -DTF_LINK_MAP=ON (tools): the
+# linker's map, and transformers/tools/check_icf_folding.py run on it after the link - the build fails if an override
+# target shares its body with another function (for a later change that turns folding on).
+option(TF_LINK_INCREMENTAL "Link the game incrementally (RelWithDebInfo's own default) instead of /INCREMENTAL:NO /OPT:REF /OPT:NOICF" OFF)
+option(TF_LINK_MAP "Write the game's linker map and check it for folded override targets (tools/check_icf_folding.py)" OFF)
+if(MSVC AND NOT TF_LTCG AND NOT TF_LINK_INCREMENTAL)
+    target_link_options(TransformersRecomp PRIVATE "$<$<CONFIG:RelWithDebInfo>:/INCREMENTAL:NO;/OPT:REF;/OPT:NOICF>")
+endif()
+if(MSVC AND TF_LINK_MAP)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    target_link_options(TransformersRecomp PRIVATE "/MAP:$<TARGET_FILE_DIR:TransformersRecomp>/TransformersRecomp.map")
+    add_custom_command(TARGET TransformersRecomp POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/transformers/tools/check_icf_folding.py"
+                "$<TARGET_FILE_DIR:TransformersRecomp>/TransformersRecomp.map" "${CMAKE_SOURCE_DIR}"
+        COMMENT "Checking the game's linker map for folded override targets"
+        VERBATIM)
+endif()
 ps2x_stage_ffmpeg_runtime_dlls(TransformersRecomp)
 
 # (TODO 299, the temporal upscaler) AMD's FidelityFX SDK: the API's headers are vendored (native_render/ext/fidelityfx, MIT);

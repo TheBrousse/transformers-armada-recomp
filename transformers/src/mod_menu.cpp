@@ -3008,6 +3008,17 @@ namespace mod_menu
                 {
                     const ImVec2 he = f.heading->CalcTextSizeA(size * 0.55f, FLT_MAX, 0.0f, hd.c_str());
                     dl->AddText(f.heading, size * 0.55f, ImVec2(w - pad - he.x, lineY), colour("blue"), hd.c_str());
+                    // (TODO 382, tests: TF_HD_LINE_LOG=1 - the line's width beside the room right of the title, once a line)
+                    static const bool lineLog = std::getenv("TF_HD_LINE_LOG") && *std::getenv("TF_HD_LINE_LOG") == '1';
+                    static std::string logged;
+                    if (lineLog && logged != hd)
+                    {
+                        logged = hd;
+                        std::string one = hd;
+                        std::replace(one.begin(), one.end(), '\n', '|');
+                        std::fprintf(stderr, "[hd line] %.0f x %.0f px, room right of the title %.0f px (window %.0f x %.0f): %s\n", he.x, he.y,
+                                     (w - pad) - (pad + titleExtent.x), w, h, one.c_str());
+                    }
                 }
             }
             const float headerBottom = pad * 0.6f + titleExtent.y + size * 1.3f;

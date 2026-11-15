@@ -18,6 +18,7 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h> // (TODO 380: the adapter's free video memory, for the upscaler's room)
 #ifndef _WINDOWS
 #define _WINDOWS // (ffx_api_loader.h: the Windows loader)
 #endif
@@ -202,7 +203,18 @@ namespace nr::taa
         static ffxContext context = nullptr;
         static unsigned madeRW = 0, madeRH = 0, madeOW = 0, madeOH = 0;
         static bool failed = false, madeInfinite = true;
-        if (context && (renderWidth > madeRW || renderHeight > madeRH || outputWidth != madeOW || outputHeight != madeOH || camera.infinite != madeInfinite))
+        // (TODO 380) Made once with room - twice the height it is first asked for, the size a field buffer's whole height
+        // would need - and given the real sizes each frame (the dispatch's renderSize / upscaleSize, at most the context's):
+        // a picture that grows within that room no longer rebuilds the context mid-play (120-160 ms on the 7900 XTX at
+        // 3440 x 1440). Rebuilt only past the room (a larger window), or for the depth's kind. TF_TAA_ROOM=0: made for the
+        // sizes asked and rebuilt when they change, as before.
+        // (The room costs video memory - 278 MB more on the RX 5700 XT at 3456 x 1440 - so it is made only when the card has
+        // 2 GB of its budget free when the context is made; else the exact sizes, as before. TF_TAA_ROOM=1: always.)
+        static const char *roomEnv = std::getenv("TF_TAA_ROOM");
+        static const bool roomOff = roomEnv && *roomEnv == '0', roomForced = roomEnv && *roomEnv == '1';
+        static bool roomMade = false; // (the context in use was made with the room)
+        if (context && (renderWidth > madeRW || renderHeight > madeRH || outputWidth > madeOW || outputHeight > madeOH ||
+                        (!roomMade && (outputWidth != madeOW || outputHeight != madeOH)) || camera.infinite != madeInfinite))
         {
             f->DestroyContext(&context, nullptr);
             context = nullptr;
@@ -227,8 +239,30 @@ namespace nr::taa
                 create.flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
             if (std::getenv("TF_TAA_FSRDEBUG"))
                 create.flags |= FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION; // (TF_TAA_FSRDEBUG=1: the SDK's own debug view in the output)
-            create.maxRenderSize = {renderWidth, renderHeight};
-            create.maxUpscaleSize = {outputWidth, outputHeight};
+            // (the adapter's budget less what is in use, the card's own memory - as the renderer's other budget checks)
+            uint64_t freeBytes = 0;
+            {
+                IDXGIFactory4 *factory = nullptr;
+                IDXGIAdapter3 *adapter = nullptr;
+                if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+                {
+                    factory->EnumAdapterByLuid(static_cast<ID3D12Device *>(device)->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+                    factory->Release();
+                }
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) && info.Budget > info.CurrentUsage)
+                    freeBytes = info.Budget - info.CurrentUsage;
+                if (adapter)
+                    adapter->Release();
+            }
+            const bool roomWanted = roomForced || (!roomOff && freeBytes >= (2ull << 30));
+            const unsigned room = roomWanted ? 2u : 1u;
+            roomMade = room > 1u;
+            std::fprintf(stderr, "[taa] the upscaler's room: %s (%llu MB of the card's video memory free)\n",
+                         roomOff ? "off (TF_TAA_ROOM=0)" : roomForced ? "on (TF_TAA_ROOM=1)" : roomMade ? "on" : "off (under 2 GB free)",
+                         static_cast<unsigned long long>(freeBytes >> 20));
+            create.maxRenderSize = {renderWidth, renderHeight * room};
+            create.maxUpscaleSize = {outputWidth, outputHeight * room};
             const ffxReturnCode_t made = f->CreateContext(&context, &create.header, nullptr);
             if (made != FFX_API_RETURN_OK || !context)
             {
@@ -237,14 +271,35 @@ namespace nr::taa
                 failed = true;
                 return false;
             }
-            madeRW = renderWidth, madeRH = renderHeight, madeOW = outputWidth, madeOH = outputHeight, madeInfinite = camera.infinite;
+            madeRW = renderWidth, madeRH = renderHeight * room, madeOW = outputWidth, madeOH = outputHeight * room, madeInfinite = camera.infinite;
             ffxQueryGetProviderVersion provider{};
             provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
             f->Query(&context, &provider.header);
-            std::fprintf(stderr, "[taa] temporal upscaler: %s, %ux%u -> %ux%u%s; depth near %.4g far %.4g%s, fov %.1f deg, %.4g m a unit\n",
+            std::fprintf(stderr, "[taa] temporal upscaler: %s, %ux%u -> %ux%u%s (room to %ux%u); depth near %.4g far %.4g%s, fov %.1f deg, %.4g m a unit\n",
                          provider.versionName ? provider.versionName : "?", renderWidth, renderHeight, outputWidth, outputHeight,
-                         renderWidth == outputWidth ? " (native AA)" : "", camera.nearZ, camera.farZ, camera.infinite ? " (infinite)" : "",
+                         renderWidth == outputWidth ? " (native AA)" : "", madeOW, madeOH, camera.nearZ, camera.farZ, camera.infinite ? " (infinite)" : "",
                          camera.fovY * 57.2958f, camera.metersPerUnit);
+            // (TODO 380: what the room costs - the SDK's own count of the context's video memory, and what the same picture
+            // would take made without the room; with TF_TAA_LOG only, a measuring aid)
+            if (std::getenv("TF_TAA_LOG"))
+            {
+                FfxApiEffectMemoryUsage used{}, without{};
+                ffxQueryDescUpscaleGetGPUMemoryUsage usage{};
+                usage.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+                usage.gpuMemoryUsageUpscaler = &used;
+                const bool haveUsed = f->Query(&context, &usage.header) == FFX_API_RETURN_OK;
+                ffxQueryDescUpscaleGetGPUMemoryUsageV2 usage2{};
+                usage2.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2;
+                usage2.device = device;
+                usage2.maxRenderSize = {renderWidth, renderHeight};
+                usage2.maxUpscaleSize = {outputWidth, outputHeight};
+                usage2.flags = create.flags;
+                usage2.gpuMemoryUsageUpscaler = &without;
+                const bool haveWithout = f->Query(nullptr, &usage2.header) == FFX_API_RETURN_OK;
+                std::fprintf(stderr, "[taa] the upscaler's video memory: %s MB made (room %u), %s MB for the picture alone\n",
+                             haveUsed ? std::to_string(used.totalUsageInBytes >> 20).c_str() : "?", room,
+                             haveWithout ? std::to_string(without.totalUsageInBytes >> 20).c_str() : "?");
+            }
         }
         ffxDispatchDescUpscale d{};
         d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;

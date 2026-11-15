@@ -115,15 +115,8 @@ function Use-Python([string]$Exe) {
 # Fonts improve prompts, but must not prevent an otherwise playable install or its mods.
 function Invoke-OptionalFonts([string]$Python, [string]$Port) {
     try {
-        Invoke-Probe { & $Python -c "import numpy" } | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "`n==> Installing numpy (button prompts and fonts)" -ForegroundColor Cyan
-            $eap = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            try { & $Python -m pip install --user numpy 2>&1 | ForEach-Object { "$_" } }
-            finally { $ErrorActionPreference = $eap }
-            if ($LASTEXITCODE -ne 0) { throw "pip install numpy failed" }
-        }
+        # (TODO 382: numpy checked and installed by make_hd_textures.ps1 -FontsOnly itself, each with a time limit - never
+        # here, where a stuck import or pip would hold the setup or the update for good)
         & (Join-Path $Port "tools\make_hd_textures.ps1") -FontsOnly -Python $Python
         if (-not $?) { throw "making the fonts failed" }
     } catch {

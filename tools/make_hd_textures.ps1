@@ -42,6 +42,7 @@
 param([switch]$SkipUpscale, [switch]$CrispFontsOnly, [switch]$FontsOnly, [string]$Python = "python",
       [ValidateSet("", "fast", "balanced", "best")][string]$Quality = "",
       [switch]$Resume, [int]$GamePid = 0, [switch]$Verify, [switch]$Remake,
+      [switch]$RetryResets,  # (TODO 382) F1 > Make HD textures: tried again on a card whose driver resets stopped the last runs
       [switch]$Gentle)  # (TODO 310) easy on the graphics card (or "gentle": true in hd_options.json): rests, about three times as slow
 
 $ErrorActionPreference = "Stop"
@@ -80,6 +81,64 @@ if ($Resume) {
         Write-Host "You can close this window at any time: it carries on the next time you start the game."
     }
 }
+# (TODO 382) In a console window of its own (the game's small window), QuickEdit off: with it, a click in the window
+# selects text and Windows holds the program at its next line of output until a key is pressed - it looks stuck. Only
+# when this script is alone in its console (never a terminal the player opened himself, which keeps its own setting).
+try {
+    Add-Type -Namespace TfHd -Name Con -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr h, uint m);
+[DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] list, uint count);
+'@ -ErrorAction Stop
+    if ([TfHd.Con]::GetConsoleWindow() -ne [IntPtr]::Zero -and [TfHd.Con]::GetConsoleProcessList((New-Object uint32[] 8), 8) -eq 1) {
+        $h = [TfHd.Con]::GetStdHandle(-10)   # (the console's input)
+        $m = 0
+        if ([TfHd.Con]::GetConsoleMode($h, [ref]$m) -and ($m -band 0x40)) {
+            [void][TfHd.Con]::SetConsoleMode($h, (($m -band (-bnot 0x40)) -bor 0x80))   # (QuickEdit off, ENABLE_EXTENDED_FLAGS)
+        }
+    }
+} catch {}
+# (TODO 382) The small window's own log (the game starts it; the setup and the update have theirs): logs\hd_textures.log
+# in the install folder (hd_textures\hd_textures.log before the install layout), the run before as hd_textures_prev.log.
+# And in every run, the graphics cards with their driver versions, for a report.
+if ($Resume -or $Verify) {
+    try {
+        $logDir = Get-LayoutLogsDir $Root
+        if (-not $logDir) { $logDir = $Out; New-Item -ItemType Directory -Force $logDir | Out-Null }
+        $makerLog = Join-Path $logDir "hd_textures.log"
+        if (Test-Path -LiteralPath $makerLog) { Move-Item -LiteralPath $makerLog -Destination (Join-Path $logDir "hd_textures_prev.log") -Force }
+        Start-Transcript -Path $makerLog -Force | Out-Null
+    } catch {}
+}
+try {
+    $cards = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" })
+    if ($cards) { Write-Host "Graphics: $($cards -join '; ')"; Write-StepLog "hd: graphics: $($cards -join '; ')" }
+} catch {}
+# (TODO 382 (b)) Each card's own video memory (the driver's record) and how much is in use now (Windows' GPU counters,
+# by class name: the same on every Windows language): a card short of memory - the game open beside the upscaler -
+# shows here.
+try {
+    $mem = @()
+    foreach ($k in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+        if (-not $p -or -not $p.DriverDesc) { continue }
+        $bytes = 0
+        if ($p.'HardwareInformation.qwMemorySize') { $bytes = [uint64]$p.'HardwareInformation.qwMemorySize' }
+        elseif ($p.'HardwareInformation.MemorySize' -is [byte[]]) { $bytes = [BitConverter]::ToUInt32($p.'HardwareInformation.MemorySize', 0) }
+        elseif ($p.'HardwareInformation.MemorySize') { $bytes = [uint64]$p.'HardwareInformation.MemorySize' }
+        if ($bytes -gt 0) { $mem += "$($p.DriverDesc) $([int64]($bytes / 1MB)) MB" }
+    }
+    $used = @()
+    try {
+        $used = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory -ErrorAction Stop |
+            ForEach-Object { [int64]($_.DedicatedUsage / 1MB) } | Sort-Object -Descending)
+    } catch {}
+    $memLine = "video memory: $(if ($mem) { $mem -join '; ' } else { 'not read' }); in use now: " +
+        $(if ($used) { "$($used[0]) MB (the busiest card)" } else { "not read" })
+    Write-Host "  ($memLine)"; Write-StepLog "hd: $memLine"
+} catch {}
 # (TODO 267) Beside the game (-GamePid): never waiting for it; the upscale stops when it ends.
 $withGame = if ($GamePid -gt 0) { @("--game-pid", "$GamePid") } else { @() }
 # (TODO 371) Windows 11's Smart App Control refusing the upscaler (realesrgan-ncnn-vulkan.exe, downloaded) or a Python
@@ -136,6 +195,8 @@ function SetStatus([string]$State) {
         try {
             $old = Get-Content $StatusFile -Raw | ConvertFrom-Json; $st.done = $old.done; $st.total = $old.total
             if ($old.gpu) { $st.gpu = $old.gpu }
+            # (TODO 382: why the upscale stopped on the card, kept while the set stays unfinished)
+            if ($State -ne "done" -and $old.stop_reason) { $st.stop_reason = $old.stop_reason; $st.driver = $old.driver }
         } catch {}
     }
     $st.updated = (Get-Date).ToUniversalTime().ToString("s")
@@ -180,24 +241,130 @@ function Run([string]$Exe, [string[]]$Arguments) {
     }
 }
 
-# (TODO 186) numpy, which the sharp fonts need, installed when it is missing; $LASTEXITCODE 0 when it is there.
-function EnsureNumpy {
-    & $Python -c "import numpy" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Step "Installing numpy (Python), for the sharp fonts"
-        & $Python -m pip install --user numpy 2>&1 | ForEach-Object { "$_" }
-        & $Python -c "import numpy" 2>$null
+# (TODO 382) A step that must never hold the setup for good: the program run as a child of this script, its output
+# shown as it comes, and after -Seconds that child - only it, the process this function started, by its handle and its
+# start time - ended. Returns its exit code, or $null when the limit ended it. -Hang (tests, TF_HD_TEST_HANG): the
+# program replaced by a Python that only sleeps, to drive the limit.
+function Format-WinArg([string]$a) {
+    # (one argument as CreateProcess's command line reads it back: quoted when it holds a space or a quote,
+    # backslashes before a quote doubled; Windows PowerShell's .NET has no ArgumentList)
+    if ($a -ne "" -and $a -notmatch '[\s"]') { return $a }
+    $s = '"'; $bs = 0
+    foreach ($c in $a.ToCharArray()) {
+        if ($c -eq '\') { $bs++; continue }
+        if ($c -eq '"') { $s += ('\' * ($bs * 2 + 1)) + '"' } else { $s += ('\' * $bs) + $c }
+        $bs = 0
     }
+    $s + ('\' * ($bs * 2)) + '"'
+}
+function Invoke-Limited([string]$Exe, [string[]]$Arguments, [int]$Seconds, [switch]$Quiet, [switch]$Hang) {
+    if ($Hang) { $Arguments = @("-c", "import time; time.sleep(100000)") }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = (@($Arguments | ForEach-Object { Format-WinArg "$_" }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    $seen = New-Object System.Collections.Generic.List[string]
+    try {
+        try { [void]$p.Start() } catch { $b = Find-SmartAppBlock "$_"; if ($b) { throw $b }; throw }
+        $started = $p.StartTime
+        # (both outputs read line by line as they come, without PowerShell events - those wait for the script)
+        $readers = @($p.StandardOutput, $p.StandardError)
+        $tasks = @($readers[0].ReadLineAsync(), $readers[1].ReadLineAsync())
+        $open = @($true, $true)
+        $until = (Get-Date).AddSeconds($Seconds)
+        while ($open[0] -or $open[1] -or -not $p.HasExited) {
+            $got = $false
+            for ($k = 0; $k -lt 2; $k++) {
+                if ($open[$k] -and $tasks[$k].IsCompleted) {
+                    $line = $tasks[$k].Result
+                    if ($null -eq $line) { $open[$k] = $false } else { $seen.Add($line); if (-not $Quiet) { Write-Host $line }; $tasks[$k] = $readers[$k].ReadLineAsync() }
+                    $got = $true
+                }
+            }
+            if ((Get-Date) -ge $until) {
+                # (ended already - a child of its own still holding the output open: its code counts)
+                if ($p.HasExited) { $script:LimitedLines = $seen; return $p.ExitCode }
+                # (still the process started above: its handle is held, so its id cannot have gone to another)
+                if (-not $p.HasExited -and $p.StartTime -eq $started) { try { $p.Kill() } catch {} }
+                [void]$p.WaitForExit(10000)
+                $script:LimitedLines = $seen
+                return $null
+            }
+            if (-not $got) { Start-Sleep -Milliseconds 50 }
+        }
+        $p.WaitForExit()
+        $script:LimitedLines = $seen
+        return $p.ExitCode
+    } finally {
+        $p.Dispose()
+    }
+}# (the limits, in seconds; TF_HD_LIMIT_<NAME> for tests)
+function Limit([string]$Name, [int]$Default) {
+    $v = [Environment]::GetEnvironmentVariable("TF_HD_LIMIT_$Name")
+    if ($v -match '^\d+$') { return [int]$v } else { return $Default }
+}
+function Hangs([string]$Name) { return ($env:TF_HD_TEST_HANG -split ',') -contains $Name }
+# A limit as words: "15 minutes", "2 minutes", "20 seconds".
+function Format-Limit([int]$Seconds) {
+    if ($Seconds -ge 60 -and $Seconds % 60 -eq 0) { $m = $Seconds / 60; return "$m minute$(if ($m -ne 1) { 's' })" }
+    return "$Seconds second$(if ($Seconds -ne 1) { 's' })"
+}
+
+# (TODO 186) numpy, which the sharp fonts need, installed when it is missing; $true when it is there.
+# (TODO 382) Neither the import check (2 min) nor pip (15 min) may hold the setup for good. A limit that ended it is
+# said here, in full ($script:NumpyWarned): the caller then adds no second warning.
+$script:NumpyWarned = $false
+function EnsureNumpy {
+    $limit = Limit "NUMPY" 120
+    $code = Invoke-Limited $Python @("-c", "import numpy") $limit -Quiet -Hang:(Hangs "numpy")
+    if ($null -eq $code) {
+        Write-Host "`nwarning: Python took over $(Format-Limit $limit) just to load numpy (an antivirus checking it, most likely); the sharp text and PS5 button symbols are left for the next run." -ForegroundColor Yellow
+        Write-StepLog "hd: numpy's import stopped after its time limit"
+        $script:NumpyWarned = $true
+        return $false
+    }
+    if ($code -eq 0) { return $true }
+    Step "Installing numpy (Python), for the sharp fonts"
+    $limit = Limit "PIP" 900
+    $code = Invoke-Limited $Python @("-m", "pip", "install", "--user", "numpy") $limit -Hang:(Hangs "pip")
+    if ($null -eq $code) {
+        Write-Host "`nwarning: installing numpy took over $(Format-Limit $limit) and was stopped; the sharp text and PS5 button symbols are left for the next run." -ForegroundColor Yellow
+        $script:NumpyWarned = $true
+        Write-StepLog "hd: pip install numpy stopped after its time limit"
+        return $false
+    }
+    $code = Invoke-Limited $Python @("-c", "import numpy") (Limit "NUMPY" 120) -Quiet
+    return ($code -eq 0)
+}
+# (TODO 382) Python's, numpy's and Pillow's versions in the window and the step log, once a run: what a report needs.
+$script:VersionsWritten = $false
+function Write-PythonVersions {
+    if ($script:VersionsWritten) { return }
+    $script:VersionsWritten = $true
+    $code = Invoke-Limited $Python @("-c", "import sys, numpy, PIL; print('Python %s, numpy %s, Pillow %s' % (sys.version.split()[0], numpy.__version__, PIL.__version__))") (Limit "NUMPY" 120) -Quiet
+    $v = if ($code -eq 0 -and $script:LimitedLines.Count) { $script:LimitedLines[$script:LimitedLines.Count - 1] } else { "Python's versions not read" }
+    Write-Host "  ($v)"
+    Write-StepLog "hd: $v"
 }
 
 # Only FONTS from TFA2.ZIP: no other archives, downloads or GPU upscale.
 if ($FontsOnly) {
     try {
-        $ErrorActionPreference = "Continue"
-        EnsureNumpy
-        $ErrorActionPreference = "Stop"
-        if ($LASTEXITCODE -ne 0) { throw "Python's numpy could not be installed (pip install numpy)" }
-        Run $Python @((Join-Path $Py "make_fonts_only.py"), "--game", $Game, "--out", $Out, "--controls", (Join-Path $Root "controls.txt"))
+        if (-not (EnsureNumpy)) {
+            if ($script:NumpyWarned) { return }  # (its time limit, already said)
+            throw "Python's numpy could not be installed or loaded (pip install numpy)"
+        }
+        Write-PythonVersions
+        # (TODO 382: never longer than 15 minutes; it takes about a minute)
+        $limit = Limit "FONTS" 900
+        $code = Invoke-Limited $Python @((Join-Path $Py "make_fonts_only.py"), "--game", $Game, "--out", $Out, "--controls", (Join-Path $Root "controls.txt")) $limit -Hang:(Hangs "fonts")
+        if ($null -eq $code) { throw "making them took over $(Format-Limit $limit) and was stopped (it is tried again next time)" }
+        if ($code -ne 0) { $b = Find-SmartAppBlock ($script:LimitedLines -join "`n"); if ($b) { throw $b }; throw "make_fonts_only.py failed with exit code $code" }
     } catch {
         Write-Host "`nwarning: $($_.Exception.Message): the button prompts and sharp fonts are not made; continuing with the game's own fonts." -ForegroundColor Yellow
     }
@@ -314,20 +481,42 @@ function CrispFonts {
     #    game's Display settings "Sharp text" / "Button symbols" choose among them. Needs numpy; a minute.
     # (TODO 186: numpy installed here when it is missing - setup.ps1 never installed it, so an install made
     # without it never had the sharp text: the game showed the old letters)
-    $ErrorActionPreference = "Continue"
-    EnsureNumpy
-    $ErrorActionPreference = "Stop"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "`nwarning: Python's numpy could not be installed (pip install numpy): the sharp text and PS5 button symbols are not made." -ForegroundColor Yellow
+    if (-not (EnsureNumpy)) {
+        if (-not $script:NumpyWarned) {  # (a time limit is already said)
+            Write-Host "`nwarning: Python's numpy could not be installed or loaded (pip install numpy): the sharp text and PS5 button symbols are not made." -ForegroundColor Yellow
+        }
         return
     }
+    Write-PythonVersions
     Step "Making the sharp fonts and PS5 button symbols into $(Join-Path $Out 'crisp_fonts')"
     $a = @((Join-Path $Py "make_crisp_fonts.py"), "--archives", $archives, "--converted", $converted, "--out", (Join-Path $Out "crisp_fonts"))
     $up = Join-Path $Out "upscaled"
     if (Test-Path $up) { $a += @("--upscaled", $up) }
     $controls = Join-Path $Root "controls.txt"  # (the keyboard layout: the key prompts' keys)
     if (Test-Path $controls) { $a += @("--controls", $controls) }
-    Run $Python $a
+    # (TODO 382, public issue #32: a player's maker stopped at this step on every run - it comes first while no
+    # manifest is there. It takes about a minute; after 15 it is ended, said plainly, and the HD textures go on. No
+    # manifest is written then, so the next run tries again.)
+    $limit = Limit "FONTS" 900
+    $code = Invoke-Limited $Python $a $limit -Hang:(Hangs "fonts")
+    if ($null -eq $code) {
+        Write-Host ("`nwarning: making the sharp text and PS5 button symbols took over $(Format-Limit $limit) and was stopped. The game " +
+            "keeps its own text and button symbols for now; it is tried again the next time the HD textures are made. " +
+            "If this happens every time, please tell us (the logs folder's update.log or setup.log).") -ForegroundColor Yellow
+        Write-StepLog "hd: the sharp fonts stopped after their time limit"
+        return
+    }
+    if ($code -ne 0) {
+        $b = Find-SmartAppBlock ($script:LimitedLines -join "`n"); if ($b) { throw $b }  # (TODO 371)
+        # (TODO 382: a failed fonts step is not the end of the HD textures: said plainly, its last lines kept for a report)
+        $tail = @($script:LimitedLines | Select-Object -Last 6)
+        Write-Host ("`nwarning: making the sharp text and PS5 button symbols failed (exit code $code). The game keeps its own " +
+            "text and button symbols for now; it is tried again the next time the HD textures are made.") -ForegroundColor Yellow
+        if ($tail) { Write-Host "  its last lines:"; $tail | ForEach-Object { Write-Host "    $_" } }
+        Write-StepLog "hd: the sharp fonts failed (exit code $code): $($tail -join ' | ')"
+        return
+    }
+    Write-StepLog "hd: the sharp fonts made"
 }
 
 if ($CrispFontsOnly) { CrispFonts; return }
@@ -381,21 +570,49 @@ $ErrorActionPreference = "Continue"
 # (TODO 219) In batches, the textures seen first made first, each colour-matched as it is made; it waits while the
 # game runs (unless hd_options.json says to carry on) and says "HD textures: N of M made" after each batch.
 & $Python (Join-Path $Py "upscale_textures.py") $converted --out (Join-Path $Out "upscaled") `
-    --work (Join-Path $Out "work") --exe $exe --quality $Quality --match-colour @withGame @(if ($Gentle) { "--gentle" }) 2>&1 | ForEach-Object {
+    --work (Join-Path $Out "work") --exe $exe --quality $Quality --match-colour @withGame @(if ($Gentle) { "--gentle" }) @(if ($RetryResets) { "--retry-resets" }) 2>&1 | ForEach-Object {
         $l = "$_"
         if ($l.StartsWith("HD textures: ")) { Write-StepLog "hd:     $l"; HdTitle $l }   # (TODO 310: the batch it was at)
         elseif ($l -match '^paused while the game runs \((.*)\)') { HdTitle "HD textures: waiting for the game to close ($($Matches[1]))" }
         elseif ($l -eq "the game closed: carrying on") { HdTitle "HD textures: being made now" }
+        # (TODO 382) The card the upscaler picked, an image marked because it stops the upscaler, and the run's count
+        # of them: in the step log too
+        elseif ($l -match "^note: the upscaler's graphics card|^note: no HD image for|^warning: \d+ textures? could not be made|^note: the upscale stopped") { Write-StepLog "hd: $l" }
         $l
     } | Tee-Object -Variable lines | Out-Host
 $code = $LASTEXITCODE
+# (TODO 382) The upscaler's exit code and, when it did not end well, its last lines - in the step log too, for a report
+if ($code -ne 0 -and $code -ne 6) {  # (6: nothing was tried; its note above says why)
+    $tail = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -notmatch 'DeprecationWarning|getdata' } | Select-Object -Last 8)
+    Write-Host "  (the upscaler ended with exit code $code; its last lines:)"; $tail | ForEach-Object { Write-Host "    $_" }
+    Write-StepLog "hd: the upscaler ended with exit code ${code}: $($tail -join ' | ')"
+}
+# (TODO 382) Exit 6: this card's driver was reset in each of the last runs: nothing tried (the upscaler set the state
+# "resets_stopped", the game shows it); said once already, so quietly - no colour match, no fonts, no window held.
+if ($code -eq 6) {
+    # (said as it was: a reset Windows logged, or the upscaler losing its card with no reset logged)
+    $lost = $false
+    try { $lost = ("$((Get-Content $StatusFile -Raw | ConvertFrom-Json).stop_reason)" -eq "device_lost") } catch {}
+    if ($lost) {
+        Write-StepLog "hd: not tried again: the upscaler lost its graphics card in the last runs, no driver reset logged (F1 > Make HD textures tries again)"
+        HdTitle "HD textures: stopped - the upscaler stops on this graphics driver"
+    }
+    else {
+        Write-StepLog "hd: not tried again: graphics driver resets in the last runs (F1 > Make HD textures tries again)"
+        HdTitle "HD textures: stopped - the graphics driver was reset in every run"
+    }
+    exit 0
+}
 # (TODO 267) Exit 4: the game closed and the upscale stopped with it - the rest waits for the next start.
 if ($code -eq 4) { exit 0 }
 # (0.7.0) Exit 5: the graphics driver was reset even with the smallest pieces, so this run stopped with images left.
 # The set stays unfinished (never "done"): the next run - the game's next start, an update, F1 - carries on.
 $stoppedByResets = ($code -eq 5)
 if ($stoppedByResets) {
-    Write-Host "`nwarning: the graphics driver was reset while the HD textures were made, even in the smallest pieces:" -ForegroundColor Yellow
+    # (TODO 382: as it was - a driver reset Windows logged, or only the upscaler losing its card on this driver)
+    $why = "the graphics driver was reset while the HD textures were made"
+    try { if ((Get-Content $StatusFile -Raw | ConvertFrom-Json).stop_reason -eq "device_lost") { $why = "the upscaler lost its graphics card on this graphics driver (no driver reset was logged)" } } catch {}
+    Write-Host "`nwarning: $why, even in the smallest pieces:" -ForegroundColor Yellow
     Write-Host "this run stopped with some left to make. What is made is kept and used; the rest is made the next time." -ForegroundColor Yellow
     $code = 0
 }
@@ -433,14 +650,40 @@ else { Step "Matching the upscaled images' colour to the game's textures" }
 # (--only-new: the images matched as they were made are not measured again)
 Run $Python @((Join-Path $Py "match_colour.py"), "--upscaled", (Join-Path $Out "upscaled"), "--native", $converted, "--only-new")
 CrispFonts
-SetStatus $(if ($cardBroken) { "card_broken" } elseif ($stoppedByResets) { "working" } else { "done" })
+# (TODO 382) "resets_stopped": the upscaler gave up on this card after runs in a row stopped by resets - kept as it says
+$resetsGaveUp = $false; $stopReason = ""
+if ($stoppedByResets) {
+    try { $sj = Get-Content $StatusFile -Raw | ConvertFrom-Json; $resetsGaveUp = ($sj.state -eq "resets_stopped"); $stopReason = "$($sj.stop_reason)" } catch {}
+}
+# (TODO 382) What it was, in the words the player can check: a reset Windows logged (the screen goes black), or only the
+# upscaler losing its card on this graphics driver (nothing to see: another driver version is the thing to try).
+$stopWhat = if ($stopReason -eq "device_lost") { "the upscaler lost its graphics card on this graphics driver (no driver reset was logged; another driver version may help)" } else { "the graphics driver was reset during the upscale" }
+SetStatus $(if ($cardBroken) { "card_broken" } elseif ($resetsGaveUp) { "resets_stopped" } elseif ($stoppedByResets) { "working" } else { "done" })
 Write-Host "`nDone. Start the game from this folder (Play.bat): the log says '[native render] upscaled textures: N images'." -ForegroundColor Green
 # (TODO 352) The small window: a done message the player sees - shown again (not taking the focus) and left up a while.
 # (Not after a run the graphics driver's resets stopped with images left: that set is not ready.)
 if ($stoppedByResets) { HdTitle "HD textures: not finished - the next start of the game carries on" }
-if ($Resume -and -not $Verify -and -not $cardBroken -and -not $stoppedByResets) {
-    HdTitle "HD textures: ready - start the game to use them"
-    Write-Host "`nThe HD textures are ready. Start the game again to use them." -ForegroundColor Green
+Write-StepLog ("hd: the run ended: " + $(if ($cardBroken) { "nothing made on this card (broken images)" } elseif ($stoppedByResets) { "not finished (graphics driver resets)" } else { "ready" }))
+# (TODO 382) The small window, after a run the graphics driver's resets stopped: said, and held open like the done
+# message (it closed at once before, and looked like a crash at the last line shown - the sharp fonts).
+$heldReason = if ($Resume -and -not $Verify -and $stoppedByResets) { "not finished" } else { "" }
+if ($heldReason -and $resetsGaveUp) {
+    HdTitle "HD textures: stopped - the graphics driver was reset in every run"
+    Write-Host ("`nThe HD textures are not made further on this PC: in each of the last runs $stopWhat, even with the " +
+        "smallest pieces. What is made is used, with the game's own textures for the rest, and no run tries again by " +
+        "itself. F1 > Graphics > Make HD textures tries again (after a graphics driver change, the next start does). If " +
+        "you tell us, please attach logs\hd_textures.log from the install folder.") -ForegroundColor Yellow
+}
+elseif ($heldReason) {
+    Write-Host ("`nThe HD textures are not finished: $stopWhat. What is made is used; " +
+        "the rest is made the next time you start the game. If this happens every time, please tell us and attach " +
+        "logs\hd_textures.log from the install folder.") -ForegroundColor Yellow
+}
+if ($Resume -and -not $Verify -and -not $cardBroken -and ($heldReason -or -not $stoppedByResets)) {
+    if (-not $heldReason) {
+        HdTitle "HD textures: ready - start the game to use them"
+        Write-Host "`nThe HD textures are ready. Start the game again to use them." -ForegroundColor Green
+    }
     try {
         if (-not ("TfHd.TfHdWindow" -as [type])) {
             Add-Type -Namespace TfHd -Name TfHdWindow -MemberDefinition @'

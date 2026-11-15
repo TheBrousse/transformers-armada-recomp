@@ -1,5 +1,40 @@
 # What's new
 
+## 0.7.8
+
+**Fixed**
+- On a processor without SSE4.1 (older than 2008) the game now says so in a message instead of closing without a
+  word, and the setup says it before the long build.
+- The native renderer uses less video memory in some levels (about 150 MB less in the Amazon and Antarctica at
+  3440 x 1440).
+- With a frame rate cap of 240 (or 144 and other capped rates), a short heavy moment no longer drops the frame rate
+  by a third for half a minute. A few slow frames used to make the game step far down and stay there; now it steps
+  down only as far as the game needs.
+- Updates are quicker: every update set the game's build up again from scratch (deleting what the last build had
+  configured), on most PCs, even when nothing about it had changed. It now keeps it, as it was meant to.
+- Far 3D and Very far 3D (and Full 3D) no longer stutter when you turn into thick forest. The game could make a few
+  hundred trees 3D in a single frame; now it makes at most 32 a frame, nearest first, so the rest follow over the next
+  frames. Trees right at the edge of the tree distance also switch between flat and 3D less often when you move
+  a little.
+- The HD textures' small window no longer closes without a word when the upscaler stops on the graphics card: it says
+  what happened and stays open, and it writes logs\hd_textures.log (with the graphics card and its driver version) to
+  attach to a report. A failed or very slow sharp-text step, or Python's numpy, no longer stops the HD textures; the
+  sharp text is tried again next time. Clicking inside the window no longer pauses it. Thanks to a7xshayne-lgtm.
+- HD textures that stopped at the same count every time (416 of 1707, 525 of 1707 and similar) now finish. The upscaler
+  turns textures smaller than 12 pixels black and, on some graphics cards, then loses the card for the rest of its
+  batch; those few textures are now made without the graphics card. If one texture still stops the upscaler, it keeps
+  its original look and the rest of the set is made.
+- On a graphics card whose upscaler stops in every run, the game no longer tries again at each start for nothing:
+  after three runs in a row that made nothing on the same driver it stops trying, and the F1 menu says so (what was
+  made stays in use). F1 > Graphics > Make HD textures tries again, and so does a new graphics driver.
+- With FSR (Upscaler: FSR 3 / 4) the game could freeze for a moment about 20 seconds into a level, as FSR
+  restarted itself for a larger picture; it no longer restarts.
+
+**Changed**
+- The game runs a little faster: about 1 to 3 percent less processor time per frame.
+- Thick forest at the higher tree distances (Trees: Far 3D and beyond) costs the processor less: the 3D trees are now
+  drawn in far fewer batches. Slower processors and laptops gain the most.
+
 ## 0.7.7
 
 **New**

@@ -124,7 +124,8 @@ step "Upscaling into $out/upscaled (resumable, preset: $quality)"
 log=$(mktemp "$out/upscale-log.XXXXXX")
 trap 'rm -f "$log"' EXIT
 set +e
-"$python" "$py/upscale_textures.py" "$converted" --out "$out/upscaled" --work "$out/work" --exe "$exe" --quality "$quality" 2>&1 | tee "$log"
+# (TODO 382: a run of this script is always one asked for: it tries again on a card whose driver resets stopped the last runs)
+"$python" "$py/upscale_textures.py" "$converted" --out "$out/upscaled" --work "$out/work" --exe "$exe" --quality "$quality" --retry-resets 2>&1 | tee "$log"
 status=("${PIPESTATUS[@]}")
 set -e
 code=${status[0]}
@@ -133,7 +134,7 @@ code=${status[0]}
 # What is made is kept and used; the set is not marked done, and running this again carries on.
 stopped_by_resets=0
 if [ "$code" -eq 5 ]; then
-    echo 'warning: the graphics driver was reset while the HD textures were made, even in the smallest pieces: this run stopped with some left to make; running this again carries on.' >&2
+    echo 'warning: the upscaler stopped on the graphics card (a driver reset, or it lost the card) while the HD textures were made, even in the smallest pieces: this run stopped with some left to make; running this again carries on.' >&2
     stopped_by_resets=1
     code=0
 fi

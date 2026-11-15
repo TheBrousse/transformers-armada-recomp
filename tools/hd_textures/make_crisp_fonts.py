@@ -818,9 +818,15 @@ def main():
         h, w = native.shape[:2]
         W, H = w * SCALE, h * SCALE
         ups = find_file(args.upscaled, rel_dir, atlas, [".png"]) if args.upscaled else None
+        base = None
         if ups:
-            base = to_float(Image.open(ups).convert("RGBA").resize((W, H), Image.LANCZOS))
-        else:
+            # (TODO 382: an upscaled atlas left unreadable - an upscale stopped by a graphics driver reset - is not the
+            # end of the fonts: the game's own atlas is the base instead, and the upscaler makes that image again)
+            try:
+                base = to_float(Image.open(ups).convert("RGBA").resize((W, H), Image.LANCZOS))
+            except (OSError, ValueError, SyntaxError) as e:
+                print(f"{atlas}: the upscaled image could not be read ({e}): the game's own is used", flush=True)
+        if base is None:
             base = to_float(Image.open(src).convert("RGBA").resize((W, H), Image.BICUBIC))
 
         has_keys = any(c in BUTTONS.get(f, {}) or c in ARROWS.get(f, {}) for f, glyphs in fonts for c, v in glyphs)

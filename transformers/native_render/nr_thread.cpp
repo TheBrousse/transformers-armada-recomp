@@ -2487,7 +2487,9 @@ namespace nr
 
     void recycleFrameBuffers(Frame &frame)
     {
-        constexpr size_t kKeep = 3; // (frames in flight: the one being read, one drawn, one waiting)
+        // (frames in flight: the one being read, one drawn, one waiting - and, TODO 383, the list read's expanded vector
+        // taken from the same kept ones and the capture's given back: one more)
+        constexpr size_t kKeep = 4;
         if (frame.vuChunks.capacity() > 0)
         {
             frame.vuChunks.clear();
@@ -2521,6 +2523,38 @@ namespace nr
         };
         take(g_spareDraws, draws);
         take(g_spareLists, list);
+    }
+
+    // (TF_NATIVE_KEEPDRAWS=0: a fresh vector for each frame's expanded draws, as before - the A/B of TODO 383's faults)
+    bool keepDraws()
+    {
+        static const bool on = !(std::getenv("TF_NATIVE_KEEPDRAWS") && *std::getenv("TF_NATIVE_KEEPDRAWS") == '0');
+        return on;
+    }
+
+    void takeSpareDraws(std::vector<Draw> &draws)
+    {
+        if (!keepDraws())
+            return;
+        std::lock_guard<std::mutex> lock(g_spareMutex);
+        if (g_spareDraws.empty() || draws.capacity() > 0)
+            return;
+        auto best = g_spareDraws.begin();
+        for (auto it = g_spareDraws.begin(); it != g_spareDraws.end(); ++it)
+            if (it->capacity() > best->capacity())
+                best = it;
+        draws = std::move(*best);
+        g_spareDraws.erase(best);
+    }
+
+    void giveSpareDraws(std::vector<Draw> &&draws)
+    {
+        if (draws.capacity() == 0 || !keepDraws())
+            return;
+        draws.clear(); // (the draws' meshes and textures let go of here, on the calling thread)
+        std::lock_guard<std::mutex> lock(g_spareMutex);
+        if (g_spareDraws.size() < 4u)
+            g_spareDraws.push_back(std::move(draws));
     }
 
     void takeChunkBuffer(std::vector<uint32_t> &chunks)

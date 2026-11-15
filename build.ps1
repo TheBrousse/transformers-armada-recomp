@@ -73,6 +73,9 @@ $Build = Join-Path $Root $(if ($Public) { "out\build-public" } else { "out\build
 if ($BuildDir) { $Build = Join-Path $Root "out\$BuildDir" } # (-BuildDir: an A/B build beside the played one)
 $ToolsBuild = Join-Path $Root "out\tools"
 $Tools = Join-Path $Root "transformers\tools"
+# (cpucheck) The processor first: the game needs SSE4.1 (2008 or newer) - said now, not after the long build
+# (transformers\tools\cpu_check.py: numpy's own cpuid table; when it cannot tell, the game's own check at its start stands).
+try { & python (Join-Path $Tools "cpu_check.py"); if ($LASTEXITCODE -eq 3) { exit 3 } } catch { }
 
 # --- The release being built: USA (SLUS-20668, transformers\config\) or another one with its own
 # config (transformers\config\versions\<serial>\). TF_GAME_VERSION when set; else the release whose
@@ -427,7 +430,8 @@ function Get-GeneratorArgs([string]$Dir) {
     $norm = { param($p) ("$p" -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
     $cache = Join-Path $Dir "CMakeCache.txt"
     if (Test-Path -LiteralPath $cache) {
-        $m = Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.*)$' | Select-Object -First 1
+        # (TODO 381: any type - CMake keeps the -D we pass as UNINITIALIZED, with backslashes; one it set itself is INTERNAL)
+        $m = Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR_INSTANCE(?::[A-Za-z]+)?=(.*)$' | Select-Object -First 1
         $was = if ($m) { & $norm $m.Matches[0].Groups[1].Value } else { "" }
         if ($was -and @($vs | Where-Object { (& $norm $_.Path) -eq $was })) { return $a }
         Write-Host "  (the build folder $(Split-Path $Dir -Leaf) was set up with a Visual Studio without the C++ tools: setting it up again)" -ForegroundColor Yellow

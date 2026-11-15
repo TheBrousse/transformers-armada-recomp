@@ -30,6 +30,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -65,8 +66,18 @@ namespace nr
             uint32_t held[4] = {};
             int64_t lastRefresh = 0, refreshCount = 0, lastVbNs = 0; // (refreshCount: the refreshes counted since the watch began)
             std::chrono::steady_clock::time_point since{};
+            // (TODO 377, TF_PACING_HIST=1, a test aid: the pictures over 8.3 ms with their time since the first picture -
+            // for the slow pictures' classes and whether they come at a beat or at events)
+            std::vector<std::pair<double, double>> slow;
+            int64_t firstNs = 0;
         };
         Pacing g_pacing;
+
+        bool pacingHistOn()
+        {
+            static const bool on = std::getenv("TF_PACING_HIST") && *std::getenv("TF_PACING_HIST") == '1';
+            return on;
+        }
 
         // (TODO 291) The shown pictures' intervals of the last 30 s, for the fps line's 1% low (nr::pictureLowRate): what
         // the player sees. Before, the line's 1% low came from the game's frames, which the game's own wait for a VBlank
@@ -149,6 +160,28 @@ namespace nr
                          worstMean > 0.0 ? 1000.0 / worstMean : 0.0, lo, hi, p.repeats, p.unshown, pace::takeCapDrops(), gate.pictures, gate.heldMs, gate.slicesMs, rAvg, rSd, sAvg, sSd,
                          sLo, sHi, hz,
                          !known ? "unknown" : ps2_host_display::screenVariable() ? "on" : "off", cadence, turn);
+            if (pacingHistOn() && !b.empty())
+            {
+                // (b is sorted: the counts over each frame time, and the 0.1% low next to the 1% low)
+                const auto over = [&](double ms) { return static_cast<size_t>(b.end() - std::upper_bound(b.begin(), b.end(), ms)); };
+                const size_t w01 = std::min(b.size(), std::max<size_t>(1u, b.size() / 1000u));
+                double m01 = 0.0;
+                for (size_t i = 0; i < w01; ++i)
+                    m01 += b[b.size() - 1u - i];
+                m01 /= static_cast<double>(w01);
+                std::string list;
+                for (size_t i = 0; i < p.slow.size() && i < 48u; ++i)
+                {
+                    char one[32];
+                    std::snprintf(one, sizeof(one), " %.2f:%.1f", p.slow[i].first, p.slow[i].second);
+                    list += one;
+                }
+                std::fprintf(stderr, "[tf] pacing hist: %zu pictures; over 5 ms %zu, 8.3 ms %zu, 16.7 ms %zu, 33 ms %zu; 1%% low %.1f, 0.1%% low %.1f a second; "
+                                     "over 8.3 ms (s since the first picture : ms)%s\n",
+                             b.size(), over(5.0), over(1000.0 / 120.0), over(1000.0 / 60.0), over(1000.0 / 30.0),
+                             worstMean > 0.0 ? 1000.0 / worstMean : 0.0, m01 > 0.0 ? 1000.0 / m01 : 0.0, list.c_str());
+            }
+            p.slow.clear();
             std::fill(std::begin(p.held), std::end(p.held), 0u);
             p.between.clear();
             p.toScreen.clear();
@@ -169,6 +202,8 @@ namespace nr
             if (p.lastShownNs != 0 && ns - p.lastShownNs < 1000000000ll) // (not across a pause of a second: a movie, a load)
             {
                 p.between.push_back(static_cast<double>(ns - p.lastShownNs) / 1.0e6);
+                if (pacingHistOn() && p.between.back() > 1000.0 / 120.0)
+                    p.slow.emplace_back(static_cast<double>(ns - p.firstNs) / 1.0e9, p.between.back());
                 std::lock_guard<std::mutex> lock(g_shownIntervals.mutex); // (TODO 291: nr::pictureLowRate)
                 auto &v = g_shownIntervals.v;
                 v.emplace_back(ns, static_cast<float>(ns - p.lastShownNs) / 1.0e6f);
@@ -176,6 +211,8 @@ namespace nr
                     v.pop_front();
             }
             p.lastShownNs = ns;
+            if (p.firstNs == 0)
+                p.firstNs = ns;
             {
                 std::chrono::steady_clock::time_point vb{};
                 std::chrono::steady_clock::duration period{};

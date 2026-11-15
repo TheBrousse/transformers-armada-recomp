@@ -418,9 +418,9 @@ $crispMissing = (Test-Path (Join-Path $Port "hd_textures\converted\textures")) -
     (Select-String -LiteralPath (Join-Path $Port "tools\make_hd_textures.ps1") -SimpleMatch "CrispFontsOnly" -Quiet)
 if ($crispMissing) {
     Step "Making the sharp fonts and PS5 button symbols (hd_textures\crisp_fonts)" "HD textures"
-    Invoke-Probe { & $Python -c "import numpy" } | Out-Null
-    if ($LASTEXITCODE -ne 0) { Invoke-Native { & $Python -m pip install --user numpy } | Out-Null }
-    & (Join-Path $Port "tools\make_hd_textures.ps1") -CrispFontsOnly
+    # (TODO 382: numpy checked and installed by make_hd_textures.ps1 itself, each with a time limit - never here, where
+    # a stuck import or pip would hold the update for good)
+    & (Join-Path $Port "tools\make_hd_textures.ps1") -CrispFontsOnly -Python $Python
     if (-not $?) { Write-Host "warning: the sharp fonts were not made (see above); the game keeps its own letters" -ForegroundColor Yellow }
     $needTextures = $true
 }

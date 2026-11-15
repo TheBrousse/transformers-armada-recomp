@@ -6003,6 +6003,8 @@ namespace nr
         rain::beginFrame(&frame.rainBlocks); // (TODO 146: the passes' blocks, copied when they were made)
         static thread_local std::vector<uint32_t> words;
         std::vector<Draw> out;
+        takeSpareDraws(out); // (TODO 383: a kept vector, not fresh pages every frame)
+        out.clear();
         out.reserve(frame.draws.size() * 2u + 64u);
         t_out = &out;
         t_useView = framesDeferred(); // (the 2D's textures from the tables as the list stood)
@@ -6826,7 +6828,36 @@ namespace nr
         }
         t_out = nullptr;
         t_useView = false;
-        frame.draws = std::move(out);
+        frame.draws.swap(out);
+        giveSpareDraws(std::move(out)); // (TODO 383: the capture's vector kept, not freed)
+        {
+            // (TODO 380 (a)) The game's byte copy through a 16-bit view of its own 32-bit scene buffer - a FRAME of PSMCT16 drawn
+            // with a PSMCT16 texture (the device's rectangle method moving one byte of each word into another under FBMSK
+            // 0x3fff - here the scene's green into its alpha, for the lens filter, taLensFilter::Render): left out. Native's
+            // lens pass reads the scene's green itself (nr_frame.cpp's top-byte reads); drawn as a 32-bit draw this copy
+            // wrote nothing the picture shows (the A/B at three places: the same pictures), and its 16-bit rows reaching 895
+            // made the scene's buffer twice as tall (8 MB and more, and the upscaler's context again).
+            // TF_NATIVE_CT16COPY=1: drawn, as before.
+            static const bool drawCopies = std::getenv("TF_NATIVE_CT16COPY") && *std::getenv("TF_NATIVE_CT16COPY") == '1';
+            // (Only the scene's: a 16-bit view 512 wide or more (FBW 8+) of a buffer the frame also draws into as 32 bits. The
+            // device's other two such copies stay - the frame-buffer copy onto the depth buffer's page (FBW 4) and the
+            // shadow texture's (FBW 2, taShadowScene): left out, native's grass under the shadows changed a little - a
+            // mean of 0.07-0.10 at the Amazon's basin and the dropship.)
+            if (!drawCopies)
+            {
+                std::unordered_set<uint32_t> wide32; // (fbp | fbw << 9 of the frame's 32- and 24-bit buffers 512 wide or more)
+                for (const Draw &d : frame.draws)
+                    if (const uint32_t psm = (d.target >> 24) & 0x3Fu; (psm == 0x00u || psm == 0x01u) && ((d.target >> 16) & 0x3Fu) >= 8u)
+                        wide32.insert((d.target & 0x1FFu) | (((d.target >> 16) & 0x3Fu) << 9));
+                if (!wide32.empty())
+                    frame.draws.erase(std::remove_if(frame.draws.begin(), frame.draws.end(),
+                                                     [&wide32](const Draw &d) {
+                                                         return ((d.target >> 24) & 0x3Fu) == 0x02u && d.tex0 != 0u && ((d.tex0 >> 20) & 0x3Fu) == 0x02u &&
+                                                                wide32.count((d.target & 0x1FFu) | (((d.target >> 16) & 0x3Fu) << 9)) != 0u;
+                                                     }),
+                                      frame.draws.end());
+            }
+        }
         if (const ext::RenderHooks *h = playerHooks(); h && h->replaceFrame)
             h->replaceFrame(frame); // (an extension's player: all of its draws or none)
         frame.ranges.clear();
@@ -7229,10 +7260,11 @@ namespace nr
             s.defaultValue = graphics_driver::defaultFor("TF_NATIVE_UPSCALER", "bilinear"); // (TODO 295: FSR 1 on built-in graphics)
             if (taa::sdkPresent())
                 s.help += " FSR 3 / 4 (AMD FidelityFX, temporal: FSR 4 where the Radeon driver offers it - RX 7000 and 9000 - "
-                          "FSR 3.1 elsewhere): the sharpest picture from a render scale under 100%, and at 100% the best edge "
-                          "smoothing (it replaces Smooth edges). Its presets are on the Render scale row (Native AA, Quality, "
-                          "Balanced, Performance, Ultra Performance). Costs GPU time: for graphics cards, not built-in graphics "
-                          "(there FSR 1 is the better choice). Takes a restart.";
+                          "FSR 3.1 elsewhere): the sharpest picture from a render scale under 100%. At 100% it smooths edges (it "
+                          "replaces Smooth edges); with FSR 3.1 distant trees shimmer at 100%, and there Bilinear with Smooth "
+                          "edges is the steadier picture. Its presets are on the Render scale row (Native AA, Quality, Balanced, Performance, "
+                          "Ultra Performance). Costs GPU time: for graphics cards, not built-in graphics (there FSR 1 is the "
+                          "better choice). Takes a restart.";
             s.apply = [](const std::string &value) {
                 // (FSR 3 / 4 sizes the picture and the GS targets at the start: a restart, on or off)
                 if (value == "fsr" || taa::upscalerOn())

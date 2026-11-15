@@ -498,6 +498,12 @@ namespace nr
     void recycleFrameBuffers(Frame &frame);
     void takeFrameBuffers(std::vector<Draw> &draws, std::vector<uint32_t> &list);
     void takeChunkBuffer(std::vector<uint32_t> &chunks); // (N5 step 2 part 2: Frame::vuChunks' memory)
+    // (TODO 383) The list read's side of the same: the expanded draws built in a kept vector (the largest, empty, its
+    // capacity kept) and the frame's unexpanded one given back - a fresh vector of draws each frame (a megabyte or two
+    // at ~2x the capture's draws) was ~250 page faults a frame on the read thread and a VirtualAlloc / VirtualFree pair,
+    // whose unmapping interrupts every core running a thread of the process.
+    void takeSpareDraws(std::vector<Draw> &draws);
+    void giveSpareDraws(std::vector<Draw> &&draws);
     // (TODO 112, TF_HITCH_MS) The game's thread's time waiting for the renderer in submitFrame so far (ms, all of it);
     // the large images' loaders now (queued requests, PNGs being decoded/compressed) and so far (chains compressed
     // into the cache, PNGs decoded); pipelines made so far (on the render thread and the variants' thread).
