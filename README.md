@@ -16,6 +16,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/kayliox/transformers-armada-recomp/releases/latest/download/tfa-setup-linux"><img src="https://img.shields.io/badge/Download-Setup%20for%20Linux-2b7bd6?style=for-the-badge&logo=linux&logoColor=white" alt="Download the setup for Linux, SteamOS and Bazzite" height="56"></a>
+</p>
+
+<p align="center">
   <a href="https://recomplauncher.com/game/transformers-armada-recomp"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher"></a>
 </p>
 
