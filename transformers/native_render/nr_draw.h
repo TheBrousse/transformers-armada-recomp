@@ -72,6 +72,7 @@ namespace nr::draw
         float pose[4];       // (N9 stage 3: x the camera's turn applies, y the vertices' frame-before stream)
         float lightsB[12];   // (N9 stage 3: p[8..10] of 0x21f0 in the frame before's pose)
         float clipRowsM[16]; // (TODO 101 a: clipRows halfway between the two poses, along the turn - nr_passes.cpp midPose)
+        float fogx[4];       // (TODO 399) x: a 3D tree drawn after the depth fog's pass takes that fog in its own shader (t1: the fog's palette); y: the fog's strength, applied when w is set
     };
     // (N9 stage 3) The picture's constants (the shaders' b1): where it lies between the frame before's pose and this
     // frame's, the camera's turn.

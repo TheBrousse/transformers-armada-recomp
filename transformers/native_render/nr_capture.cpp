@@ -7050,6 +7050,29 @@ namespace nr
             s.unavailableHelp = "Turn it on first (the row above).";
             ps2_settings::add(s);
         }
+        // (TODO 399) The distance haze (the game's depth fog) strength: the F1 slider, live. 100% = the console's; terrain and trees alike.
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_FOG_STRENGTH";
+            s.section = "Graphics";
+            s.label = "Distance haze (native renderer)";
+            s.order = 56;
+            s.help = "Native renderer: how strong the haze is on far hills, mountains and trees. 100% is the game's own. Lower "
+                     "shows the far land clearer and more colourful, 0% has no haze at all; above 100% it is thicker. Trees and "
+                     "ground take the same haze.";
+            s.choices = {{"0", "0%"}, {"0.25", "25%"}, {"0.5", "50%"}, {"0.75", "75%"}, {"1", "100%"}, {"1.25", "125%"}, {"1.5", "150%"}};
+            s.defaultValue = "1";
+            s.apply = [](const std::string &value) {
+                frame::setFogStrength(static_cast<float>(std::atof(value.c_str())));
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
+            ps2_settings::add(s);
+        }
         // (TODO 108 (2)) Its tone mapping (TF_NATIVE_TONEMAP, live, off by default - the picture as the game draws it).
         {
             ps2_settings::Setting s;

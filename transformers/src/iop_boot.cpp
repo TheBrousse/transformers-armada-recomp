@@ -1,4 +1,5 @@
-// The IOP-less boot (iop_boot.h): the "emulation out" plan's step 2 (S2), opt-in (TF_IOP_BOOT=0).
+// The IOP-less boot (iop_boot.h): the "emulation out" plan's step 2 (S2). The default for the USA disc since TODO 388 (1)
+// (TF_IOP_BOOT=1: the IOP's boot); the European disc keeps the IOP's boot until it is tested without (TF_IOP_BOOT=0).
 //
 // What the game asks of the IOP, measured in S1 (iop_tripwire.cpp, every episode, PAL, movies, states): at boot it
 // reboots it (sceSifRebootIop), syncs, loads 8 modules through _sceSifLoadModuleBuffer - TWOFISH, SIO2MAN, LIBSD,
@@ -15,9 +16,12 @@
 //   - the Sirens bind gets a server descriptor made here (sid set, no buffers), as the runtime does for its own routes:
 //     the SDK's bind loops until the client has a server.
 // The IOP's memory model stays: the system memory the game allocates and the DMA into it work as before. A module this
-// does not know is loaded on the IOP as before (said in the log). Decomp equivalent: the EE's boot without an IOP.
+// does not know is loaded on the IOP as before - a WARNING line with its name: the session is then partly the IOP's.
+// Decomp equivalent: the EE's boot without an IOP.
 
 #include "iop_boot.h"
+
+#include "game_version.h" // TF_GAME_PAL: the European disc keeps the IOP's boot (install)
 
 #include "native_disc.h"
 #include "native_sound.h"
@@ -170,13 +174,25 @@ namespace iop_boot
 
     void install(PS2Runtime &runtime)
     {
+        // (TODO 388 (1)) Without the IOP by default on the USA disc; the European disc keeps the IOP's boot until it is
+        // tested without. TF_IOP_BOOT=0: without the IOP (either disc), =1: the IOP's boot.
         const char *want = std::getenv("TF_IOP_BOOT");
-        if (!want || *want != '0')
+        const bool asked = want && *want;
+#if defined(TF_GAME_PAL)
+        const bool without = asked && *want == '0';
+#else
+        const bool without = !asked || *want == '0';
+#endif
+        if (!without)
+        {
+            std::fprintf(stderr, "[iop boot] the IOP's boot: %s%s\n", asked ? "TF_IOP_BOOT=" : "",
+                         asked ? want : "the European disc keeps it until it is tested without the IOP (TF_IOP_BOOT=0: without)");
             return;
+        }
         const char *iopSound = std::getenv("TF_NATIVE_SOUND_IOP");
         if (!native_sound::active() || !native_disc::active() || (iopSound && *iopSound == '1'))
         {
-            std::fprintf(stderr, "[iop boot] TF_IOP_BOOT=0 asks for a boot without the IOP, but %s: the IOP boots as before\n",
+            std::fprintf(stderr, "[iop boot] the IOP's boot: %s\n",
                          !native_sound::active() ? "the sound server is the IOP's (TF_NATIVE_SOUND=0)"
                          : !native_disc::active() ? "the disc is read through the IOP's TwoFish (TF_NATIVE_DISC=0)"
                                                   : "TF_NATIVE_SOUND_IOP=1 keeps the IOP");
@@ -194,7 +210,7 @@ namespace iop_boot
         g_active = true;
         runtime.setIopParked(true);
         std::fprintf(stderr, "[iop boot] the game boots without the IOP: its modules answered here, its processor never started "
-                             "(TF_IOP_BOOT=0; unset: the IOP's boot)\n");
+                             "(%s; TF_IOP_BOOT=1: the IOP's boot)\n", asked ? "TF_IOP_BOOT=0" : "the default");
     }
 
     bool active() { return g_active; }
@@ -207,7 +223,8 @@ namespace iop_boot
         const Known *k = knownFor(name);
         if (!k)
         {
-            std::fprintf(stderr, "[iop boot] a module this boot does not know (\"%s\", IOP %08x): loaded on the IOP\n", name.c_str(), iopAddr);
+            std::fprintf(stderr, "[iop boot] WARNING: a module this boot does not know (\"%s\", IOP %08x) is loaded on the IOP: this session "
+                                 "is partly the IOP's (TF_IOP_BOOT=1: the IOP's boot for all of it)\n", name.c_str(), iopAddr);
             return false;
         }
         moduleId = ++g_nextId;
@@ -225,12 +242,12 @@ namespace iop_boot
         if (!g_active && modules == 0u)
         {
             if (!native_sound::active() || !native_disc::active())
-                std::fprintf(stderr, "[iop boot] this save state was made without the IOP (TF_IOP_BOOT=0), and this game's %s the IOP's: "
+                std::fprintf(stderr, "[iop boot] this save state was made without the IOP, and this game's %s the IOP's: "
                                      "it has no sound server or disc server to run - start with TF_NATIVE_SOUND=1 and TF_NATIVE_DISC=1, "
                                      "or make the state again\n",
                              !native_sound::active() ? "sound server is" : "disc is read through");
             else
-                std::fprintf(stderr, "[iop boot] this save state was made without the IOP (TF_IOP_BOOT=0): the native sound server and "
+                std::fprintf(stderr, "[iop boot] this save state was made without the IOP: the native sound server and "
                                      "disc serve it as they would\n");
         }
         else if (g_active && modules != 0u)

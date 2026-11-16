@@ -105,4 +105,7 @@ namespace native_sound::mixer
     // game's later mixes are not shortened by them. Not before the first render.
     void renderAhead(size_t frames);
     void reset();
+
+    // (TODO 384 (c)) The mixing thread says who it is (the stream reader's fallback lines name the thread that read).
+    void markMixingThread();
 }

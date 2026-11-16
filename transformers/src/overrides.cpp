@@ -277,7 +277,7 @@ namespace
         const uint32_t argAddr = getRegU32(ctx, 6);
         const uint32_t resultAddr = getRegU32(ctx, 7);
 
-        // (TF_IOP_BOOT=0: the module answered as the IOP's load answers it, not loaded - iop_boot.cpp)
+        // (the IOP-less boot, the USA disc's default: the module answered as the IOP's load answers it, not loaded - iop_boot.cpp)
         if (int32_t fakeId = 0, fakeStart = 0; iop_boot::takeModule(*runtime, rdram, iopAddr, fakeId, fakeStart))
         {
             if (resultAddr != 0u)
@@ -2094,6 +2094,14 @@ namespace
                     pixelsX *= zoom;
                     pixelsY *= zoom;
                 }
+                {
+                    // (TODO 396) F1 > Gameplay > Scope sensitivity: the aiming view's mouse speed (1 outside it, and at 100%)
+                    const float sens = view_turn::aimSensitivity();
+                    pixelsX *= sens;
+                    pixelsY *= sens;
+                    zoom = (zoom > 0.05f && zoom < 1.0f ? zoom : 1.0f) * sens;
+                    view_turn::noteMouseZoom(zoom); // (the pictures' turn scales the travel the same)
+                }
             }
             {
                 // (TODO 292 A) One frame turns at most TF_MOUSE_MAX_DEG_S (1500) degrees a second of the time since the
@@ -2104,6 +2112,7 @@ namespace
                 const auto nowTake = std::chrono::steady_clock::now();
                 const float dt = std::clamp(std::chrono::duration<float>(nowTake - lastTake).count(), 1.0f / 480.0f, 0.05f);
                 lastTake = nowTake;
+                view_turn::smoothAimTravel(pixelsX, pixelsY, dt); // (TODO 396: the narrow aiming view's travel made even in time)
                 if (maxRate > 0.0f)
                 {
                     const float maxPixels = maxRate * dt / kRadiansPerPixel;
@@ -2398,7 +2407,13 @@ namespace
                     g_carPitch = std::isfinite(pitchUnits) ? std::clamp(pitchUnits * kCarPitchPerUnit, 0.0f, kCarPitchPerUnit) : 0.0f;
                     g_carMouseHeld = true;
                 }
-                g_carYaw = std::remainder(g_carYaw + px * kRadiansPerPixel, 6.2831853f);
+                // (TODO 397: the spring's yaw runs the other way to the mouse - right looked left; TF_CAR_MOUSE_YAW_SIGN=1
+                // gives the old direction)
+                static const float yawSign = [] {
+                    const char *v = std::getenv("TF_CAR_MOUSE_YAW_SIGN");
+                    return v && *v && std::atof(v) > 0.0 ? 1.0f : -1.0f;
+                }();
+                g_carYaw = std::remainder(g_carYaw + yawSign * px * kRadiansPerPixel, 6.2831853f);
                 if (g_carYaw >= 3.1415927f)
                     g_carYaw -= 6.2831853f;
                 g_carPitch = std::clamp(g_carPitch + py * kRadiansPerPixel, 0.0f, kCarPitchPerUnit);
@@ -2830,6 +2845,18 @@ namespace
     constexpr uint32_t kPreGameEnd = 0x00334650u, kPreGameVtable = 0x006B7360u;
     PS2Runtime::RecompiledFunction g_preGameEnd = nullptr;
     int g_hqRate = 0;
+    // (TODO 360) The HQ's rate when it follows the setting: at a limit of 30 (or under) the HQ runs as the console runs it
+    // (rate 0: frames of two fields at the console's VBlanks) - as it does when the limit was 30 before the game started
+    // (the frame-rate hooks then never go in). Set to 30 live in a level, the HQ reached through a warp gate ran at the PC
+    // port's rate 30 instead and at half speed (bbatts, measured: its own clock 0.48 s a second, 14.5 pictures; the switch to
+    // it returned early, the level being at 30 already). TF_HQ30_CONSOLE=0: as before. TF_HQ_RATE=30 (a test arrangement,
+    // in-between pictures) keeps its own rate.
+    int hqRateNow()
+    {
+        static const bool console = [] { const char *e = std::getenv("TF_HQ30_CONSOLE"); return !(e && *e == '0'); }();
+        const int rate = g_hqRate < 0 ? g_frameRate : g_hqRate;
+        return console && g_hqRate < 0 && rate <= 30 ? 0 : rate;
+    }
     // In the HQ (its rate set by executorLoop): the settings panel and F4 leave its rate alone,
     // and their choice takes effect at the next level.
     bool g_inHq = false;
@@ -2914,8 +2941,8 @@ namespace
                     const char *env = std::getenv("TF_HQ_MOMENTS");
                     return env && *env && *env != '0';
                 }();
-                const int hqRate = g_hqRate < 0 ? g_frameRate : g_hqRate;
-                std::fprintf(stderr, "[tf] the HQ at %d frames a second%s\n", hqRate,
+                const int hqRate = hqRateNow();
+                std::fprintf(stderr, "[tf] the HQ at %d frames a second%s%s\n", hqRate != 0 ? hqRate : 30, hqRate == 0 ? " (the console's own)" : "",
                              hqMoments && hqRate <= 30 ? ", pictures at the screen's refresh" : "");
                 g_hqMoments.store(hqMoments && hqRate <= 30); // (before the switch: the renderer's moments)
                 switchFrameRate(rdram, ctx, runtime, hqRate);
@@ -3108,8 +3135,10 @@ namespace
         g_effectsUpdate(rdram, ctx, runtime);
     }
 
+    void enemyLiftFrameEnd(uint8_t *rdram, uint32_t gp); // (TODO 400, below, with the actor Cull's lift)
     void setFrameWords(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        enemyLiftFrameEnd(rdram, getRegU32(ctx, 28));
         setEcoScale(rdram);
         const auto read = [rdram](uint32_t address)
         {
@@ -4029,6 +4058,10 @@ namespace
     // ladder's steps did). The FPS counter shows the pictures really drawn. TF_RATE_LADDER=1: the ladder as before
     // (even steps / fine steps, frame pacing Auto), for an A/B.
     std::atomic<int> g_wantCap{-1};     // (the panel's cap, taken on the game thread: takeSettings)
+    // (TODO 395) A live change of the forest's setting asks for the frame-rate ladder to start again from the player's
+    // rate, as a new cap does (takeSettings): the bars a heavier setting left (a rung barred for up to two minutes, the
+    // drawing's wall for up to five) belong to the old setting. TF_FOREST_LIVE_RESET=0: as before (kept until they run out).
+    std::atomic<bool> g_wantLadderAgain{false};
     int g_ceilingRate = 0;              // (follow: the rate the last miss came at, and until when nothing at or above it)
     std::chrono::steady_clock::time_point g_ceilingUntil{};
     int g_ceilingFails = 0;             // (follow: misses in a row - the wall's 10 s doubles with each, to 120 s; forgotten 30 s on)
@@ -5410,10 +5443,11 @@ namespace
             g_adoptSceneStream = false;
             if (g_hqRate != 0 && hqInMemory(rdram))
             {
-                const int hqRate = g_hqRate < 0 ? g_frameRate : g_hqRate;
+                const int hqRate = hqRateNow();
                 g_adoptSceneStream = true;
                 g_executorVtable = kPreGameVtable;
-                std::fprintf(stderr, "[tf] the HQ at %d frames a second (a state loaded in it)\n", hqRate);
+                std::fprintf(stderr, "[tf] the HQ at %d frames a second%s (a state loaded in it)\n", hqRate != 0 ? hqRate : 30,
+                             hqRate == 0 ? " (the console's own)" : "");
                 switchFrameRate(rdram, ctx, runtime, hqRate);
                 g_inHq = true;
                 if (hqRate > 30)
@@ -5467,6 +5501,22 @@ namespace
         const int lock = g_wantLock.exchange(-1);
         const int moments = g_wantMoments.exchange(-1);
         const int cap = g_wantCap.exchange(-1);
+        if (g_wantLadderAgain.exchange(false) && lock < 0 && moments < 0 && cap < 0)
+        {
+            // (TODO 395: the forest's setting changed - the ladder from the player's rate again, nothing else of the settings)
+            if (!g_levelHooks || g_inHq || g_levelRate == 0 || (g_levelRate == g_frameRate && g_rateIndex == 0))
+                return;
+            std::fprintf(stderr, "[tf] the forest's setting changed: the frame rate from %d again (it was at %d)\n", g_frameRate, g_levelRate);
+            if (g_levelRate != g_frameRate)
+            {
+                const int from = g_levelRate, to = g_frameRate;
+                g_carsPhase = g_carsPhase * to / from;
+                switchFrameRate(rdram, ctx, runtime, to, false, true);
+                convertLevel(rdram, ctx, runtime, from, to);
+            }
+            startAdapting();
+            return;
+        }
         if (lock < 0 && moments < 0 && cap < 0)
             return;
         if (cap >= 0)
@@ -5507,10 +5557,11 @@ namespace
         // one until the next HQ). Nothing of a level's to convert: the HQ's per-frame steps follow the rate (hq_rate).
         if (g_inHq)
         {
-            const int hqRate = g_hqRate < 0 ? g_frameRate : g_hqRate;
+            const int hqRate = hqRateNow();
             if (cap >= 0 && g_hqRate < 0 && hqRate != g_levelRate) // (only for a new limit; the rate may have stepped down since)
             {
-                std::fprintf(stderr, "[tf] the HQ at %d frames a second (the limit changed in it)\n", hqRate);
+                std::fprintf(stderr, "[tf] the HQ at %d frames a second%s (the limit changed in it)\n", hqRate != 0 ? hqRate : 30,
+                             hqRate == 0 ? " (the console's own)" : "");
                 switchFrameRate(rdram, ctx, runtime, hqRate, false, true);
                 if (hqRate > 30)
                     startAdapting();
@@ -6709,6 +6760,48 @@ namespace
         const double clock = g_forestClock;
         const uint32_t count = ecoInstanceCount(rdram);
         g_forestPeak = std::max(g_forestPeak, count);
+        // (TODO 395) A live change of the forest's setting (the Trees row, Forest distance, Far trees, Every tree 3D): one
+        // line when it changes and four after it (2, 5, 10 and 20 s of the forest's time) - the reach, its fit to the
+        // cap, the 3D trees and the frame rate, so a log shows whether the forest came back to the new setting.
+        {
+            static float seenFactor = -1.0f, seenSprites = -1.0f;
+            static double changedAt = -1.0;
+            static int follow = 0;
+            const float f = forestFactor(), sp = g_forestSprites.load(std::memory_order_relaxed);
+            const bool changed = seenFactor >= 0.0f && (f != seenFactor || sp != seenSprites);
+            if (changed)
+            {
+                std::fprintf(stderr, "[forest] the setting now: forest x%g%s, far trees %s (was x%g); the reach x%.2f of it, %u 3D trees (cap %u), the level at %d frames a second\n",
+                             static_cast<double>(f), g_forestFullNow ? " (every tree 3D)" : "", sp >= 1.0f ? "3D to the edge" : sp <= 0.0f ? "flat" : "part 3D",
+                             static_cast<double>(seenFactor), static_cast<double>(g_forestOld ? 1.0f : g_forestFit), count, ecoCap(rdram), g_levelRate);
+                changedAt = g_forestClock;
+                follow = 0;
+                // (TODO 395, the fix) The new setting starts as a restart would start it: its whole reach (the fit to the cap
+                // brings it in again within a few frames where the trees are too many - 3% of itself a frame), and the
+                // frame-rate ladder from the player's rate (takeSettings). Before, the reach a heavier setting had been cut
+                // to was carried over as a share of the new one and grew back 5% a second, and only with the ladder at its
+                // top; the ladder kept its bars. TF_FOREST_LIVE_RESET=0: as before.
+                static const bool liveReset = [] { const char *e = std::getenv("TF_FOREST_LIVE_RESET"); return !(e && *e == '0'); }();
+                if (liveReset && !g_forestOld)
+                {
+                    g_forestFit = 1.0f;
+                    g_forestRoomSince = clock;
+                    g_wantLadderAgain.store(true);
+                }
+            }
+            else if (changedAt >= 0.0 && follow < 4)
+            {
+                static const double kAfter[4] = {2.0, 5.0, 10.0, 20.0};
+                if (g_forestClock - changedAt >= kAfter[follow])
+                {
+                    std::fprintf(stderr, "[forest] %.0f s after the change: forest x%g, the reach x%.2f of it, %u 3D trees (cap %u), the level at %d frames a second\n",
+                                 kAfter[follow], static_cast<double>(f), static_cast<double>(g_forestOld ? 1.0f : g_forestFit), count, ecoCap(rdram), g_levelRate);
+                    ++follow;
+                }
+            }
+            seenFactor = f;
+            seenSprites = sp;
+        }
         g_forestCostMs.push_back(static_cast<float>(g_forestUs / 1000.0)); // (the frame since the last: one frame's forest)
         g_forestUs = 0.0;
         g_layoutUsSum += g_layoutUs;
@@ -7815,6 +7908,19 @@ namespace
         uint32_t tableAt = 0u, table = 0u, k = 0u;
         bool on = false;
     };
+    // TODO 400 (found by leaving k lifted: no more gaps in 250 pictures): the small-on-screen test (k, gp-0x5BB8) also decides
+    // the actor's nodes OUTSIDE the actor's own Cull call (a later pass of the same frame), and there the game's k left that
+    // grunt block out of one picture now and then. So the lift of k, once an actor's Cull has made it, stays to the end of
+    // the frame (the frame's first setFrameWords puts it back). TF_ENEMY_K_FRAME=0: put back at the end of each Cull as before.
+    bool g_kLiftedFrame = false;
+    uint32_t g_kFrameOriginal = 0u;
+    void enemyLiftFrameEnd(uint8_t *rdram, uint32_t gp)
+    {
+        if (!g_kLiftedFrame || gp < 0x00100000u || gp >= PS2_RAM_SIZE)
+            return;
+        g_kLiftedFrame = false;
+        std::memcpy(rdram + gp - 0x5BB8u, &g_kFrameOriginal, 4);
+    }
     ActorCullOpen openActorCull(uint8_t *rdram, R5900Context *ctx)
     {
         ActorCullOpen o;
@@ -7831,8 +7937,15 @@ namespace
             std::memcpy(&o.table, rdram + o.tableAt, 4);
             std::memcpy(rdram + o.tableAt, &kNoLimit, 4);
         }
+        static const bool frameLift = !(std::getenv("TF_ENEMY_K_FRAME") && *std::getenv("TF_ENEMY_K_FRAME") == '0');
         std::memcpy(&o.k, rdram + gp - 0x5BB8u, 4);
         const float none = 0.0f;
+        if (frameLift)
+        {
+            if (!g_kLiftedFrame)
+                g_kFrameOriginal = o.k, g_kLiftedFrame = true;
+            o.k = g_kFrameOriginal; // (what the game had, whether this Cull or an earlier one lifted)
+        }
         std::memcpy(rdram + gp - 0x5BB8u, &none, 4);
         o.on = true;
         return o;
@@ -7843,7 +7956,9 @@ namespace
             return;
         if (o.tableAt)
             std::memcpy(rdram + o.tableAt, &o.table, 4);
-        std::memcpy(rdram + gp - 0x5BB8u, &o.k, 4);
+        static const bool frameLift = !(std::getenv("TF_ENEMY_K_FRAME") && *std::getenv("TF_ENEMY_K_FRAME") == '0');
+        if (!frameLift)
+            std::memcpy(rdram + gp - 0x5BB8u, &o.k, 4);
     }
 
     // (TODO 137) The Mini-Con and Data-Con pickups (taPickupPanel, its slot 9: 0x0037C4C0, called by the pickup manager's
@@ -8827,6 +8942,8 @@ namespace
         native_sound::addSettings(); // Sound: the native sound server (native_sound.h)
         surround_mode::addSettings(); // Sound: plain stereo or Pro Logic II for the 3D sounds (surround_mode.h)
         fast_load::addSettings();   // Gameplay: fast loading (fast_load.h)
+        menu_fade_speed::addSettings(); // Gameplay: Menu speed Original / Double / Four times (menu_fade_speed.h, TODO 386)
+        view_turn::addSettings();   // Gameplay: Scope sensitivity (view_turn.h, TODO 396)
         language::addSettings();    // Gameplay: the PAL release's language (language.h)
         mod_menu::addSettings();    // Controls: driving with W / S (mod_menu.h)
         small_crosshair::addSettings(); // Display: the small crosshair (small_crosshair.h)
@@ -9749,10 +9866,103 @@ namespace
         }
     }
 
+    // (TODO 389, a tools aid) TF_PERF_CSV=<file>: one row a second from counters the port already has, always on while
+    // set (no other log needed). Columns: seconds since the first row; the game's frames and pictures shown that second;
+    // the PC VBlanks and the game ticks (60 a second of game time: under 60 = the game slower than real time); the frame
+    // time p50 / p95 / max (ms, frame start to frame start); the frames whose start moved 0 / 1 / 2+ PC VBlanks (0 = two
+    // frames inside one VBlank, 2+ = a frame held two periods: TODO 377's beat showed only as these); frames over 25 /
+    // 50 ms; the game thread's CPU ms and the EE's clock-wait (idle) ms in that second; the level's rate and the cap. (The
+    // idle by event is not here: the runtime collects it only for TF_HITCH_MS, whose slow-frame lines take it.) Flushed each
+    // row: the process ends with _Exit.
+    void perfCsvFrame(PS2Runtime *runtime)
+    {
+        static std::FILE *out = []() -> std::FILE *
+        {
+            const char *path = std::getenv("TF_PERF_CSV");
+            if (!path || !*path)
+                return nullptr;
+            std::FILE *f = std::fopen(path, "w");
+            if (f)
+            {
+                std::fprintf(f, "t,frames,pictures,pc_vblanks,game_ticks_per_s,ms_p50,ms_p95,ms_max,vb0,vb1,vb2plus,over25,over50,"
+                                "thread_cpu_ms_per_s,ee_idle_ms,level_rate,cap\n");
+                std::fflush(f);
+                std::fprintf(stderr, "[tf] TF_PERF_CSV: a row a second to %s\n", path);
+            }
+            else
+                std::fprintf(stderr, "[tf] TF_PERF_CSV: cannot write %s\n", path);
+            return f;
+        }();
+        if (!out)
+            return;
+        using clock = std::chrono::steady_clock;
+        EeScheduler &ee = runtime->eeScheduler();
+        const auto now = clock::now();
+        const uint64_t vb = ee.currentVSyncTick();
+        testTick(runtime);
+        static const auto start = now;
+        static auto windowStart = now, lastFrame = now;
+        static uint64_t lastVb = vb, windowVb = vb;
+        static double windowGame = g_testTick;
+        ps2_host_display::Clock::time_point lastPicture{};
+        static uint64_t windowPictures = ps2_host_display::pictureCount(lastPicture);
+        static auto windowIdle = ee.idleHostTime();
+#if defined(_WIN32)
+        static double windowCpu = tfThreadCpuMs();
+#endif
+        static std::vector<float> ms;
+        static uint32_t vb0 = 0u, vb1 = 0u, vb2 = 0u, over25 = 0u, over50 = 0u;
+        if (now != lastFrame)
+        {
+            const float f = std::chrono::duration<float, std::milli>(now - lastFrame).count();
+            ms.push_back(f);
+            over25 += f > 25.0f ? 1u : 0u;
+            over50 += f > 50.0f ? 1u : 0u;
+            const uint64_t step = vb - lastVb;
+            (step == 0u ? vb0 : step == 1u ? vb1 : vb2) += 1u;
+        }
+        lastFrame = now;
+        lastVb = vb;
+        const double elapsed = std::chrono::duration<double>(now - windowStart).count();
+        if (elapsed < 1.0)
+            return;
+        const uint64_t pictures = ps2_host_display::pictureCount(lastPicture);
+        const double idleMs = std::chrono::duration<double, std::milli>(ee.idleHostTime() - windowIdle).count();
+#if defined(_WIN32)
+        const double cpuNow = tfThreadCpuMs(), cpuMs = cpuNow - windowCpu;
+        windowCpu = cpuNow;
+#else
+        const double cpuMs = 0.0;
+#endif
+        float p50 = 0.0f, p95 = 0.0f, mx = 0.0f;
+        if (!ms.empty())
+        {
+            std::vector<float> v = ms;
+            std::sort(v.begin(), v.end());
+            p50 = v[v.size() / 2];
+            p95 = v[std::min(v.size() - 1u, static_cast<size_t>(0.95 * static_cast<double>(v.size())))];
+            mx = v.back();
+        }
+        std::fprintf(out, "%.3f,%zu,%llu,%llu,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%u,%.1f,%.1f,%d,%d\n",
+                     std::chrono::duration<double>(now - start).count(), ms.size(),
+                     static_cast<unsigned long long>(pictures - windowPictures), static_cast<unsigned long long>(vb - windowVb),
+                     (g_testTick - windowGame) / elapsed, p50, p95, mx, vb0, vb1, vb2, over25, over50, cpuMs / elapsed, idleMs, g_levelRate,
+                     g_rateSetting >= kUnlimitedRate ? 0 : g_rateSetting);
+        std::fflush(out);
+        ms.clear();
+        vb0 = vb1 = vb2 = over25 = over50 = 0u;
+        windowStart = now;
+        windowVb = vb;
+        windowGame = g_testTick;
+        windowPictures = pictures;
+        windowIdle = ee.idleHostTime();
+    }
+
     void frameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (language::redirectForText(rdram, ctx, runtime)) // (the PAL release's text in another language: language.h)
             return;
+        perfCsvFrame(runtime); // (TODO 389, TF_PERF_CSV)
         testStall(runtime);
         key_text::switchTest(runtime->eeScheduler().currentVSyncTick()); // (TF_KEY_TEXT_SWITCH_TEST, tests)
         key_text::frame(rdram); // (the sticks' words for the keyboard: key_text.h)
@@ -10458,7 +10668,7 @@ namespace
         sirens_trace::install(runtime); // TF_SIRENS_LOG=<file> (sirens_trace.cpp)
         native_disc::install(runtime);  // TF_NATIVE_DISC=1: TwoFish's disc reads answered on the host (native_disc.cpp)
         native_sound::install(runtime); // TF_NATIVE_SOUND=1: the sound server answered on the EE (native_sound.cpp)
-        iop_boot::install(runtime);     // TF_IOP_BOOT=0: the game boots without the IOP (iop_boot.cpp; after the two above)
+        iop_boot::install(runtime);     // the game boots without the IOP (USA disc default; TF_IOP_BOOT=1: the IOP's; iop_boot.cpp; after the two above)
         distance_meter::install(runtime); // the distance meter (distance_meter.cpp)
         boss_cheat::install(runtime); // one-hit kills leave the bosses' fights to play out (boss_cheat.h, TODO 199)
         start_screens::install(runtime);  // boot straight to the main menu (start_screens.h, TODO 110)
@@ -10558,7 +10768,7 @@ namespace
         // debugging hooks below, which then wrap them like any other.
         decomp::install(runtime);
         menu_mouse::install(runtime); // the mouse in the HQ's screens (menu_mouse.h, TODO 175)
-        menu_fade_speed::install(runtime); // TF_MENU_FADE_SPEED=2|4: the screens' fades faster (TODO 386; after menu_mouse, whose base-update hook it wraps)
+        menu_fade_speed::install(runtime); // F1 Menu speed / TF_MENU_FADE_SPEED: the screens' fades (TODO 386; after menu_mouse, whose base-update hook it wraps)
         // The native PC renderer (native_render/), wrapping the render calls (TF_NATIVE_RENDER).
         nr::install(runtime);
         // The extensions that hook the native renderer (port_ext.h AfterRender: e.g. the overlay's Playable Decepticons,
@@ -10624,6 +10834,7 @@ namespace
                 iop_boot::stateLoaded(runtime); // (a state made with the other boot told; the IOP parked again)
                 sound_nodes::stateLoaded(); // (the console frames they owe: none, as in a game started with the state)
                 pc_settings_row::stateLoaded(); // (pages open before the load are not the state's: pc_settings_row.h)
+                menu_fade_speed::stateLoaded(); // (the state's screens: their fade rates as made at this menu speed)
             });
         // The frame rate (see "The frame rate"): TF_FRAME_RATE=<frames a second>, 60 by default;
         // 30 (or TF_60FPS=0) for the console's. TF_60FPS=force also plays the level of a state

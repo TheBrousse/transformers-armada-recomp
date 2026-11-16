@@ -3343,6 +3343,7 @@ namespace nr::frame
             return out;
         }();
         std::unordered_set<uint32_t> drawnTargets; // (the targets drawn into so far this frame)
+        std::unordered_map<uint32_t, GpuTexture *> fogPalettes; // (TODO 399: a target's depth fog palette, once its fog pass is met - the 3D trees after it take it)
         // (Debug: TF_NATIVE_SKIP=a-b[,c-d]: the frame's draws a to b left out, to find which draw makes what.)
         static const std::vector<std::pair<size_t, size_t>> skips = [] {
             std::vector<std::pair<size_t, size_t>> out;
@@ -3751,6 +3752,18 @@ namespace nr::frame
                 const gfx::TextureId tgDepth = dev.view(tg.id, true); // (the target's depth as a texture; 0: none - the picture's)
                 const bool fog = pass.fogPalette && !tg.main && tgDepth;
                 GpuTexture *fogPalette = fog ? textureFor(pass.fogPalette) : nullptr;
+                if (fogPalette)
+                    fogPalettes[found->first] = fogPalette;
+                // (TODO 399) The game draws its 3D trees after the fog's pass: one drawn after it takes the fog in its own shader
+                // (the far trees this port draws had none while the terrain behind them did). TF_NATIVE_TREEFOG=0: as before.
+                static const bool treeFogOn = !(std::getenv("TF_NATIVE_TREEFOG") && *std::getenv("TF_NATIVE_TREEFOG") == '0');
+                GpuTexture *treeFogPalette = nullptr;
+                if (treeFogOn && !fog && draw.shader.blockOf(Routine::Instances))
+                {
+                    const auto fp = fogPalettes.find(found->first);
+                    if (fp != fogPalettes.end())
+                        treeFogPalette = fp->second;
+                }
                 static const bool fogLog = std::getenv("TF_NATIVE_FOGLOG") != nullptr;
                 if (fogLog && !shotPath.empty() && pass.fogPalette)
                     std::fprintf(stderr, "[native render] fog pass of draw %zu into %04x: fog %d (main %d, depth view %u), palette %d, test %llx zbuf %llx\n",
@@ -3996,6 +4009,8 @@ namespace nr::frame
                 // microsecond: the half-pixel move below on every pass was 0.8 ms of the frame's recording.)
                 Constants c{};
                 std::memcpy(c.rows, pass.matrix, sizeof(c.rows));
+                c.fogx[1] = fogStrength();
+                c.fogx[3] = 1.0f;
                 c.screen[0] = draw.originX;
                 c.screen[1] = draw.originY;
                 // The GS covers the pixels whose integer coordinates the primitive holds - pixel n shows
@@ -4461,8 +4476,10 @@ namespace nr::frame
                 }
                 // (t0 the draw's texture; t1 the fog's palette, else TEST's DATE copy, else the top-byte read's palette; t2 the
                 // fog's depth. Unused, t1 and t2 are left at what they were bound to: the shader reads them only for those.)
+                const bool treeFog = treeFogPalette && !destSlot && !topSource;
+                c.fogx[0] = treeFog ? 1.0f : 0.0f;
                 dev.bindTextures(selfSlot ? selfSlot : source ? sourceSlot : t ? t->id : 0u,
-                                 fog ? fogPalette->id : destSlot ? destSlot : topSource ? topPalette->id : gfx::kKeepTexture,
+                                 fog ? fogPalette->id : destSlot ? destSlot : topSource ? topPalette->id : treeFog ? treeFogPalette->id : gfx::kKeepTexture,
                                  fog ? tgDepth : gfx::kKeepTexture);
                 // (The rings: the pass's constants, then its instance entries. Full - the frame's ring room spent - the
                 // draw's passes from here are left out, as the check at a pass's start left them before.)

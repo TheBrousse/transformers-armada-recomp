@@ -300,9 +300,13 @@ Everything you need is in the folder you installed into:
 To back up your saves, copy the `saves` folder. To move the game to another drive or PC, or to a Steam Deck, copy
 the whole folder you installed into.
 
-The native Linux build has no `saves`, `logs` or `data` folders: everything stays in the checkout. `settings.ini` is
-in its root, the disc's files in `game`, the memory cards in `game/mc0` and `game/mc1`, save states in `states`, logs
-in `runs`, and F1 > Saves' backups and exports in `Saves`.
+On Linux, an install made with the setup program (`tfa-setup-linux`) has the same folders: `Transformers Armada`
+starts the game (give it to Steam), `tfa-setup` is the setup, and `settings.ini`, `saves`, `logs` and `data` are as
+above; an install made before they existed is moved at its next update, the same way. A checkout cloned and set up by
+hand (`setup.sh`) keeps everything in the checkout, as before: `settings.ini` in its root, the disc's files in `game`,
+the memory cards in `game/mc0` and `game/mc1`, save states in `states`, logs in `runs`, and F1 > Saves' backups and
+exports in `Saves`. To give it the same folders, run `python3 tools/move_layout.py --game-folder . --root ..` in it
+once: the folder above it becomes the install folder.
 
 **Logs, for a bug report:** in the game, **F1 > About > "Make a report"** makes one zip file with the logs, your
 settings and your PC's details (no saves, nothing of the game's files) and opens its folder. Attach that file. If

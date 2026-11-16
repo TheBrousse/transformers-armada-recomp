@@ -6,6 +6,10 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_host_display.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace tf::timing
 {
     namespace
@@ -23,6 +27,31 @@ namespace tf::timing
         // PC: the VBlank count the frame now beginning began at (for port::lateFramesTakeNextVBlank).
         int32_t g_frameBegan = 0;
 
+        // PC (TODO 377): the EE scheduler's VBlank tick when the wait before returned. The scheduler counts a VBlank as it
+        // takes the VBlank's event, before the game's own handler raises vblankCount.
+        uint64_t g_beganTick = 0;
+
+        // PC (TODO 377): at one field a frame the game counts its wait from its last frame's stamp (lastFlipVBlank), which
+        // BeginRender stores one frame late: the target is always passed already, and the frame was held to one VBlank only
+        // because the port's wait yields once and then waits for the scheduler's next event. When that event was not a
+        // VBlank, the wait returned without one and the next frame waited two: at a high cap some pictures stayed up twice
+        // as long, ~7 times a second at the Testbench's spots and up to ~4,000 a minute in Deep Amazon on a fast PC.
+        // The wait now ends at the next real VBlank, unless the frame is late - more than one VBlank has begun since the
+        // wait before (the wait sits at the start of the render, so an on-time frame's work already straddles one) - then
+        // it returns at once, as counting from the flip meant. TF_WAIT_TARGET=flip: as before.
+        bool waitFromFlip()
+        {
+            static const bool flip = []()
+            {
+                const char *e = std::getenv("TF_WAIT_TARGET");
+                const bool v = e && std::strcmp(e, "flip") == 0;
+                if (v)
+                    std::fprintf(stderr, "[tf] the VBlank wait counts from the last flip, as before (TF_WAIT_TARGET=flip)\n");
+                return v;
+            }();
+            return flip;
+        }
+
         // After the wait: with frames of two fields, the next frame starts on the other one.
         void FinishWait(decomp::Guest &g)
         {
@@ -30,6 +59,7 @@ namespace tf::timing
                 nextFrameField = nextFrameField == 0 ? 1 : 0;
             const int32_t count = vblankCount;
             g_frameBegan = count;
+            g_beganTick = g.runtime()->eeScheduler().currentVSyncTick();
             g.setGpr(kResult, static_cast<uint32_t>(count));
             port::vblankWaitEnds(g.cop0Count());
             if (ps2_host_display::tracing())
@@ -65,7 +95,15 @@ namespace tf::timing
             const uint8_t twoFields = framesOfTwoFields;
             int32_t target = vblankCount + 1;
             if (countFromFlipB != 0 || countFromFlipA != 0)
+            {
                 target = lastFlipVBlank + (twoFields != 0 ? 2 : 1);
+                if (twoFields == 0 && !waitFromFlip())
+                {
+                    // PC (TODO 377): the next real VBlank, or at once when the frame is late.
+                    const uint64_t tick = g.runtime()->eeScheduler().currentVSyncTick();
+                    target = tick > g_beganTick + 1u ? static_cast<int32_t>(vblankCount) : vblankCount + 1;
+                }
+            }
             g.setGpr(kReached, 0u);
             g.setGpr(kTwoFields, twoFields);
             g.setGpr(kTarget, static_cast<uint32_t>(target));

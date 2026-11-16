@@ -22,6 +22,20 @@
 #include "native_sound_mixer.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <ctime>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#if defined(_WIN32)
+// (TODO 384 (c): the stream reader's cache by the PC's memory - kernel32's, declared here to keep <windows.h> out of this file)
+extern "C" __declspec(dllimport) int __stdcall GlobalMemoryStatusEx(void *status);
+#else
+#include <unistd.h>
+#endif
 
 #include "native_sound_data.h"
 #include "pad_speaker.h"
@@ -54,6 +68,32 @@ namespace native_sound::mixer
         // for voices and streams alike (the A/B of 2026-10-22: menu music 2.00x at correlation 0.996,
         // the title jingle 1.9x), so the mix is halved to sound as the game always has here.
         constexpr float kOutputGain = 0.5f;
+
+        // (TODO 384 (c)) The mixing thread's mark (markMixingThread): the stream reader's fallback lines name the thread.
+        thread_local bool t_mixingThread = false;
+        double msSince(std::chrono::steady_clock::time_point t0)
+        {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        // (TODO 384 (c)) A line's own clock: the wall clock (to line up with other logs, which print it too) and the seconds
+        // since this process's first such line.
+        std::string readClock()
+        {
+            static const auto t0 = std::chrono::steady_clock::now();
+            const auto now = std::chrono::system_clock::now();
+            const std::time_t t = std::chrono::system_clock::to_time_t(now);
+            const int ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+            std::tm tm{};
+#if defined(_WIN32)
+            localtime_s(&tm, &t);
+#else
+            localtime_r(&t, &tm);
+#endif
+            char b[48];
+            std::snprintf(b, sizeof(b), "%02d:%02d:%02d.%03d (+%.3f s)", tm.tm_hour, tm.tm_min, tm.tm_sec, ms,
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            return b;
+        }
 
         using data::Envelope;
         using data::Tone;
@@ -587,6 +627,602 @@ namespace native_sound::mixer
                              g_reqClock - v.keyedTime, v.peak);
         }
 
+        // ---- the stream reader (TODO 384 (c)) ------------------------------------------------------
+        // The streams' files (music, ambience, voice) were read a row at a time (an interleave of every channel, up to
+        // 64 KB) by the mix itself, on whichever thread held the mixer - the mixing thread, or the game's own while it
+        // waited for it. On the Testbench such a read took ~3 ms with the sound off, and the game waited behind it
+        // (lane F's stall hunt, 2026-11-14). Now a thread of its own, which never holds the mixer, keeps each open
+        // stream's file in memory ahead of where it plays: a file up to limits().wholeMax whole (kept afterwards, limits().cacheMax in
+        // all, the least recently used dropped first), a larger one as its first kHead bytes (its header and its start,
+        // for repeats and loops) plus a window of kAhead ahead of the play position. The parts a stream is likely to
+        // play next (the next part, the same one again, a tune asked for) are read ahead too. The mix copies its rows
+        // from memory; where the reader has not got there yet, the file is read as before and the line says so
+        // ("[ns read] fallback"). The bytes are the file's either way: the same samples in the same order.
+        // TF_NATIVE_SOUND_READER=0: no reader (every row read from the file, as before). TF_NATIVE_SOUND_READER_VERIFY=1
+        // (tests): every row copied from memory is compared with the file's bytes, read as before.
+        namespace reader
+        {
+            constexpr uint64_t kHead = 4ull << 20, kAhead = 6ull << 20, kBehind = 1ull << 20, kChunk = 512ull << 10;
+
+            // How much it keeps, by the PC's memory: 12 GB and more 256 MB in all, files up to 16 MB whole; 6 GB and more
+            // 128 MB, up to 8 MB whole; less 48 MB, up to 2 MB whole (the rest as head + window only). In-use files are
+            // never dropped, so a stream always has its window. TF_NATIVE_SOUND_READER_CACHE_MB=<n>: that many MB in all;
+            // TF_NATIVE_SOUND_READER_RAM_MB=<n>: the tier of a PC with n MB (tests).
+            struct Limits
+            {
+                uint64_t cacheMax = 256ull << 20, wholeMax = 16ull << 20;
+            };
+            uint64_t physicalMemory()
+            {
+#if defined(_WIN32)
+                struct Status
+                {
+                    unsigned long length, load;
+                    unsigned long long totalPhys, availPhys, totalPage, availPage, totalVirtual, availVirtual, availExtended;
+                } st{};
+                st.length = sizeof(st);
+                return GlobalMemoryStatusEx(&st) ? st.totalPhys : 0;
+#else
+                const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+                return pages > 0 && page > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(page) : 0;
+#endif
+            }
+            const Limits &limits()
+            {
+                static const Limits l = []
+                {
+                    Limits r;
+                    uint64_t ram = physicalMemory();
+                    // (tests: TF_NATIVE_SOUND_READER_RAM_MB=<n> picks the tier as if the PC had n MB)
+                    if (const char *env = std::getenv("TF_NATIVE_SOUND_READER_RAM_MB"); env && *env)
+                        ram = static_cast<uint64_t>(std::max(0L, std::strtol(env, nullptr, 10))) << 20;
+                    if (ram && ram < (6ull << 30))
+                        r.cacheMax = 48ull << 20, r.wholeMax = 2ull << 20;
+                    else if (ram && ram < (12ull << 30))
+                        r.cacheMax = 128ull << 20, r.wholeMax = 8ull << 20;
+                    if (const char *env = std::getenv("TF_NATIVE_SOUND_READER_CACHE_MB"); env && *env)
+                        r.cacheMax = static_cast<uint64_t>(std::max(0L, std::strtol(env, nullptr, 10))) << 20;
+                    std::fprintf(stderr, "[ns reader] keeps up to %llu MB of the streams' files, files up to %llu MB whole (the PC has %llu MB)\n",
+                                 static_cast<unsigned long long>(r.cacheMax >> 20), static_cast<unsigned long long>(r.wholeMax >> 20),
+                                 static_cast<unsigned long long>(ram >> 20));
+                    return r;
+                }();
+                return l;
+            }
+
+            struct File
+            {
+                std::filesystem::path path;
+                uint64_t size = 0;
+                bool sized = false, failed = false, whole = false;
+                std::vector<uint8_t> head; // [0, head.size()): the whole file, or its first kHead bytes
+                std::vector<uint8_t> win;  // [base, base + win.size()): a large file's window
+                uint64_t base = 0;
+                uint64_t want = 0; // where the stream reads next
+                int users = 0;     // streams that read it now
+                int hinted = 0;    // read ahead for a part that may come
+                uint64_t lastUse = 0;
+            };
+
+            // (TODO 388 (8)) Each stream file's start, read once at sound init: its header and its first row (what a
+            // stream's open and play read at once, on the game's thread, before the reader can be ahead of them), and
+            // an album's text whole. The disc's 231 streams: about 8 MB. The bytes are the file's; a range outside them
+            // goes to the file as before.
+            struct Start
+            {
+                std::vector<uint8_t> header; // [0, header.size())
+                uint64_t rowAt = 0;
+                std::vector<uint8_t> row;   // [rowAt, rowAt + row.size()): the part's first row, every channel
+                std::vector<uint8_t> whole; // an album's text (.ALB_T)
+            };
+            std::string startKey(const std::filesystem::path &path)
+            {
+                std::string k = path.lexically_normal().generic_string();
+                for (char &c : k)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return k;
+            }
+
+            struct State
+            {
+                std::mutex m;
+                std::condition_variable cv;
+                std::map<std::string, std::shared_ptr<File>> files;
+                uint64_t clock = 0;
+                bool started = false;
+                // (TODO 388 (8)) the starts, of the disc at primeRoot; primeList is walked one file at a time when the
+                // reader has nothing a stream needs
+                std::map<std::string, Start> starts;
+                std::filesystem::path primeRoot;
+                std::vector<std::filesystem::path> primeList;
+                size_t primeNext = 0;
+                bool primeScan = false, primeSaid = false;
+                uint64_t primeBytes = 0;
+                int primeStreams = 0, primeAlbums = 0, startHits = 0;
+                std::chrono::steady_clock::time_point primeT0;
+                // (the reader's own counts, for the summary line)
+                uint64_t readBytes = 0;
+                double readMs = 0.0, readMaxMs = 0.0;
+                int reads = 0;
+                // (TF_NATIVE_SOUND_READER_VERIFY: files taken in, dropped, and taken in again after a drop)
+                std::set<std::string> dropped;
+                int cached = 0, drops = 0, again = 0;
+            };
+            // (never destroyed: the reader thread may still run while the process ends)
+            State &state()
+            {
+                static State *s = new State();
+                return *s;
+            }
+            bool enabled()
+            {
+                static const bool on = []
+                {
+                    const char *env = std::getenv("TF_NATIVE_SOUND_READER");
+                    return !(env && *env == '0');
+                }();
+                return on;
+            }
+            bool verifying()
+            {
+                static const bool on = []
+                {
+                    const char *env = std::getenv("TF_NATIVE_SOUND_READER_VERIFY");
+                    return env && *env && *env != '0';
+                }();
+                return on;
+            }
+
+            // What a file still needs read, and where (lock held). Returns false when it needs nothing now.
+            bool nextRead(File &f, uint64_t &at, uint64_t &len, bool &toHead)
+            {
+                if (f.failed || !f.sized || (f.users == 0 && f.hinted == 0))
+                    return false;
+                const uint64_t headEnd = f.whole ? f.size : std::min(f.size, kHead);
+                if (f.head.size() < headEnd)
+                {
+                    at = f.head.size();
+                    len = std::min(kChunk, headEnd - at);
+                    toHead = true;
+                    return true;
+                }
+                if (f.users == 0)
+                    f.hinted = 0; // (read ahead as asked: kept like any other, dropped when the cache is full)
+                if (f.whole || f.users == 0)
+                    return false;
+                // the window: from where the stream reads (never inside the head), kAhead of it
+                const uint64_t from = std::max(f.want, static_cast<uint64_t>(f.head.size()));
+                if (from < f.base || from > f.base + f.win.size())
+                {
+                    f.win.clear(); // (a jump: the window starts again there)
+                    f.base = from;
+                }
+                else if (from - f.base > kBehind)
+                {
+                    const uint64_t drop = from - f.base - kBehind / 2;
+                    f.win.erase(f.win.begin(), f.win.begin() + static_cast<std::ptrdiff_t>(drop));
+                    f.base += drop;
+                }
+                const uint64_t end = std::min(f.size, from + kAhead);
+                if (f.base + f.win.size() >= end)
+                    return false;
+                at = f.base + f.win.size();
+                len = std::min(kChunk, end - at);
+                toHead = false;
+                return true;
+            }
+
+            // The least recently used whole files nobody reads, dropped while the cache is over kCacheMax (lock held).
+            void trim(State &s)
+            {
+                for (;;)
+                {
+                    uint64_t total = 0;
+                    std::shared_ptr<File> oldest;
+                    std::string oldestKey;
+                    for (auto &[key, f] : s.files)
+                    {
+                        total += f->head.size() + f->win.size();
+                        if (f->users == 0 && f->hinted == 0 && (!oldest || f->lastUse < oldest->lastUse))
+                        {
+                            oldest = f;
+                            oldestKey = key;
+                        }
+                    }
+                    if (total <= limits().cacheMax || !oldest)
+                        return;
+                    if (verifying())
+                    {
+                        // (tests: the LRU's work said, so a run with a small cache shows it evicting)
+                        s.dropped.insert(oldestKey);
+                        std::fprintf(stderr, "[ns reader] TEST: '%s' dropped (%.1f MB held, the limit %.1f MB): %d dropped so far\n",
+                                     oldestKey.c_str(), static_cast<double>(total) / 1048576.0,
+                                     static_cast<double>(limits().cacheMax) / 1048576.0, ++s.drops);
+                    }
+                    s.files.erase(oldestKey);
+                }
+            }
+
+            // (TODO 388 (8)) One step of reading the streams' starts (lock held on entry and return; the disk is read
+            // without it). False when there is nothing left to do.
+            bool primeStep(State &s, std::unique_lock<std::mutex> &lock)
+            {
+                if (s.primeRoot.empty() || (!s.primeScan && s.primeNext >= s.primeList.size()))
+                    return false;
+                const std::filesystem::path root = s.primeRoot;
+                if (s.primeScan)
+                {
+                    s.primeScan = false;
+                    lock.unlock();
+                    std::vector<std::filesystem::path> list;
+                    std::error_code ec;
+                    for (std::filesystem::recursive_directory_iterator it(root / "SOUND", ec), end; !ec && it != end; it.increment(ec))
+                    {
+                        if (!it->is_regular_file(ec))
+                            continue;
+                        std::string ext = it->path().extension().string();
+                        for (char &c : ext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        if (ext == ".MS" || ext == ".ALB_T")
+                            list.push_back(it->path());
+                    }
+                    std::sort(list.begin(), list.end());
+                    lock.lock();
+                    if (s.primeRoot == root)
+                    {
+                        s.primeList = std::move(list);
+                        s.primeNext = 0;
+                    }
+                    return true;
+                }
+                const std::filesystem::path path = s.primeList[s.primeNext++];
+                const bool last = s.primeNext >= s.primeList.size();
+                lock.unlock();
+                Start st;
+                bool album = false;
+                {
+                    std::string ext = path.extension().string();
+                    for (char &c : ext)
+                        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    album = ext == ".ALB_T";
+                }
+                std::ifstream in(path, std::ios::binary);
+                if (in && album)
+                {
+                    std::error_code ec;
+                    const uint64_t size = std::filesystem::file_size(path, ec);
+                    if (!ec && size > 0 && size <= (256u << 10))
+                    {
+                        st.whole.resize(static_cast<size_t>(size));
+                        if (!in.read(reinterpret_cast<char *>(st.whole.data()), static_cast<std::streamsize>(size)))
+                            st.whole.clear();
+                    }
+                }
+                else if (in)
+                {
+                    st.header.resize(0x28);
+                    data::StreamHeader h;
+                    if (in.read(reinterpret_cast<char *>(st.header.data()), 0x28) && data::readStreamHeader(st.header.data(), 0x28, h))
+                    {
+                        st.rowAt = h.dataOffset ? h.dataOffset : 0x8000u;
+                        st.row.resize(static_cast<size_t>(h.interleave) * h.channels);
+                        in.clear();
+                        in.seekg(static_cast<std::streamoff>(st.rowAt));
+                        if (!in.read(reinterpret_cast<char *>(st.row.data()), static_cast<std::streamsize>(st.row.size())))
+                            st.row.clear(); // (only whole rows are kept: a short one comes from the file as before)
+                    }
+                    else
+                        st.header.clear();
+                }
+                lock.lock();
+                if (s.primeRoot != root)
+                    return true; // (another disc meanwhile: its own list)
+                if (!st.header.empty() || !st.whole.empty())
+                {
+                    s.primeBytes += st.header.size() + st.row.size() + st.whole.size();
+                    ++(album ? s.primeAlbums : s.primeStreams);
+                    s.starts[startKey(path)] = std::move(st);
+                }
+                if (last && !s.primeSaid)
+                {
+                    s.primeSaid = true;
+                    std::fprintf(stderr, "[ns reader] the starts of %d streams and %d albums read ahead (%.1f MB) in %.0f ms\n",
+                                 s.primeStreams, s.primeAlbums, static_cast<double>(s.primeBytes) / 1048576.0,
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s.primeT0).count());
+                }
+                return true;
+            }
+
+            void loop();
+            void ensureThread(State &s) // (lock held)
+            {
+                if (!s.started)
+                {
+                    s.started = true;
+                    std::thread(loop).detach();
+                }
+            }
+
+            void loop()
+            {
+                State &s = state();
+                std::map<std::string, std::ifstream> handles; // (the reader's own: the streams' are never touched)
+                std::unique_lock<std::mutex> lock(s.m);
+                for (;;)
+                {
+                    // the file whose stream is closest to running out
+                    std::shared_ptr<File> pick;
+                    std::string pickKey;
+                    uint64_t at = 0, len = 0, lead = UINT64_MAX;
+                    bool toHead = false, sizeOnly = false;
+                    for (auto &[key, f] : s.files)
+                    {
+                        if (f->failed || (f->users == 0 && f->hinted == 0))
+                            continue;
+                        if (!f->sized)
+                        {
+                            pick = f, pickKey = key, sizeOnly = true;
+                            break;
+                        }
+                        uint64_t a = 0, l = 0;
+                        bool h = false;
+                        if (!nextRead(*f, a, l, h))
+                            continue;
+                        const uint64_t d = f->users ? (a > f->want ? a - f->want : 0) : (UINT64_MAX / 2); // (hints last)
+                        if (!pick || d < lead)
+                            pick = f, pickKey = key, at = a, len = l, toHead = h, lead = d;
+                    }
+                    if (!pick)
+                    {
+                        if (primeStep(s, lock)) // (TODO 388 (8): the streams' starts, when no stream needs a read)
+                            continue;
+                        trim(s);
+                        s.cv.wait_for(lock, std::chrono::milliseconds(200));
+                        continue;
+                    }
+                    const std::filesystem::path path = pick->path;
+                    lock.unlock();
+                    // (the read itself, without the lock: the mix and the game never wait for the disk here)
+                    std::ifstream &in = handles[pickKey];
+                    if (!in.is_open())
+                        in.open(path, std::ios::binary);
+                    bool ok = static_cast<bool>(in);
+                    uint64_t size = 0;
+                    std::vector<uint8_t> chunk;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (ok && sizeOnly)
+                    {
+                        std::error_code ec;
+                        size = std::filesystem::file_size(path, ec);
+                        ok = !ec;
+                    }
+                    else if (ok)
+                    {
+                        chunk.resize(static_cast<size_t>(len));
+                        in.clear();
+                        in.seekg(static_cast<std::streamoff>(at));
+                        ok = static_cast<bool>(in.read(reinterpret_cast<char *>(chunk.data()), static_cast<std::streamsize>(len)));
+                    }
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    lock.lock();
+                    if (!ok)
+                    {
+                        pick->failed = true;
+                        handles.erase(pickKey);
+                        std::fprintf(stderr, "[ns reader] '%s' could not be read: its rows come from the file as before\n",
+                                     path.string().c_str());
+                        continue;
+                    }
+                    if (sizeOnly)
+                    {
+                        pick->size = size;
+                        pick->sized = true;
+                        pick->whole = size <= limits().wholeMax;
+                        continue;
+                    }
+                    ++s.reads;
+                    s.readBytes += len;
+                    s.readMs += ms;
+                    s.readMaxMs = std::max(s.readMaxMs, ms);
+                    // (still the place it was read for: the window may have moved meanwhile)
+                    if (toHead && at == pick->head.size())
+                        pick->head.insert(pick->head.end(), chunk.begin(), chunk.end());
+                    else if (!toHead && at == pick->base + pick->win.size())
+                        pick->win.insert(pick->win.end(), chunk.begin(), chunk.end());
+                    // (a file no stream reads and none may read soon: its own handle closed)
+                    if (pick->users == 0 && pick->hinted == 0)
+                        handles.erase(pickKey);
+                    if (handles.size() > 16)
+                        handles.clear();
+                }
+            }
+
+            std::shared_ptr<File> get(const std::filesystem::path &path)
+            {
+                State &s = state();
+                const std::string key = path.string();
+                auto &f = s.files[key];
+                if (!f)
+                {
+                    f = std::make_shared<File>();
+                    f->path = path;
+                    if (verifying())
+                    {
+                        const bool before = s.dropped.count(key) != 0;
+                        if (before)
+                            ++s.again;
+                        else
+                            ++s.cached;
+                        std::fprintf(stderr, "[ns reader] TEST: '%s' %s: %d files taken in, %d of them again after a drop\n",
+                                     key.c_str(), before ? "taken in AGAIN (it was dropped)" : "taken in", s.cached + s.again, s.again);
+                    }
+                }
+                f->lastUse = ++s.clock;
+                ensureThread(s);
+                return f;
+            }
+
+            // (TODO 388 (7, 8)) At sound init and when the disc's place changes (the mods' copy): the reader thread
+            // started now, not at the first stream, and the starts of that disc's streams read ahead.
+            // TF_NATIVE_SOUND_READER_STARTS=0: neither (the thread at the first stream, every start read from the file).
+            void prime(const std::filesystem::path &root)
+            {
+                static const bool on = []
+                {
+                    const char *env = std::getenv("TF_NATIVE_SOUND_READER_STARTS");
+                    return !(env && *env == '0');
+                }();
+                if (!enabled() || !on || root.empty())
+                    return;
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.m);
+                ensureThread(s);
+                if (root == s.primeRoot)
+                    return;
+                s.primeRoot = root;
+                s.starts.clear();
+                s.primeList.clear();
+                s.primeNext = 0;
+                s.primeScan = true;
+                s.primeSaid = false;
+                s.primeBytes = 0;
+                s.primeStreams = s.primeAlbums = 0;
+                s.primeT0 = std::chrono::steady_clock::now();
+                s.cv.notify_all();
+            }
+
+            // The bytes [at, at + n) of a stream's start, when they are all in it (lock held).
+            bool copyStart(State &s, const std::filesystem::path &path, uint64_t at, uint8_t *dst, size_t n)
+            {
+                if (s.starts.empty())
+                    return false;
+                const auto it = s.starts.find(startKey(path));
+                if (it == s.starts.end())
+                    return false;
+                const Start &st = it->second;
+                const uint8_t *from = nullptr;
+                if (at + n <= st.header.size())
+                    from = st.header.data() + at;
+                else if (!st.row.empty() && at >= st.rowAt && at + n <= st.rowAt + st.row.size())
+                    from = st.row.data() + (at - st.rowAt);
+                if (!from)
+                    return false;
+                std::memcpy(dst, from, n);
+                if (verifying())
+                    std::fprintf(stderr, "[ns reader] TEST: %s of '%s' at %llu (%zu bytes) from the read-ahead starts (%d so far)\n",
+                                 at < st.header.size() ? "a header" : "a first row", path.filename().string().c_str(),
+                                 static_cast<unsigned long long>(at), n, ++s.startHits);
+                return true;
+            }
+
+            // An album's text from the starts; false when it is not there (read from the file as before).
+            bool startText(const std::filesystem::path &path, std::vector<uint8_t> &out)
+            {
+                if (!enabled())
+                    return false;
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.m);
+                const auto it = s.starts.find(startKey(path));
+                if (it == s.starts.end() || it->second.whole.empty())
+                    return false;
+                out = it->second.whole;
+                return true;
+            }
+
+            // A stream reads this file now (from `want`); release() when it stops.
+            std::shared_ptr<File> acquire(const std::filesystem::path &path, uint64_t want)
+            {
+                if (!enabled())
+                    return nullptr;
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.m);
+                std::shared_ptr<File> f = get(path);
+                ++f->users;
+                f->want = want;
+                s.cv.notify_all();
+                return f;
+            }
+            void release(std::shared_ptr<File> &f)
+            {
+                if (!f)
+                    return;
+                State &s = state();
+                {
+                    std::lock_guard<std::mutex> lock(s.m);
+                    --f->users;
+                    f->lastUse = ++s.clock;
+                }
+                f.reset();
+            }
+            // A file a stream may play soon: its head (or all of it, when small) read ahead.
+            void hint(const std::filesystem::path &path)
+            {
+                if (!enabled())
+                    return;
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.m);
+                std::shared_ptr<File> f = get(path);
+                f->hinted = 1;
+                s.cv.notify_all();
+            }
+            // The bytes [at, at + n) from memory, when the reader has them; else false (and the reader is told where to
+            // be). The file's end is the file's: a range past it is false, as a read of the file would be.
+            bool copy(const std::shared_ptr<File> &f, uint64_t at, uint8_t *dst, size_t n)
+            {
+                if (!f)
+                    return false;
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.m);
+                f->want = at + n;
+                f->lastUse = ++s.clock;
+                s.cv.notify_all();
+                if (f->failed || !f->sized || at + n > f->size)
+                    return copyStart(s, f->path, at, dst, n); // (TODO 388 (8): a stream's start, before the reader has it)
+                if (at + n <= f->head.size())
+                {
+                    std::memcpy(dst, f->head.data() + at, n);
+                    return true;
+                }
+                if (at >= f->base && at + n <= f->base + f->win.size())
+                {
+                    std::memcpy(dst, f->win.data() + (at - f->base), n);
+                    return true;
+                }
+                // (a row across the head's end: its start from the head, the rest from the window, which starts there)
+                if (at < f->head.size() && f->base == f->head.size() && at + n <= f->base + f->win.size())
+                {
+                    const size_t first = static_cast<size_t>(f->head.size() - at);
+                    std::memcpy(dst, f->head.data() + at, first);
+                    std::memcpy(dst + first, f->win.data(), n - first);
+                    return true;
+                }
+                if (copyStart(s, f->path, at, dst, n)) // (TODO 388 (8): a part's first row, its head not read yet)
+                    return true;
+                f->want = at; // (behind: from here)
+                return false;
+            }
+        }
+
+        // A stream's hold on its file in the reader (released when the stream lets the file go or is destroyed).
+        struct ReaderHold
+        {
+            std::shared_ptr<reader::File> f;
+            ReaderHold() = default;
+            ReaderHold(const ReaderHold &) = delete;
+            ReaderHold &operator=(const ReaderHold &) = delete;
+            ReaderHold(ReaderHold &&o) noexcept : f(std::move(o.f)) {}
+            ReaderHold &operator=(ReaderHold &&o) noexcept
+            {
+                if (this != &o)
+                {
+                    reader::release(f);
+                    f = std::move(o.f);
+                }
+                return *this;
+            }
+            ~ReaderHold() { reader::release(f); }
+        };
+
         // ---- streams -------------------------------------------------------------------------
         struct Stream
         {
@@ -604,7 +1240,13 @@ namespace native_sound::mixer
             bool isAlbum = false;
             int tune = 0, part = 0, repeatsDone = 0;
             std::string pendingTune;
+            // (TODO 384 (c)) The part's file: in the reader's memory (src), read from the file only where the reader is
+            // behind (in, opened then). pos: where the next row starts in it.
+            ReaderHold src;
             std::ifstream in;
+            bool inOpen = false, partOk = false;
+            uint64_t pos = 0;
+            std::string partFile; // (the part's file: the read lines)
             data::StreamHeader header;
             uint32_t rowsLeft = 0; // interleave rows still to read
             std::array<int32_t, 8> h1{}, h2{};
@@ -627,18 +1269,107 @@ namespace native_sound::mixer
 
         std::map<int32_t, Stream> g_streams;
 
+        // (TODO 384 (c)) n bytes of the part's file at `at`: from the reader's memory, else from the file (opened then) -
+        // the fallback, said in its line. The same bytes either way.
+        bool readAt(Stream &s, uint64_t at, uint8_t *dst, size_t n, const char *what)
+        {
+            if (reader::copy(s.src.f, at, dst, n))
+            {
+                if (reader::verifying())
+                {
+                    // (tests: the file's own bytes beside them)
+                    std::vector<uint8_t> check(n);
+                    std::ifstream f(discPath(s.partFile), std::ios::binary);
+                    f.seekg(static_cast<std::streamoff>(at));
+                    const bool ok = static_cast<bool>(f.read(reinterpret_cast<char *>(check.data()), static_cast<std::streamsize>(n)));
+                    // The counts, a line at the first check and then every 5 s (the game ends with _Exit: no line at the
+                    // end), so a test states how many it checked.
+                    static int rows = 0, headers = 0, bad = 0;
+                    static uint64_t bytes = 0;
+                    static auto said = std::chrono::steady_clock::time_point{};
+                    ++(std::strcmp(what, "a row") == 0 ? rows : headers);
+                    bytes += n;
+                    if (!ok || std::memcmp(check.data(), dst, n) != 0)
+                        std::fprintf(stderr, "[ns reader] VERIFY: %s of '%s' at %llu (%zu bytes) DIFFERS from the file (%d so far)\n", what,
+                                     s.partFile.c_str(), static_cast<unsigned long long>(at), n, ++bad);
+                    if (const auto now = std::chrono::steady_clock::now(); now - said >= std::chrono::seconds(5))
+                    {
+                        said = now;
+                        std::fprintf(stderr, "[ns reader] VERIFY %s: %d rows and %d part headers checked (%.1f MB), %d differ\n",
+                                     readClock().c_str(), rows, headers, static_cast<double>(bytes) / 1048576.0, bad);
+                    }
+                }
+                return true;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!s.inOpen)
+            {
+                s.in.close();
+                s.in.clear();
+                s.in.open(discPath(s.partFile), std::ios::binary);
+                s.inOpen = true;
+            }
+            s.in.clear();
+            s.in.seekg(static_cast<std::streamoff>(at));
+            const bool ok = s.in && static_cast<bool>(s.in.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(n)));
+            const double ms = msSince(t0);
+            if (reader::enabled())
+            {
+                static int said = 0;
+                if (said < 40 || ms > 1.0)
+                {
+                    ++said;
+                    std::fprintf(stderr, "[ns read] %s fallback: %s of '%s' at %llu (%zu bytes) read from the file in %.2f ms on %s "
+                                         "(the reader was behind)\n",
+                                 readClock().c_str(), what, s.partFile.c_str(), static_cast<unsigned long long>(at), n, ms,
+                                 t_mixingThread ? "the mixing thread" : "the game thread");
+                }
+            }
+            return ok;
+        }
+
+        // The parts a stream may play next, read ahead by the reader (TODO 384 (c)): the next part of its tune, the
+        // same one again (a repeat, a loop), and a tune asked for.
+        void hintNext(const Stream &s)
+        {
+            if (!reader::enabled())
+                return;
+            if (!s.isAlbum)
+            {
+                if (!s.partFile.empty())
+                    reader::hint(discPath(s.partFile));
+                return;
+            }
+            if (s.tune >= 0 && s.tune < static_cast<int>(s.album.tunes.size()))
+            {
+                const data::Album::Tune &t = s.album.tunes[static_cast<size_t>(s.tune)];
+                for (int p : {s.part, s.part + 1})
+                    if (p >= 0 && p < static_cast<int>(t.parts.size()))
+                        reader::hint(discPath(t.parts[static_cast<size_t>(p)].file));
+            }
+            if (!s.pendingTune.empty())
+                for (const auto &t : s.album.tunes)
+                    if (t.name == s.pendingTune && !t.parts.empty())
+                        reader::hint(discPath(t.parts.front().file));
+        }
+
         bool openPart(Stream &s, const std::string &file)
         {
             s.in.close();
             s.in.clear();
-            s.in.open(discPath(file), std::ios::binary);
+            s.inOpen = false;
+            s.partOk = false;
+            s.partFile = file;
+            reader::release(s.src.f);
+            s.src.f = reader::acquire(discPath(file), 0);
             uint8_t h[0x28];
-            if (!s.in || !s.in.read(reinterpret_cast<char *>(h), sizeof(h)) || !data::readStreamHeader(h, sizeof(h), s.header))
+            if (!readAt(s, 0, h, sizeof(h), "a part's header") || !data::readStreamHeader(h, sizeof(h), s.header))
             {
                 std::fprintf(stderr, "[native sound] stream file '%s' not readable\n", file.c_str());
                 return false;
             }
-            s.in.seekg(s.header.dataOffset ? s.header.dataOffset : 0x8000u);
+            s.pos = s.header.dataOffset ? s.header.dataOffset : 0x8000u;
+            s.partOk = true;
             s.samplesLeft = s.header.samples;
             s.sampleRate = s.header.sampleRate;
             s.pitchReg = pitchRegister(s.sampleRate, s.pitch);
@@ -655,8 +1386,13 @@ namespace native_sound::mixer
             const data::StreamHeader &h = s.header;
             std::vector<uint8_t> &row = s.rowBytes; // (every byte read over below, or the row is not used)
             row.resize(static_cast<size_t>(h.interleave) * h.channels);
-            if (!s.in.read(reinterpret_cast<char *>(row.data()), static_cast<std::streamsize>(row.size())))
+            const bool read = s.partOk && readAt(s, s.pos, row.data(), row.size(), "a row");
+            if (!read)
+            {
+                s.partOk = false; // (as a file read past its end: no more rows of this part)
                 return false;
+            }
+            s.pos += row.size();
             for (uint32_t c = 0; c < h.channels && c < 8; ++c)
                 for (uint32_t b = 0; b + 16 <= h.interleave; b += 16)
                 {
@@ -716,7 +1452,9 @@ namespace native_sound::mixer
                 std::fprintf(stderr, "[native sound] album '%s': tune '%s' part %d '%s'\n", s.file.c_str(), t->name.c_str(), s.part,
                              t->parts[static_cast<size_t>(s.part)].file.c_str());
             s.index = s.part;
-            return openPart(s, t->parts[static_cast<size_t>(s.part)].file);
+            const bool opened = openPart(s, t->parts[static_cast<size_t>(s.part)].file);
+            hintNext(s);
+            return opened;
         }
 
         // The next sample of each channel into the resampling history; false at the end.
@@ -1132,11 +1870,16 @@ namespace native_sound::mixer
     }
 
     // ---- the disc -------------------------------------------------------------------------
-    void useDisc(const std::filesystem::path &cdRoot) { g_disc = cdRoot; }
+    void useDisc(const std::filesystem::path &cdRoot)
+    {
+        g_disc = cdRoot;
+        reader::prime(cdRoot); // (TODO 388 (8): the mods' copy: its streams' starts; nothing when it is the same disc)
+    }
 
     void setDisc(const std::filesystem::path &cdRoot)
     {
         g_disc = cdRoot;
+        reader::prime(cdRoot); // (TODO 388 (7, 8): the reader started at sound init, the streams' starts read ahead)
         g_reverb.loadPresets();
         loadSirensTables(g_disc / "IOP" / "SIRENS3.IRX");
     }
@@ -1675,9 +2418,22 @@ namespace native_sound::mixer
         if (n.size() > 6 && n.compare(n.size() - 6, 6, ".ALB_T") == 0)
         {
             std::vector<uint8_t> text;
-            std::ifstream f(discPath(name), std::ios::binary);
-            if (f)
-                text.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            // (TODO 388 (8): the album's text from the reader's starts, else from the file as before)
+            if (!reader::startText(discPath(name), text))
+            {
+                std::ifstream f(discPath(name), std::ios::binary);
+                if (f)
+                    text.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            }
+            else if (reader::verifying())
+            {
+                std::ifstream f(discPath(name), std::ios::binary);
+                std::vector<uint8_t> file;
+                if (f)
+                    file.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                std::fprintf(stderr, "[ns reader] VERIFY: the album '%s' (%zu bytes) from the read-ahead starts %s the file\n",
+                             name.c_str(), text.size(), file == text ? "is the same as" : "DIFFERS from");
+            }
             if ((text.empty() && !g_archive.read(name, text)) || !data::loadAlbum(text, s.album) || s.album.tunes.empty())
             {
                 std::fprintf(stderr, "[native sound] album '%s' not readable\n", name.c_str());
@@ -1687,11 +2443,15 @@ namespace native_sound::mixer
             const data::Album::Tune &t = s.album.tunes.front();
             if (!t.parts.empty())
                 openPart(s, t.parts.front().file);
+            hintNext(s);
             std::fprintf(stderr, "[native sound] album '%s' (\"%s\"): %zu tune(s), plays '%s' part 0 '%s'\n", name.c_str(),
                          s.album.name.c_str(), s.album.tunes.size(), t.name.c_str(), t.parts.empty() ? "-" : t.parts.front().file.c_str());
         }
         else
+        {
             openPart(s, name);
+            hintNext(s);
+        }
         s.open = true;
         // (each stream the game opens: the music and the ambience of a level - the user heard none
         // in Antarctica, 2026-10-23)
@@ -1706,7 +2466,7 @@ namespace native_sound::mixer
             s.playing = true;
             return;
         }
-        if (!s.in.is_open())
+        if (!s.partOk && !s.inOpen)
         {
             std::fprintf(stderr, "[native sound] stream %d asked to play, but no file is open ('%s')\n", handle, s.file.c_str());
             return;
@@ -1735,6 +2495,9 @@ namespace native_sound::mixer
         s.playing = false;
         s.open = false;
         s.in.close();
+        s.inOpen = false;
+        s.partOk = false;
+        reader::release(s.src.f);
     }
 
     void switchTune(int32_t handle, bool immediately, const std::string &tune)
@@ -1745,6 +2508,7 @@ namespace native_sound::mixer
         if (!immediately && s.playing)
         {
             s.pendingTune = tune;
+            hintNext(s); // (TODO 384 (c): its first part read ahead, for when the part playing ends)
             return;
         }
         for (size_t i = 0; i < s.album.tunes.size(); ++i)
@@ -1756,6 +2520,7 @@ namespace native_sound::mixer
                 s.index = 0;
                 if (!s.album.tunes[i].parts.empty())
                     openPart(s, s.album.tunes[i].parts.front().file);
+                hintNext(s);
                 s.finished = false;
             }
     }
@@ -1770,6 +2535,7 @@ namespace native_sound::mixer
         s.repeatsDone = 0;
         s.index = part;
         openPart(s, t->parts[static_cast<size_t>(part)].file);
+        hintNext(s);
     }
 
     void setStreamLoudness(int32_t handle, uint32_t loudness) { g_streams[handle].loudness = loudnessGain(loudness); }
@@ -1968,6 +2734,8 @@ namespace native_sound::mixer
         g_fraction -= static_cast<double>(frames);
         mixFrames(frames);
     }
+
+    void markMixingThread() { t_mixingThread = true; }
 
     // The frames mixed ahead are not taken off the game's later mixes: the time a hitch costs the
     // game is lost for good (the EE scheduler catches up two VBlank periods at most, then goes on

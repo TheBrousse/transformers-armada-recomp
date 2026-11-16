@@ -4,6 +4,7 @@
 #include "cam_trace.h"
 #include "camera_mode.h"
 #include "photo_mode.h"
+#include "runtime/ps2_settings.h"
 #include "playrec.h"
 #include "port.h"
 #include "ps2_runtime.h"
@@ -317,6 +318,9 @@ namespace view_turn
         bool reticleKept = false;  // (TODO 292 B: the crosshair model's draws left unturned this frame)
         bool reticleKnown = false; // (and where it is, for TF_XHAIR_PICTURE_LOG)
         double reticle[3] = {};
+        float mouseZoom = 1.0f;   // (TODO 396: the aiming view's zoom factor the frame's mouse travel was scaled by)
+        float fov = 0.0f;         // (TODO 396: the game's field of view, degrees, when the frame ended)
+        bool aimNarrow = false;   // (and the aiming view at a narrow field: the turn left off there)
     };
 
     bool enabled()
@@ -428,6 +432,100 @@ namespace view_turn
     }
 
     bool testMouseOn() { return g_mouse.testOn.load(std::memory_order_relaxed); }
+
+    namespace
+    {
+        std::atomic<float> g_gameFov{0.0f};
+        std::atomic<float> g_mouseZoom{1.0f};
+        // TF_AIM_TURN: 0 = no turn for every picture at the narrow aiming view; 1 = as before (the travel not scaled by the zoom);
+        // anything else / unset = kept, the travel scaled by the aiming zoom as the game's own frame is.
+        int aimTurnMode()
+        {
+            static const int m = std::getenv("TF_AIM_TURN") ? std::atoi(std::getenv("TF_AIM_TURN")) : 2;
+            return m;
+        }
+        double g_owedX = 0.0, g_owedY = 0.0;
+        double narrowDegrees()
+        {
+            static const double v = std::getenv("TF_AIM_FOV_NARROW") ? std::atof(std::getenv("TF_AIM_FOV_NARROW")) : 55.0;
+            return v;
+        }
+    }
+
+    void noteMouseZoom(float zoom) { g_mouseZoom.store(zoom, std::memory_order_relaxed); }
+
+    namespace
+    {
+        std::atomic<float> g_scopeSens{1.0f};
+        float sensFrom(const std::string &value)
+        {
+            const float p = value.empty() ? 100.0f : static_cast<float>(std::atof(value.c_str()));
+            return p > 0.0f ? std::clamp(p, 5.0f, 100.0f) / 100.0f : 1.0f;
+        }
+    }
+
+    float aimSensitivity() { return camera_mode::lookState() ? g_scopeSens.load(std::memory_order_relaxed) : 1.0f; }
+
+    void addSettings()
+    {
+        if (const char *env = std::getenv("TF_SCOPE_SENSITIVITY"); env && *env)
+            g_scopeSens.store(sensFrom(env));
+        ps2_settings::Setting s;
+        s.key = "TF_SCOPE_SENSITIVITY";
+        s.section = "Gameplay";
+        s.label = "Scope sensitivity";
+        s.order = 7;
+        s.help = "How fast the mouse turns the view while you aim (R3 / right mouse button), the zoom steps and the sniper Mini-Con's scope. 100% is the game's own speed; lower is slower and steadier.";
+        s.choices = {{"100", "100%"}, {"75", "75%"}, {"50", "50%"}, {"35", "35%"}, {"25", "25%"}};
+        s.defaultValue = "100";
+        s.apply = [](const std::string &value)
+        {
+            g_scopeSens.store(sensFrom(value));
+            std::fprintf(stderr, "[turn] scope sensitivity %.0f%% (F1 > Gameplay > Scope sensitivity; TF_SCOPE_SENSITIVITY)\n", static_cast<double>(g_scopeSens.load()) * 100.0);
+            return true;
+        };
+        ps2_settings::add(s);
+    }
+
+    void noteGameFov(float degrees)
+    {
+        const float was = g_gameFov.exchange(degrees, std::memory_order_relaxed);
+        static int told = 0;
+        if (std::fabs(was - degrees) > 0.05f && told++ < 200)
+            std::fprintf(stderr, "[turn] the game's field of view %.2f degrees (was %.2f)%s\n", static_cast<double>(degrees), static_cast<double>(was),
+                         degrees > 1.0f && degrees <= narrowDegrees() ? ": a narrow aiming view (TF_AIM_TURN=0 / TF_AIM_SMOOTH=1 act here)" : "");
+    }
+
+    bool aimNarrow()
+    {
+        const float f = g_gameFov.load(std::memory_order_relaxed);
+        return f > 1.0f && f <= narrowDegrees();
+    }
+
+    void smoothAimTravel(float &pixelsX, float &pixelsY, float dtSeconds)
+    {
+        // (off unless TF_AIM_SMOOTH=1, and only with TF_AIM_TURN=0: measured 2026-11-16 it does not even the steps - the uneven
+        // steps are the game's frames against the pictures, not the mouse's travel - and with the turn for every picture on
+        // it would count the travel it still owes twice)
+        static const bool off = !(std::getenv("TF_AIM_SMOOTH") && *std::getenv("TF_AIM_SMOOTH") == '1') || aimTurnMode() != 0;
+        static const double tau = (std::getenv("TF_AIM_SMOOTH_MS") ? std::atof(std::getenv("TF_AIM_SMOOTH_MS")) : 4.0) / 1000.0;
+        if (off || tau <= 0.0 || !aimNarrow())
+        {
+            // (left the narrow view: what was owed goes out with this take - nothing lost)
+            pixelsX += static_cast<float>(g_owedX);
+            pixelsY += static_cast<float>(g_owedY);
+            g_owedX = g_owedY = 0.0;
+            return;
+        }
+        const double a = dtSeconds / (dtSeconds + tau);
+        g_owedX += pixelsX;
+        g_owedY += pixelsY;
+        const double ox = g_owedX * a, oy = g_owedY * a;
+        g_owedX -= ox;
+        g_owedY -= oy;
+        pixelsX = static_cast<float>(ox);
+        pixelsY = static_cast<float>(oy);
+    }
 
     void noteTurned(const uint8_t *rdram, uint32_t control, float mouseYaw, float mousePitch, float frameSeconds)
     {
@@ -650,6 +748,9 @@ namespace view_turn
                     fc->reticle[i] = at[i];
             }
         }
+        fc->fov = g_gameFov.load(std::memory_order_relaxed);
+        fc->aimNarrow = aimTurnMode() == 0 && aimNarrow();
+        fc->mouseZoom = aimTurnMode() == 1 ? 1.0f : g_mouseZoom.load(std::memory_order_relaxed);
         fc->cameras = std::move(g.cameras);
         g.cameras.clear();
         g.index = 0;
@@ -945,8 +1046,8 @@ namespace view_turn
             // stick to the camera, the game turns it as the stick, below.)
             if (fc.mouseDirect)
             {
-                yaw = -(x - fc.anchorX) * kRadiansPerPixel;
-                pitch = (y - fc.anchorY) * kRadiansPerPixel;
+                yaw = -(x - fc.anchorX) * kRadiansPerPixel * fc.mouseZoom;
+                pitch = (y - fc.anchorY) * kRadiansPerPixel * fc.mouseZoom;
             }
             // (the stick: the game turns it a step a frame, its own time - so only by the picture's place among the frame's
             // moments (0 for the frame's own picture: never ahead of what the game shows, never jittered by the threads'
@@ -1004,6 +1105,9 @@ namespace view_turn
         out.valid = true;
         out.yawShown = fc.yawUnwrapped - (fc.yaw - poseYaw);
         out.sampleNs = fc.anchorNs;
+        // (TODO 396) The aiming view at a narrow field (its zoomed steps, a scope): the frame's own view, no turn for the picture.
+        if (fc.aimNarrow)
+            return;
         if (!enabled() || camera < 0 || camera >= static_cast<int>(fc.cameras.size()))
             return;
         // Its moment plus the lead: waited for if it is ahead (by up to waitMs), else read now.
@@ -1060,8 +1164,15 @@ namespace view_turn
             }
             if (maxRad > 0.0)
             {
-                dYaw = std::clamp(dYaw, -maxRad, maxRad);
-                dPitch = std::clamp(dPitch, -maxRad / 3.0, maxRad / 3.0);
+                // (TODO 396) The bound grows with the frame's own turn: a turn of 6.5 degrees a frame (the scope at 6000 px/s, the game at
+                // 104 frames a second) needs 13 degrees for the picture to show where the view will be - held to 8, the view lagged by
+                // the rest (measured: the bound hit in 93% of the pictures). TF_TURN_MAX_FRAMES=<n> frames of the frame's own turn at
+                // most (2.5 by default); 0: the fixed bound as before.
+                static const double frames = std::getenv("TF_TURN_MAX_FRAMES") ? std::atof(std::getenv("TF_TURN_MAX_FRAMES")) : 2.5;
+                const double yawBound = std::max(maxRad, frames * std::fabs(fc.dYaw));
+                const double pitchBound = std::max(maxRad / 3.0, frames * std::fabs(fc.dPitch));
+                dYaw = std::clamp(dYaw, -yawBound, yawBound);
+                dPitch = std::clamp(dPitch, -pitchBound, pitchBound);
             }
         }
         const double targetYaw = fc.yaw + dYaw;
@@ -1069,11 +1180,12 @@ namespace view_turn
         const double turnYaw = wrapAngle(targetYaw - poseYaw), turnPitch = targetPitch - posePitch;
         // (TF_TURN_DEBUG=1, a measuring aid: each picture's turn, its frame's tick, pose and the frame's own turn - degrees)
         if (static const bool debug = std::getenv("TF_TURN_DEBUG") && *std::getenv("TF_TURN_DEBUG") == '1'; debug)
-            std::fprintf(stderr, "[turn debug] tick %llu s %.2f: turn yaw %+.2f pitch %+.2f (mouse/stick %+.2f %+.2f, frame %+.2f %+.2f), pitch %.2f, %.1f ms frame; pivot %.1f %.1f %.1f, the eye %.1f from it\n",
+            std::fprintf(stderr, "[turn debug] tick %llu s %.2f: turn yaw %+.2f pitch %+.2f (mouse/stick %+.2f %+.2f, frame %+.2f %+.2f), pitch %.2f, %.1f ms frame; pivot %.1f %.1f %.1f, the eye %.1f from it [kind %d direct %d zoom %.2f]\n",
                          static_cast<unsigned long long>(fc.tick), sc, turnYaw * 57.2958, turnPitch * 57.2958, dYaw * 57.2958, dPitch * 57.2958,
                          fc.dYaw * 57.2958, fc.dPitch * 57.2958, fc.pitch * 57.2958, fc.realFrameMs, fc.pivot[0], fc.pivot[1], fc.pivot[2],
                          std::sqrt((fc.eye[0] - fc.pivot[0]) * (fc.eye[0] - fc.pivot[0]) + (fc.eye[1] - fc.pivot[1]) * (fc.eye[1] - fc.pivot[1]) +
-                                   (fc.eye[2] - fc.pivot[2]) * (fc.eye[2] - fc.pivot[2])));
+                                   (fc.eye[2] - fc.pivot[2]) * (fc.eye[2] - fc.pivot[2])),
+                         fc.kind, fc.mouseDirect ? 1 : 0, static_cast<double>(fc.mouseZoom));
         out.yawShown = fc.yawUnwrapped - (fc.yaw - poseYaw) + turnYaw;
         if (std::fabs(turnYaw) < 1e-7 && std::fabs(turnPitch) < 1e-7)
             return;

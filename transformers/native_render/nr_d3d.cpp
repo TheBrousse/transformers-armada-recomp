@@ -110,6 +110,7 @@ cbuffer Draw : register(b0)
                                    // w: (TODO 299) the scene's 3D for the temporal upscaler - jittered, its motion written
     float4 lightsB[3];             // (N9 stage 3) p[8..10] of 0x21f0 (the lights, the eye in the mesh's space) in the frame before's pose
     float4 clipRowsM[4];           // (TODO 101 a) clipRows halfway between the two poses, along the turn (nr_passes.cpp midPose)
+    float4 fogx;                   // (TODO 399) x: a 3D tree takes the depth fog in its own shader (t1 = the fog's palette); y: the fog's strength, used when w is set
 };
 // (N9 stage 3) The picture: one frame's recording drawn once for each picture between frames, these its own - where it lies
 // between the frame before's pose and this frame's (each matrix blended so), and the camera's turn since the frame's input.
@@ -875,6 +876,9 @@ float4 psColour(VsOut i)
         float d = depthTex.Load(int3(i.pos.xy, 0));
         uint z = (uint)min(d * 268435456.0, 16777215.0); // (the depth is GS Z * 16 / 2^32: Z24 back)
         t = palette.Load(int3((z >> 8) & 255u, 0, 0));
+        // (TODO 399: the haze's strength, the F1 slider. The palette's alpha is how much of the SCENE stays - 0 at the far end,
+        // where the fog colour takes over: so a strength s keeps 1 - (1 - alpha) s of it.)
+        t.a = saturate(1.0 - (1.0 - t.a) * (fogx.w > 0.5 ? fogx.y : 1.0));
         if ((int)mode.x == 16)
             return float4(((z >> 8) & 255u) / 255.0, saturate(d * 4294967296.0 / 65536.0), saturate(d * 268435456.0 / 65536.0), 0.0); // (debug: TF_NATIVE_FOGDEBUG; alpha 0: the fog's blend keeps the source)
     }
@@ -920,6 +924,19 @@ float4 psColour(VsOut i)
     }
 #endif
     float3 rgb = saturate(c.rgb);
+    if (fogx.x > 0.5)
+    {
+        // (TODO 399) The game draws its 3D trees after the depth fog's pass, so the trees this port draws far past the console's
+        // reach had no haze while the terrain behind them had (dark trees on a pale hill). The same fog here, from the pixel's
+        // own depth (the pass's rule: where Z24 is at most 0xFFFF, the palette's entry at its bits 8-15), by the pass's blend:
+        // the colour moved towards the palette's by its alpha.
+        const uint z24 = (uint)min(i.pos.z * 268435456.0, 16777215.0);
+        if (z24 <= 65535u)
+        {
+            const float4 fp = palette.Load(int3((z24 >> 8) & 255u, 0, 0));
+            rgb = lerp(rgb, saturate(fp.rgb), saturate((1.0 - fp.a) * (fogx.w > 0.5 ? fogx.y : 1.0))); // (the palette's alpha: the share of the scene that stays)
+        }
+    }
     if (dest.y > 0.5)
         rgb = saturate(rgb * (dest.y > 1.5 ? dest.z : min(c.a, 255.0 / 128.0))); // (Cs * As or Cs * FIX: blendOf's premultiply)
     if (taa.x > 0.5 && pose.w > 0.5)

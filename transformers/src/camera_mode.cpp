@@ -97,6 +97,7 @@ namespace camera_mode
         int g_wanted = -1; // the script the game last switched to (before our substitution)
         std::atomic<bool> g_inVehicle{false}; // the game's own view is the car's (whatever first person shows)
         std::atomic<int64_t> g_updatedMs{0};  // when the manager last updated (none in menus or the HQ)
+        std::atomic<bool> g_lookState{false}; // (TODO 396) the player's state is the aiming view's
         std::atomic<bool> g_aim{false};       // first person on foot as the aiming view (TF_FIRST_PERSON_AIM)
         std::atomic<bool> g_freeLook{true};   // first person on foot: the view by the camera control (TF_FIRST_PERSON_FREE)
         std::atomic<uint32_t> g_cameraTransform{0u}; // the current camera's mlTransform (noteCameraTransform)
@@ -558,6 +559,8 @@ namespace camera_mode
     }
     void noteCameraTransform(uint32_t transform) { g_cameraTransform.store(transform, std::memory_order_relaxed); }
     bool aim() { return g_aim.load(); }
+    bool lookState() { return g_lookState.load(std::memory_order_relaxed); }
+
     bool inVehicle()
     {
         // (a view not updated for half a second: no level running, not the car)
@@ -664,6 +667,7 @@ namespace camera_mode
         const uint32_t actor = inLevel && rdram ? playerActor(rdram) : 0u;
         const uint32_t state = actor ? word(rdram, actor + kCurrentState) : ~0u;
         const uint32_t look = actor ? word(rdram, actor + kStates + 4u * kLookState) : 0u;
+        g_lookState.store(actor && state == kLookState, std::memory_order_relaxed);
         if (g_reconTrace && actor)
         {
             // (TODO 292 G, a measuring aid: the player's state changes, and whether an "into recon mode" click got there)

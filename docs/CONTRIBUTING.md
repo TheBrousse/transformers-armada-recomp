@@ -26,6 +26,7 @@ recordings. Screenshots and short videos are fine.
 
 `main` must always build and play. A pull request is merged once it builds and the game still plays with it.
 
+
 ### Changes to PS2Recomp
 
 The `PS2Recomp` folder is a submodule and is never committed to directly. Changes to it live as patch files in

@@ -21,7 +21,8 @@
 // the next step, so the steps themselves are the console's. The forces given between two steps (a hit's push, the
 // game's ApplyForce 0x3C4F30) are kept for the next step, as the console gives them to its next frame.
 // TF_RAGDOLL_FIXED_STEP=0: a step every frame, as before; TF_RAGDOLL_SMOOTH=0: the steps shown as they are (30 a
-// second); TF_RAGDOLL_STEP_LOG=1: each step's ragdoll, its time and its root particle.
+// second); TF_RAGDOLL_STEP_LOG=1: each step's ragdoll, its time and its root particle; TF_RAGDOLL_FIRST_STEP=0: a new
+// doll's first step takes only its frame's time, as before TODO 368.
 #include "ragdoll_step.h"
 
 #include "port.h"
@@ -46,7 +47,7 @@ namespace ragdoll_step
         constexpr uint32_t kParticleSize = 0x50u, kActive = 0x48u; // (+0x48: Update leaves at once when 0)
         constexpr uint32_t kMaxParticles = 256u;
         PS2Runtime::RecompiledFunction g_update = nullptr;
-        bool g_on = true, g_smooth = true, g_log = false;
+        bool g_on = true, g_smooth = true, g_log = false, g_firstStep = true;
 
         struct Doll
         {
@@ -54,6 +55,7 @@ namespace ragdoll_step
             uint64_t seen = 0u;          // (the VBlank it was last stepped or shown at)
             float credit = 0.0f;         // 30/R a frame; a step at 1
             float time = 0.0f;           // the frames' time since the last step
+            bool first = true;           // its first step still to come (a console frame's time: TODO 368)
             bool before = false;         // a step before the last: the blend's start
             bool shown = false;          // the particles hold the blend, `real` the simulation's own positions
             std::vector<float> real, last, shown_; // (x y z a particle: the simulation's, the last step's start, what is shown)
@@ -178,6 +180,19 @@ namespace ragdoll_step
                 d.before = true;
                 if (g_log)
                     logStep(rdram, runtime, self, count, particles, d.time);
+                // (TODO 368: a doll's first step takes a console frame's time - the frame's time x R/30, 1/30 s or less in
+                // slow motion - not the one frame it started in. A hit that knocks a creature down starts its ragdoll and
+                // gives it the push in the same frame (the knock-down's CalculateRagDollEffect): forces go in for one
+                // step as force x mass x dt^2, so a first step of 1/R s gave the hit 30/R of its speed - at 60 half the
+                // flight, at 240 an eighth. Later steps sum the frames' time to a console frame already.)
+                if (d.first && g_firstStep)
+                {
+                    if (g_log)
+                        std::fprintf(stderr, "[ragdoll step] doll %08x: first step %.4f s (a console frame) instead of %.4f\n", self,
+                                     d.time / share, d.time);
+                    d.time /= share;
+                }
+                d.first = false;
                 ctx->f[12] = d.time;
                 d.time = 0.0f;
                 g_update(rdram, ctx, runtime);
@@ -199,12 +214,73 @@ namespace ragdoll_step
         }
     }
 
+    // (TODO 368, a tools log: TF_RAGDOLL_CALL_LOG=1) The game's pushes into a ragdoll as they come, every frame: ApplyPointImpact
+    // 0x3C4F30 (adds to a particle's force), ApplyExplosion 0x3C4D40, SetJointVelocity 0x3C65F0 - the tick, the doll (a0), the
+    // other argument registers, the float ones, and three floats at a1 / a2 where they point into memory.
+    namespace calllog
+    {
+        struct Hook
+        {
+            uint32_t at;
+            const char *name;
+            PS2Runtime::RecompiledFunction orig;
+        };
+        Hook g_hooks[3] = {{TF_GA(0x003C4F30u), "ApplyPointImpact", nullptr}, {TF_GA(0x003C4D40u), "ApplyExplosion", nullptr},
+                           {TF_GA(0x003C65F0u), "SetJointVelocity", nullptr}};
+        template <int I>
+        void hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            char vec[2][64] = {"-", "-"};
+            for (int k = 0; k < 2; ++k)
+            {
+                const uint32_t p = getRegU32(ctx, 5 + k);
+                if (validRange(p, 12u))
+                {
+                    float v[3];
+                    std::memcpy(v, rdram + p, sizeof(v));
+                    std::snprintf(vec[k], sizeof(vec[k]), "(%.3f %.3f %.3f)", v[0], v[1], v[2]);
+                }
+            }
+            std::fprintf(stderr, "[ragdoll call] tick %llu %s doll %08x a1 %08x %s a2 %08x %s a3 %08x f12 %.4f f13 %.4f f14 %.4f\n",
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), g_hooks[I].name, getRegU32(ctx, 4),
+                         getRegU32(ctx, 5), vec[0], getRegU32(ctx, 6), vec[1], getRegU32(ctx, 7), ctx->f[12], ctx->f[13], ctx->f[14]);
+            const uint32_t doll = getRegU32(ctx, 4), idx = getRegU32(ctx, 5);
+            g_hooks[I].orig(rdram, ctx, runtime);
+            // (after it: that particle's position, previous position and force, and the doll's stored step +0x44)
+            if (validRange(doll, 0x60u) && idx < kMaxParticles)
+            {
+                const uint32_t parts = word(rdram, doll + 4u), p = parts + kParticleSize * idx;
+                if (validRange(p, kParticleSize))
+                {
+                    float x[3], xp[3], f[3], dt = 0.0f;
+                    std::memcpy(x, rdram + p, sizeof(x));
+                    std::memcpy(xp, rdram + p + 0x10u, sizeof(xp));
+                    std::memcpy(f, rdram + p + 0x30u, sizeof(f));
+                    std::memcpy(&dt, rdram + doll + 0x44u, sizeof(dt));
+                    std::fprintf(stderr, "[ragdoll call]   after: particle %u x (%.3f %.3f %.3f) before (%.3f %.3f %.3f) force (%.2f %.2f %.2f), the doll's step %.4f\n",
+                                 idx, x[0], x[1], x[2], xp[0], xp[1], xp[2], f[0], f[1], f[2], dt);
+                }
+            }
+        }
+        void install(PS2Runtime &runtime)
+        {
+            const PS2Runtime::RecompiledFunction fns[3] = {hook<0>, hook<1>, hook<2>};
+            for (int i = 0; i < 3; ++i)
+                if ((g_hooks[i].orig = runtime.lookupFunction(g_hooks[i].at)) != nullptr)
+                    runtime.registerFunction(g_hooks[i].at, fns[i]);
+        }
+    }
+
     void install(PS2Runtime &runtime)
     {
+        if (const char *v = std::getenv("TF_RAGDOLL_CALL_LOG"); v && *v == '1')
+            calllog::install(runtime);
         if (const char *v = std::getenv("TF_RAGDOLL_FIXED_STEP"); v && *v == '0')
             g_on = false;
         if (const char *v = std::getenv("TF_RAGDOLL_SMOOTH"); v && *v == '0')
             g_smooth = false;
+        if (const char *v = std::getenv("TF_RAGDOLL_FIRST_STEP"); v && *v == '0')
+            g_firstStep = false;
         g_log = std::getenv("TF_RAGDOLL_STEP_LOG") != nullptr;
         if ((g_on || g_log) && (g_update = runtime.lookupFunction(kUpdate)) != nullptr)
             runtime.registerFunction(kUpdate, update); // (with the step off, the log alone: every frame's step as before)

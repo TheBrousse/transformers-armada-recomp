@@ -33,6 +33,26 @@ namespace view_turn
     // The third-person camera turned (0x46D410, its control in `control`): its angles after the turn, the mouse's part
     // of it (radians) and the frame's time step (s).
     void noteTurned(const uint8_t *rdram, uint32_t control, float mouseYaw, float mousePitch, float frameSeconds);
+    // (TODO 396) The game's own field of view (degrees, as the camera sets it, before the port's changes), noted each time the
+    // view's camera sets it (photo_mode's hook). aimNarrow(): the aiming view's zoomed steps and a scope - the field at or
+    // below TF_AIM_FOV_NARROW (55 degrees; the steps measure 69.7, about 40.8 and under 29). The fix of the aiming view's stutter
+    // is that the pictures' turn scales the mouse travel by the aiming zoom as the game's own frame does (noteMouseZoom); the
+    // switches: TF_AIM_TURN=0 no turn for every picture at the narrow view, =1 as before the fix; TF_AIM_SMOOTH=1 (with
+    // TF_AIM_TURN=0 only) the travel smoothed - measured, no gain, so off.
+    void noteGameFov(float degrees);
+    bool aimNarrow();
+    // The aiming view's mouse zoom factor (the game's +0x20: 1, 0.57, 0.33) the frame's mouse travel was scaled by: the pictures' turn
+    // has to scale the travel since the frame by the same, or it carries the view 1.75 / 3 times too far.
+    void noteMouseZoom(float zoom);
+    // (TODO 396) F1 > Gameplay > Scope sensitivity (TF_SCOPE_SENSITIVITY, percent, 100 = the game's): the mouse's speed in the
+    // aiming view (R3's zoom steps and the sniper Mini-Con's scope) as a share of what it is; 1 outside the aiming view.
+    // addSettings: the row, before the window loop starts.
+    float aimSensitivity();
+    void addSettings();
+    // The frame's mouse travel (pixels) made even in time at the narrow aiming view: first-order, a time constant of
+    // TF_AIM_SMOOTH_MS (4 ms of added delay on the mean); nothing is lost (what is owed comes out), `dtSeconds` the time
+    // since the last take. Called at each take; resets itself when the view is not narrow.
+    void smoothAimTravel(float &pixelsX, float &pixelsY, float dtSeconds);
     // The camera object and its transform (the listener update's 0x1AFD40 call, overrides.cpp).
     void noteCameraObject(uint32_t camera, uint32_t transform);
     // (TODO 292 A) The view's camera node as the camera manager places it (photo_mode's SetPosition hook): its transform

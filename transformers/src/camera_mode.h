@@ -16,6 +16,8 @@ namespace camera_mode
     void setFirstPerson(bool on);
     // The game's view is the car's (the Autobot is in vehicle mode), first person or not. Any thread.
     bool inVehicle();
+    // (TODO 396) The player is in the game's aiming view (state 9: R3's zoom steps, the sniper Mini-Con's scope), as of the last frame.
+    bool lookState();
     // First person on foot as the game's own aiming view (R3: strafing, R3 zooms): the button it
     // presses for that, once a rendered frame (overrides.cpp, the pad override).
     uint16_t padButtons();

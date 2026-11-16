@@ -406,6 +406,8 @@ namespace photo_mode
 
         void setFieldOfView(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
+            if (getRegU32(ctx, 31) == kSetFieldOfViewFromCamera)
+                view_turn::noteGameFov(ctx->f[12]); // (TODO 396: the game's own field, before any change of ours)
             if (g_on.load(std::memory_order_relaxed) && getRegU32(ctx, 31) == kSetFieldOfViewFromCamera)
             {
                 float scale;

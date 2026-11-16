@@ -116,6 +116,11 @@ namespace nr::frame
     }
     inline float bloomStrength() { return strengthOf(g_bloomStrength, "TF_NATIVE_BLOOM_STRENGTH", kBloomStrengthDefault, 2.0f); }
     inline float toneStrength() { return strengthOf(g_toneStrength, "TF_NATIVE_TONE_STRENGTH", kToneStrengthDefault, 1.0f); }
+    // (TODO 399) The distance haze (the depth fog) strength, the F1 slider: 0 none, 1 the console's (the default), up to 1.5.
+    // It scales the fog pass's alpha and the 3D trees' own fog the same way. TF_FOG_STRENGTH, read at first use, then live.
+    inline std::atomic<float> g_fogStrength{-1.0f};
+    inline float fogStrength() { return strengthOf(g_fogStrength, "TF_FOG_STRENGTH", 1.0f, 1.5f); }
+    inline void setFogStrength(float s) { g_fogStrength.store(std::clamp(s, 0.0f, 1.5f), std::memory_order_relaxed); }
     inline void setBloomStrength(float s) { g_bloomStrength.store(std::clamp(s, 0.0f, 2.0f), std::memory_order_relaxed); }
     inline void setToneStrength(float s) { g_toneStrength.store(std::clamp(s, 0.0f, 1.0f), std::memory_order_relaxed); }
     // (TODO 108 (3) C1, TF_NATIVE_CLARITY: 1 the local contrast over the 3D; unset or 0 none. Its strength, the F1 slider,

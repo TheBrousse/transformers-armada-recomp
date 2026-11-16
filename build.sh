@@ -34,7 +34,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-game=$root/game work=$root/work build=$root/out/build tools_build=$root/out/tools tools=$root/transformers/tools
+# (TODO 279) The disc's files: game/ here, or the install's data/game once its folders were moved (tools/install_layout.sh)
+. "$root/tools/install_layout.sh"
+game=$(tfa_game_data_dir "$root") work=$root/work build=$root/out/build tools_build=$root/out/tools tools=$root/transformers/tools
 ps2recomp=$root/PS2Recomp elf=SLUS_206.68
 python=${PYTHON:-python3}
 # (cpucheck) The processor first: the game needs SSE4.1 (2008 or newer) - said now, not after the long build.
@@ -146,8 +148,16 @@ fi
 # 6. The game
 step "Configuring game build"
 # (TF_CMAKE_ARGS: more configure arguments, word-split - e.g. a packager's library paths)
+# (TF_GAME_DIR: the disc's files where they are, game/ or the install's data/game, as build.ps1 passes it - the grass
+# step and the icon read them)
 # shellcheck disable=SC2086
-cmake -S "$root" -B "$build" "${generator[@]}" "$vkd3d_arg" ${TF_CMAKE_ARGS:-} >/dev/null
+cmake -S "$root" -B "$build" "${generator[@]}" "$vkd3d_arg" "-DTF_GAME_DIR=$game" ${TF_CMAKE_ARGS:-} >/dev/null
 step "Building TransformersRecomp ($config) - the first build compiles ~22,000 generated functions"
 cmake --build "$build" ${parallel[@]+"${parallel[@]}"} --target TransformersRecomp
 step "Built $build/transformers/TransformersRecomp"
+
+# (TODO 279, docs/INSTALL_LAYOUT_PLAN.md) In a player's install (tfa-setup in the folder above): the player's things
+# moved out of the checkout once (tools/move_layout.py: the backup first, saves copied and checked, nothing deleted).
+# Never in a checkout set up by hand (no tfa-setup above it). A failure here leaves the game as it was built: it never
+# fails the build.
+tfa_layout_move "$root"

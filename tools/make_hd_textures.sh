@@ -11,7 +11,9 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-game=$root/game out=$root/hd_textures py=$root/tools/hd_textures
+# (TODO 279) The disc's files: game/ here, or the install's data/game once its folders were moved (tools/install_layout.sh)
+. "$root/tools/install_layout.sh"
+game=$(tfa_game_data_dir "$root") out=$root/hd_textures py=$root/tools/hd_textures
 python=${PYTHON:-python3}
 skip_upscale=0 crisp_fonts_only=0 fonts_only=0 verify=0 remake=0
 while [ $# -gt 0 ]; do

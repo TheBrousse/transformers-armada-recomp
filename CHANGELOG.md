@@ -1,5 +1,44 @@
 # What's new
 
+## 0.8.0
+
+**Fixed**
+- With the frame rate limit set to 30 during a level, going back to the HQ through a warp gate no longer makes the
+  HQ run at half speed.
+- Going back to a shorter tree distance (for example from Very far 3D to Far 3D) now takes effect at once: the trees
+  come back to the chosen setting and the frame rate climbs back right away. Before, some trees stayed as the heavier
+  setting had left them and the frame rate stayed low until the game was restarted.
+- At any frame rate cap (60, 120, 144, 240) some pictures were shown twice as long as others, several times a
+  second, worst in the Amazon (Deep Amazon could hold almost a third of its pictures twice as long). Every picture
+  now stays up equally long, and the lowest frame rates are higher.
+- With the mouse, looking left and right in vehicle mode was the wrong way round.
+- Turning the mouse while zoomed in to aim no longer stutters.
+- With Enemy detail on Full (the default), a distant enemy no longer flickers out for a single picture now and then.
+- Turning the mouse very fast while aiming (the sniper Mini-Con's scope too) keeps up with the mouse instead of lagging
+  behind, also when the game runs at a lower frame rate.
+- Music and voices are now read from the disk ahead of time, in the background, so a slow disk read can no longer
+  hold up a frame while they play or when one starts. The sound itself is exactly the same.
+- Enemies thrown by a melee combo or a blast fly as far as at 30 frames a second again. Above 30 frames a second
+  they barely left the ground.
+- With the native renderer, the trees drawn as 3D models far into the distance (Far 3D, Very far 3D, Full 3D) now take
+  the same distance haze as the hills behind them. Before, they stayed full colour and dark against pale, hazy
+  mountains.
+
+**New**
+- On Linux, SteamOS and Bazzite, saves, settings, logs and the disc's files now sit in the install folder, as on
+  Windows (one saves folder to back up). The move happens at the next update, with a checked backup first. Thanks to
+  TPepperoni666.
+- F1 > Gameplay > Menu speed: menus can open and close two or four times as fast. The default is the original
+  speed.
+- F1 > Gameplay > Scope sensitivity: how fast the mouse turns the view while you aim (the zoom steps and the sniper
+  Mini-Con's scope), from 100% (the game's own speed, the default) down to 25%.
+- F1 > Graphics > Distance haze (native renderer): how strong the haze is on far hills, mountains and trees, from 0%
+  (none, the far land clear and colourful) to 150%. 100% is the game's own haze, the default.
+
+**Changed**
+- On the US disc the game no longer starts the PS2's sound and input processor at all: everything it did already runs
+  on the PC, so it was only started to be put to sleep. The sound, the memory card and the controls are the same.
+
 ## 0.7.9
 
 **New**

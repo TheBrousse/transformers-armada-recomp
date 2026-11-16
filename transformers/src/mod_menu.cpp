@@ -1875,7 +1875,7 @@ namespace mod_menu
         }
 
         // The keys the layouts place (the merged rows' too): left out of the leftover rows.
-        const char *const kPlaced[] = {"PS2X_MOUSE_INVERT_Y", "PS2X_PRESENT_SYNC", "TF_SCREEN_SYNC_STATUS", "TF_NATIVE_BLOOM",
+        const char *const kPlaced[] = {"PS2X_MOUSE_INVERT_Y", "PS2X_PRESENT_SYNC", "TF_SCREEN_SYNC_STATUS", "TF_NATIVE_BLOOM", "TF_FOG_STRENGTH",
             "PS2X_FULLSCREEN", "PS2X_MONITOR", "PS2X_WIDESCREEN", "TF_ASPECT", "TF_SCREEN_SHAPE", "TF_FOV", "TF_HQ_FOV", "TF_FPS_CAP", "PS2X_SHOW_FPS",
             "TF_FRAME_RATE", "TF_FPS_LOCK", "TF_FRAME_PACING", "TF_CRISP_TEXT", "TF_BUTTON_SYMBOLS", "TF_KEY_PROMPTS", "TF_PAD_PROMPTS",
             "TF_SMALL_CROSSHAIR", "TF_CROSSHAIR", "TF_CROSSHAIR_SIZE", "TF_HQ_PANELS", "TF_DISTANCE_METER", "TF_SPEEDRUN_TIMER", "TF_RENDERER", "PS2X_GPU_SCALE",
@@ -1886,7 +1886,7 @@ namespace mod_menu
             "PS2X_STICK_LEFT_DEADZONE", "PS2X_STICK_RIGHT_DEADZONE",
             "PS2X_STICK_RESPONSE", "PS2X_STICK_VEHICLE_MODE", "PS2X_STICK_LEFT_LIFT", "PS2X_STICK_LEFT_SENSITIVITY",
             "PS2X_STICK_RIGHT_LIFT", "PS2X_STICK_VEHICLE_LIFT", "PS2X_STICK_VEHICLE_RESPONSE",
-            "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_NATIVE_SOUND", "TF_CFG_showHUD", "TF_START_SCREENS", "TF_OBJECTIVE_GUIDE",
+            "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_NATIVE_SOUND", "TF_CFG_showHUD", "TF_START_SCREENS", "TF_MENU_FADE_SPEED", "TF_SCOPE_SENSITIVITY", "TF_OBJECTIVE_GUIDE",
             "TF_ENEMY_WAVES", "TF_PLAY_RECORDING", "TF_UPDATE_CHECK",
             // (Kept in settings.ini only, never a row: the HD texture pack's folder and the HD set's - the Graphics
             // page's pack button and the setup set them; without these "Show all settings" listed them as raw rows.)
@@ -2168,6 +2168,7 @@ namespace mod_menu
             }
             keyRow("TF_SMOOTH_TEXTURES");
             keyRow("TF_NATIVE_BLOOM"); // (Glow)
+            keyRow("TF_FOG_STRENGTH"); // (TODO 399: Distance haze - a main row, the user 2026-11-16: not advanced)
             if (advanced("graphics-textures"))
             {
                 keyRow("TF_SHARP_TEXTURES");
@@ -2302,6 +2303,8 @@ namespace mod_menu
             keyRow("TF_CROSSHAIR_SIZE");
             keyRow("TF_SMALL_CROSSHAIR");
             keyRow("TF_START_SCREENS");
+            keyRow("TF_MENU_FADE_SPEED"); // (TODO 386: Menu speed, menu_fade_speed.h)
+            keyRow("TF_SCOPE_SENSITIVITY"); // (TODO 396: Scope sensitivity, view_turn.h)
             keyRow("TF_OBJECTIVE_GUIDE"); // (TODO 315: objective_guide.h)
             if (advanced("game-more"))
             {
@@ -3444,6 +3447,43 @@ namespace mod_menu
         if ((ps2_host_input::takeKeyPresses(KEY_F1) % 2) == 1 && !ctrl)
             g_open = !g_open;
         pc_settings_row::pump(); // the settings the Options pages asked for (pc_settings_row.h)
+        // (TODO 395, tests) TF_TEST_TREES=<vblank>:<step>[,<vblank>:<step>...]: the Trees row's step chosen at those
+        // VBlanks exactly as the row does it (Console, Near 3D, Far 3D, Very far 3D, Full 3D) - the live change the
+        // player makes in F1, for scripted runs.
+        if (ImGui::GetCurrentContext())
+        {
+            static std::vector<std::pair<uint64_t, std::string>> plan = []()
+            {
+                std::vector<std::pair<uint64_t, std::string>> p;
+                const char *e = std::getenv("TF_TEST_TREES");
+                std::string s = e ? e : "";
+                for (size_t at = 0; at < s.size();)
+                {
+                    const size_t comma = s.find(',', at), end = comma == std::string::npos ? s.size() : comma;
+                    const std::string item = s.substr(at, end - at);
+                    const size_t colon = item.find(':');
+                    if (colon != std::string::npos)
+                        p.emplace_back(std::strtoull(item.c_str(), nullptr, 10), item.substr(colon + 1));
+                    at = end + 1;
+                }
+                return p;
+            }();
+            static size_t next = 0u;
+            if (next < plan.size() && runtime.eeScheduler().currentVSyncTick() >= plan[next].first)
+            {
+                g_rowsAt = -1.0;
+                bool found = false;
+                for (const Option &o : trees())
+                    if (o.label == plan[next].second)
+                    {
+                        apply(o);
+                        found = true;
+                    }
+                std::fprintf(stderr, "[tf] TF_TEST_TREES: Trees set to %s at VBlank %llu%s\n", plan[next].second.c_str(),
+                             static_cast<unsigned long long>(runtime.eeScheduler().currentVSyncTick()), found ? "" : " (no such step)");
+                ++next;
+            }
+        }
         if (g_openRequest.exchange(false))
             g_open = true;
         // (TODO 208) The PlayStation button of a DualSense / DualShock 4 opens and closes it too (the pad read natively,

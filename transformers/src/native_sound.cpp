@@ -102,6 +102,7 @@ namespace native_sound
         void mixLoop()
         {
             ps2_thread_placement::place(ps2_thread_placement::Role::Helper); // (PS2X_THREAD_PLACEMENT)
+            mixer::markMixingThread(); // (TODO 384 (c): the stream reader's fallback lines say which thread read)
             std::unique_lock<std::mutex> lock(g_mixMutex);
             for (;;)
             {

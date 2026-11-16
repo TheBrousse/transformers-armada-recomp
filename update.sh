@@ -49,14 +49,21 @@ if [ -z "${TF_UPDATE_PLAY_OUTSIDE:-}" ] && ! command -v cmake >/dev/null 2>&1 &&
         exit "$code"
     fi
 fi
-exec > >(tee -a "$port/update.log") 2>&1
+# (TODO 279: the install's logs/ when its folders were moved; update.log in the checkout before that)
+update_log=$port/update.log
+if [ -f "$port/tools/install_layout.sh" ]; then
+    . "$port/tools/install_layout.sh"
+    logs=$(tfa_layout_logs_dir "$port")
+    [ -z "$logs" ] || update_log=$logs/update.log
+fi
+exec > >(tee -a "$update_log") 2>&1
 start_time=$SECONDS
 
 # (TODO 310) Each step with its time to TF_STEP_LOG when the setup or the update set it, synced to the disk at once: it
 # names the step even when the PC went off (tools/step_log.ps1's, on Windows).
 steplog() { if [ -n "${TF_STEP_LOG:-}" ]; then printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$TF_STEP_LOG" && sync "$TF_STEP_LOG" 2>/dev/null; fi; return 0; }
 step() { printf '\n==> %s\n' "$*"; steplog "update: $*"; }
-if [ -z "${TF_STEP_LOG:-}" ]; then export TF_STEP_LOG="$port/update_steps.log"; : >"$TF_STEP_LOG"; fi
+if [ -z "${TF_STEP_LOG:-}" ]; then export TF_STEP_LOG="$(dirname "$update_log")/update_steps.log"; : >"$TF_STEP_LOG"; fi
 g() { git -C "$repo" -c core.longpaths=true "$@"; }
 result() {
     [ "$play" = 1 ] || return 0

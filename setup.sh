@@ -53,6 +53,9 @@ step() { printf '\n==> %s\n' "$*"; steplog "setup: $*"; }
 if [ -z "${TF_STEP_LOG:-}" ]; then export TF_STEP_LOG="$root/setup_steps.log"; : >"$TF_STEP_LOG"; fi
 fail() { printf '\nsetup: %s\n' "$*" >&2; exit 1; }
 usa_size=2900951040 # Transformers (USA), SLUS-20668: the only disc the build accepts (it checks the executable inside)
+# (TODO 279) The disc's files: game/ here, or the install's data/game once its folders were moved (tools/install_layout.sh)
+. "$root/tools/install_layout.sh"
+game_dir=$(tfa_game_data_dir "$root")
 
 command -v python3 >/dev/null || fail "Python 3 is missing: install python3 from your distribution's packages"
 # .setup.json: { "Iso": ..., "SetUpAt": ... } as setup.ps1 writes it (the game and transformers/version.cmake read it)
@@ -77,7 +80,7 @@ if [ -n "$iso" ]; then
     json "Iso=$(readlink -f "$iso")"
 fi
 iso=$(json)
-if [ ! -f "$root/game/SLUS_206.68" ]; then
+if [ ! -f "$game_dir/SLUS_206.68" ]; then
     [ -n "$iso" ] || fail "first setup: give your disc image, e.g.  ./setup.sh --iso \"/path/to/Transformers (USA).iso\""
     [ -f "$iso" ] || fail "the disc image is gone: $iso (give it again with --iso)"
     size=$(stat -c %s "$iso")
@@ -144,11 +147,15 @@ EOF
 build_args=()
 [ "$gentle_on" = 1 ] && build_args+=(--gentle)
 step "Building the game (build.sh)"
-if [ -f "$root/game/SLUS_206.68" ]; then "$root/build.sh" ${build_args[@]+"${build_args[@]}"}; else "$root/build.sh" --iso "$iso" ${build_args[@]+"${build_args[@]}"}; fi
+if [ -f "$game_dir/SLUS_206.68" ]; then "$root/build.sh" ${build_args[@]+"${build_args[@]}"}; else "$root/build.sh" --iso "$iso" ${build_args[@]+"${build_args[@]}"}; fi
 
-for example in "$root/overlay/settings.example.ini" "$root/settings.example.ini"; do
-    if [ ! -f "$root/settings.ini" ] && [ -f "$example" ]; then cp "$example" "$root/settings.ini"; fi
-done
+# (TODO 279: with the install's folders moved - by the build, in an install - its settings.ini is the one in use: none
+# made here)
+if [ -z "$(tfa_layout_settings "$root")" ]; then
+    for example in "$root/overlay/settings.example.ini" "$root/settings.example.ini"; do
+        if [ ! -f "$root/settings.ini" ] && [ -f "$example" ]; then cp "$example" "$root/settings.ini"; fi
+    done
+fi
 json "SetUpAt=$(git -C "$root" rev-parse HEAD)"
 steplog "setup: ready"
 printf '\nReady. Play with ./play.sh in %s (for Steam: add play.sh as a non-Steam game). Settings: F1 in the game.\n' "$root"
