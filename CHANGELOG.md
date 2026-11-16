@@ -1,5 +1,10 @@
 # What's new
 
+## 0.8.1
+
+**Fixed**
+- Photo mode (F8) moves the camera again. In 0.8.0 it could only turn: W, A, S, D, Space and Q did nothing.
+
 ## 0.8.0
 
 **Fixed**

@@ -677,8 +677,12 @@ namespace photo_mode
             DrawText(text, x + 2, y + 2, size, Color{0, 0, 0, 170});
             DrawText(text, x, y, size, Color{230, 240, 255, 230});
         }
+        static double clockAt = -1.0; // (TODO 403: the free camera's own clock - see dt below)
         if (!on)
+        {
+            clockAt = -1.0;
             return;
+        }
         if (GetTime() < hintUntil)
             drawHint();
         if (IsKeyPressed(KEY_ESCAPE))
@@ -689,7 +693,12 @@ namespace photo_mode
         if (IsKeyPressed(KEY_H))
             g_hudOn.store(!g_hudOn.load());
 
-        const float dt = std::min(GetFrameTime(), 0.1f);
+        // (TODO 403: 0.8.0's photo mode could turn but not move: the platform's GetFrameTime() read 0 here - it is the time between two
+        // beginPicture() calls and one now follows the other within the same picture - and the keys move by dt. The time since this
+        // function last ran, on the platform's clock, is right however the pictures are paced.)
+        const double clockNow = GetTime();
+        const float dt = clockAt < 0.0 ? 0.0f : std::min(static_cast<float>(clockNow - clockAt), 0.1f);
+        clockAt = clockNow;
         const bool fast = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         const bool slow = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
         const float speed = 10.0f * (fast ? 5.0f : 1.0f) * (slow ? 0.2f : 1.0f); // units (about metres) a second
@@ -708,6 +717,19 @@ namespace photo_mode
         }
         if (!g_pose.havePosition || !g_pose.haveTurn)
             return;
+        {
+            // (TODO 403, a probe: TF_PHOTO_LOG=1 - a line a second of what the free camera reads: the frame time, the keys, the mouse, the place)
+            static const bool log = std::getenv("TF_PHOTO_LOG") != nullptr;
+            static double lastLog = 0.0;
+            if (log && GetTime() - lastLog > 1.0)
+            {
+                lastLog = GetTime();
+                std::fprintf(stderr, "[photo] probe: dt %.5f (raw %.5f) keys W%d A%d S%d D%d Space%d Left%d Right%d, mouse %.1f,%.1f focused %d mouseOn %d, at (%.2f, %.2f, %.2f) yaw %.1f\n", dt,
+                             GetFrameTime(), IsKeyDown(KEY_W), IsKeyDown(KEY_A), IsKeyDown(KEY_S), IsKeyDown(KEY_D), IsKeyDown(KEY_SPACE),
+                             IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT), mouse.x, mouse.y, IsWindowFocused(), mouseOn, g_pose.position[0],
+                             g_pose.position[1], g_pose.position[2], g_pose.yaw * 180.0f / kPi);
+            }
+        }
         g_pose.yaw -= mouse.x * 0.0025f * (slow ? 0.3f : 1.0f);
         g_pose.pitch -= mouse.y * 0.0025f * (slow ? 0.3f : 1.0f);
         if (IsKeyDown(KEY_LEFT))
