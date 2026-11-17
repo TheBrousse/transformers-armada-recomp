@@ -17,6 +17,7 @@
 
 <p align="center">
   <a href="https://github.com/kayliox/transformers-armada-recomp/releases/latest/download/tfa-setup-linux"><img src="https://img.shields.io/badge/Download-Setup%20for%20Linux-2b7bd6?style=for-the-badge&logo=linux&logoColor=white" alt="Download the setup for Linux, SteamOS and Bazzite" height="56"></a>
+  <a href="https://discord.gg/zgtZ7gBFmQ"><img src="https://img.shields.io/badge/Join%20us%20on-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the project's Discord server" height="56"></a>
 </p>
 
 <p align="center">
