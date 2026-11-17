@@ -1,5 +1,43 @@
 # What's new
 
+## 0.8.3
+
+**New**
+- The game's window is now called just "Transformers Armada" (no mouse hint after the name) and shows the game's own icon in its title bar and the taskbar (the same picture as the .exe's icon).
+- Settings, Graphics: "Soft particles (native renderer)". Smoke, spray and glows fade out smoothly where they meet the water,
+  ground or rocks, instead of ending in a straight cut (the Amazon waterfall's spray ended in a blocky bar at the river).
+  Medium by default; Off is the console's own look; Small, Medium and Large are how long a stretch they fade over.
+- Trees: with Trees above Console, trees the level gives no leaves of their own (bare trunks up close, as on the
+  console) now stay a full tree in the distance instead of turning into rows of bare 3D trunks. Two new Graphics
+  settings, both off by default and experimental: "Trunk-only trees: picture to 3D" (Cross-fade blends the far picture
+  into the trunk as you come nearer) and "Leaves on trunk-only trees" (gives those trees the leaves of their kind).
+- Options, Audio (the game's own Start menu page): a "Surround Mix" row, Plain stereo or Pro Logic II, the same choice as F1 > Sound > Surround encoding.
+- The game's own Options pages have more of F1's settings: Menu Shape and Menu Speed (Other, Start menu), Crosshair Mode (Gameplay; Start-up leaves the pause menu to make room) and Scope Speed (Controls > Mouse, from the HQ). The other F1-only settings stay in F1 on purpose.
+
+**Fixed**
+- Antarctica: turning the camera with the mouse no longer flashes the screen black (with one white line) or smears it
+  after visiting the HQ or another level first.
+- The Mini-Con ring in the bottom-left corner no longer jumps toward the middle of the screen (with a red streak) when a warp gate opens and its name appears, at every screen shape.
+- After alt-tabbing, if the picture stops reaching the screen for a while (seen on some AMD graphics cards), the game
+  window no longer turns black for good or stops responding: it keeps showing the game and carries on as soon as the
+  graphics card does.
+- Setup: when the game does not build, the setup now says which Visual Studio and compiler version it used, so a report tells us which one failed. With Visual Studio 2026 as the only Visual Studio and an older CMake, the setup updates CMake by itself, and with Visual Studio 2022 and 2026 both installed it builds with 2022, the version the game is tested with.
+- The camera no longer jumps behind or into walls for a moment when you stand against them and move the mouse
+  (Antarctica's ice walls showed the inside of the wall for a picture now and then). It now eases out from the wall
+  instead of popping out; walls still push it in at once, as before.
+- Photo mode (F8): Mini-Cons, Data-Cons and the other pickups no longer slowly rise into the air while it is on (and fall back when you leave it). A pickup that drops now falls at the same speed at every frame rate.
+- Make HD textures: while broken images are waiting to be made again another way, the screen no longer says "about 1 min left" (it was minutes off); it says a few more minutes.
+- On Linux, SteamOS and Bazzite, a USB receiver for a keyboard and mouse no longer takes the controller slot: a
+  Steam Controller now works with one plugged in. Thanks to TPepperoni666.
+- HQ, Select Autobot: the chosen Autobot no longer flickers for a picture when the camera swings to his page (Red
+  Alert's head showed flat dark purple, his guns flat brown). After a menu change the game sends the same textures
+  again, and on a busy frame they were drawn as one flat colour each for a moment; now the copy already loaded is used.
+- F1 menu: holding an arrow key moves through the list again, and tooltips, scrolling and double-clicks work at normal
+  speed again. Since 0.7.4 the menu ran slow, at a fraction of real time.
+
+**Removed**
+- The "Emulated (IOP)" sound engine choice is gone: the game's sound always runs natively on the PC, and with the USA disc the game no longer starts the emulated PS2 sound processor at all. A settings file that still asks for the emulated engine gets the native one. (The European disc keeps starting it for now, until it is tested without.)
+
 ## 0.8.2
 
 **Fixed**

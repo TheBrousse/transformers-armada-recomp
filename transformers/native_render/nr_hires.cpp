@@ -10,17 +10,12 @@
 // TF_HIRES_DIR: the upscaled tree (default: hd_textures\upscaled where the game starts, made by
 // tools\make_hd_textures.ps1, else the remaster's Extracted/upscaled); its native twin is
 // ../converted/textures beside it. TF_HIRES=0 turns replacement off.
-#include "dev_tree.h"
 #include "nr_types.h"
 #include "nr_backend.h"
 #include "nr_policy.h"
 #include "nr_prompt_style.h"
-#include "key_text.h"
+#include "nr_core.h"
 
-#include "raylib.h"
-
-#include "runtime/ps2_host_input.h"
-#include "runtime/ps2_thread_placement.h"
 
 #include "ext/bc7enc/bc7enc.h"
 #include "ext/bc7enc/bc7decomp.h"
@@ -48,6 +43,19 @@
 extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
 extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
 #endif
+
+// (nr_core S1c) The developer's own asset tree (dev_tree.h): the host's, through nr_core::HiresHost.
+static const char *applicationDirectory()
+{
+    const auto fn = nr_core::hiresHost().applicationDirectory;
+    return fn ? fn() : "";
+}
+
+static std::filesystem::path devTreePath()
+{
+    const std::string &tree = nr_core::hiresHost().devTree;
+    return tree.empty() ? std::filesystem::path() : std::filesystem::path(tree);
+}
 
 namespace nr
 {
@@ -82,7 +90,7 @@ namespace nr
             std::unordered_map<std::string, std::string> out;
             std::error_code ec;
             fs::path file = fs::path("tools") / "hd_textures" / "pcsx2_names.json";
-            for (fs::path at = fs::path(GetApplicationDirectory()); !fs::exists(file, ec) && !at.empty(); at = at.parent_path())
+            for (fs::path at = fs::path(applicationDirectory()); !fs::exists(file, ec) && !at.empty(); at = at.parent_path())
             {
                 file = at / "tools" / "hd_textures" / "pcsx2_names.json";
                 if (at == at.parent_path())
@@ -149,8 +157,8 @@ namespace nr
             std::error_code ec;
             // (TODO 186: the install's own set first; the developer's tree only when the install has none)
             if (!(dir && *dir) && !g.crispSet.empty() && !fs::is_directory(g.crisp / g.crispSet, ec) &&
-                !devTree().empty() && fs::is_directory(devTree() / "crisp_fonts" / g.crispSet, ec))
-                g.crisp = devTree() / "crisp_fonts";
+                !devTreePath().empty() && fs::is_directory(devTreePath() / "crisp_fonts" / g.crispSet, ec))
+                g.crisp = devTreePath() / "crisp_fonts";
             // (PR #11) The Xbox prompts: each atlas with button symbols has a twin with Xbox labels in their
             // place, with the crisp text or without; drawn instead while xboxPromptsShown.
             g.xboxSet = text ? "text_xbox" : "xbox";
@@ -210,7 +218,7 @@ namespace nr
             { return fs::is_directory(hd / "upscaled", ec) || fs::is_directory(hd / "crisp_fonts", ec); };
             if (installed(fs::path("hd_textures")))
                 return fs::absolute(fs::path("hd_textures") / "upscaled", ec);
-            fs::path at = fs::path(GetApplicationDirectory());
+            fs::path at = fs::path(applicationDirectory());
             for (int up = 0; up < 5 && !at.empty(); ++up, at = at.parent_path())
             {
                 if (installed(at / "hd_textures"))
@@ -231,8 +239,8 @@ namespace nr
                 return fs::path(dir);
             if (const fs::path found = installedTree(); !found.empty())
                 return found;
-            if (!devTree().empty())
-                return devTree() / "upscaled";
+            if (!devTreePath().empty())
+                return devTreePath() / "upscaled";
             return {};
         }
 
@@ -343,16 +351,8 @@ namespace nr
         // An image as RGBA8 (R in the low byte); empty when it does not load.
         bool load(const fs::path &file, uint32_t &width, uint32_t &height, std::vector<uint32_t> &pixels)
         {
-            Image image = LoadImage(file.string().c_str());
-            if (!image.data)
-                return false;
-            ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-            width = static_cast<uint32_t>(image.width);
-            height = static_cast<uint32_t>(image.height);
-            pixels.resize(static_cast<size_t>(width) * height);
-            std::memcpy(pixels.data(), image.data, pixels.size() * 4u);
-            UnloadImage(image);
-            return true;
+            const auto loadImage = nr_core::hiresHost().loadImage; // (the PC layer's image library: nr_core::HiresHost)
+            return loadImage && loadImage(file.string().c_str(), width, height, pixels);
         }
 
         // The candidate (an upscaled image's relpath) whose native image matches the game's texels best (mean
@@ -1216,7 +1216,7 @@ namespace nr
                     if (!backgroundAll || !SetThreadPriority(GetCurrentThread(), 0x00010000))
                         SetThreadPriority(GetCurrentThread(), loaderPriority());
 #endif
-                    ps2_thread_placement::place(ps2_thread_placement::Role::Helper); // (PS2X_THREAD_PLACEMENT)
+                    nr_core::placeThisThread(nr_core::ThreadRole::Helper); // (PS2X_THREAD_PLACEMENT)
                     work();
                 }).detach();
             std::fprintf(stderr, "[native render] upscaled images: %u loader threads (%u decoding at once, %s)\n", n, g_heavyMax,
@@ -1242,14 +1242,22 @@ namespace nr
     }
 
     // (TODO 348 (b): in step with key_text's words for the sticks - the symbols switch when they do)
-    bool keyPromptsShown() { return key_text::symbolsAsKeys(ps2_host_input::keyboardPromptsShown()); }
+    bool keyPromptsShown()
+    {
+        const auto fn = nr_core::hiresHost().keyboardPromptsShown;
+        return fn && fn();
+    }
     bool xboxPromptsShown()
     {
-        return useXboxPrompts(g_padPrompts.load(std::memory_order_relaxed),
-                              ps2_host_input::lastPadStyle() == ps2_host_input::PadStyle::PlayStation,
-                              ps2_host_input::keyboardPrompts(), g.ps2Symbols);
+        const nr_core::HiresHost &host = nr_core::hiresHost();
+        return useXboxPrompts(g_padPrompts.load(std::memory_order_relaxed), host.lastPadIsPlayStation && host.lastPadIsPlayStation(),
+                              host.keyboardPrompts && host.keyboardPrompts(), g.ps2Symbols);
     }
-    bool xbox360PromptsShown() { return ps2_host_input::xbox360Pads(); }
+    bool xbox360PromptsShown()
+    {
+        const auto fn = nr_core::hiresHost().xbox360Pads;
+        return fn && fn();
+    }
 
     void prepareHires()
     {
@@ -1301,8 +1309,8 @@ namespace nr
         {
             if (const fs::path up = resolveUpscaled(); !up.empty())
                 dirs.push_back(up.parent_path() / "crisp_fonts");
-            if (!devTree().empty())
-                dirs.push_back(devTree() / "crisp_fonts");
+            if (!devTreePath().empty())
+                dirs.push_back(devTreePath() / "crisp_fonts");
         }
         for (const fs::path &d : dirs)
             for (const char *set : {"text_ps5", "text_ps2", "ps5"})

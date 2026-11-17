@@ -1,9 +1,9 @@
 #pragma once
 // The IOP-less boot (iop_boot.cpp): the "emulation out" plan's step 2 (S2). With the native sound server and the native
 // disc the IOP has nothing to do once the game has booted (S1, iop_tripwire.h: no call reaches it after); here it is not
-// even booted - its modules are not loaded, its processor never runs. The default for the USA disc (TODO 388 (1));
-// the European disc keeps the IOP's boot until it is tested without. TF_IOP_BOOT=0: without the IOP (either disc), =1:
-// the IOP's boot. Forced to the IOP's boot by TF_NATIVE_SOUND=0, TF_NATIVE_DISC=0 or TF_NATIVE_SOUND_IOP=1.
+// even booted - its modules are not loaded, its processor never runs. The only boot on the USA disc (TODO 388 E: the
+// IOP's boot, TF_IOP_BOOT=1, and the emulated sound and disc choices are gone); the European disc keeps the IOP's boot
+// until it is tested without (TF_IOP_BOOT=0: without the IOP there; the native sound server and disc serve both boots).
 
 #include <cstdint>
 

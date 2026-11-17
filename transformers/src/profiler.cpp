@@ -64,6 +64,22 @@ void tfShowWindowWithoutFocus(void *window, int x, int y)
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 }
 
+// The window's own icon (title bar, taskbar, Alt+Tab): the exe's icon, resource 1, made from the player's disc
+// (icon.cmake, TODO 198). Without that resource the window keeps the default one.
+void tfSetWindowIcon(void *window)
+{
+    HWND hwnd = static_cast<HWND>(window);
+    HINSTANCE module = GetModuleHandleW(nullptr);
+    if (!hwnd || !FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(14) /* RT_GROUP_ICON */))
+        return;
+    const auto load = [&](int size)
+    { return static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)); };
+    if (HICON big = load(GetSystemMetrics(SM_CXICON)))
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+    if (HICON small = load(GetSystemMetrics(SM_CXSMICON)))
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+}
+
 // CPU time the calling thread has used, in milliseconds (TF_FRAME_LOG): its cycle count
 // (QueryThreadCycleTime counts at the time stamp counter's rate) over that rate, measured
 // once against steady_clock.

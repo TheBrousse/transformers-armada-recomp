@@ -300,7 +300,7 @@ function Invoke-HealingBuild([string[]]$Arguments, [string]$Root, [scriptblock]$
         $ErrorActionPreference = "Stop"
         if ($code -eq 0) { return }
         $refused = Get-RefusedObjects $lines.ToArray() @($Root)
-        if ($refused.Count -eq 0) { Assert-NotBlocked "cmake" $code; throw "cmake --build failed with exit code $code" }
+        if ($refused.Count -eq 0) { Assert-NotBlocked "cmake" $code; throw "cmake --build failed with exit code $code$(if ($script:CompilerText) { " (built with $($script:CompilerText))" })" }
         $names = ($refused | ForEach-Object { Split-Path $_ -Leaf }) -join ", "
         if ($attempt -gt 24 -or ($refused | Where-Object { $healed -icontains $_ })) {
             throw "The build stopped again at a damaged file the compiler made: $($refused[0]). Delete that file and run " +
@@ -399,34 +399,107 @@ if (-not (Test-Path (Join-Path $Game $ElfName))) {
 }
 
 # 2. Tools -----------------------------------------------------------------
-# The Visual Studio that builds: the newest install that has the C++ tools and that this CMake knows.
+# The Visual Studio that builds: an install that has the C++ tools and that this CMake knows - Visual Studio
+# 2022 when there is one (the version the releases are built and tested with), else the newest.
 # Left to itself, CMake takes the first install of its default version, which can be one without the
 # C++ tools (a C#-only Visual Studio next to the Build Tools): "No CMAKE_CXX_COMPILER could be found"
 # (a player's setup, 2026-11-09). A build folder already set up with a C++ install keeps it; one set up
 # with an install without them (that configure failed) is set up again.
-function Get-VsCppInstances {
+# (TODO 407) Each build says which Visual Studio and which compiler it used (Write-CompilerReport), and a failed
+# compile says it in its message: a player's report then names the compiler that failed.
+$TestedVsMajor = 17
+# vswhere's C++ installs (its JSON objects) as: Path, Version, Major, Name, Shown (the version Visual Studio shows),
+# Generator (CMake's name for it) and Known (whether this CMake has that generator).
+function ConvertTo-VsCppInstances($List, [string]$CMakeHelp) {
+    $names = @{ 15 = "Visual Studio 15 2017"; 16 = "Visual Studio 16 2019"; 17 = "Visual Studio 17 2022"; 18 = "Visual Studio 18 2026" }
+    @($List | Where-Object { $_.installationPath -and $_.installationVersion } | ForEach-Object {
+        $major = [int]("$($_.installationVersion)" -split '\.')[0]
+        $gen = if ($names.ContainsKey($major)) { $names[$major] } else { "Visual Studio $major" }
+        $shown = if ($_.catalog -and $_.catalog.productDisplayVersion) { "$($_.catalog.productDisplayVersion)" } else { "$($_.installationVersion)" }
+        $name = if ($_.displayName) { "$($_.displayName)" } else { $gen }
+        [pscustomobject]@{ Path = "$($_.installationPath)"; Version = [version]"$($_.installationVersion)"; Major = $major; Name = $name
+                           Shown = $shown; Generator = $gen; Known = ($names.ContainsKey($major) -and $CMakeHelp.Contains($gen)) }
+    })
+}
+# The order they are tried in: the known ones, the tested major first, then the newest.
+function Select-VsInstances($All) {
+    $known = @($All | Where-Object { $_.Known })
+    @(@($known | Where-Object { $_.Major -eq $TestedVsMajor } | Sort-Object Version -Descending) +
+      @($known | Where-Object { $_.Major -ne $TestedVsMajor } | Sort-Object Version -Descending))
+}
+$script:VsAll = $null
+function Get-VsAllCpp {
+    if ($null -ne $script:VsAll) { return $script:VsAll }
+    $script:VsAll = @()
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path -LiteralPath $vswhere)) { return @() }
+    if (-not (Test-Path -LiteralPath $vswhere)) { return $script:VsAll }
     $ErrorActionPreference = "Continue"
     $json = (& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json 2>$null | Out-String)
     # (Windows PowerShell 5.1 passes a JSON array down the pipe as ONE object; ForEach-Object unrolls it. Without
     # that, with two Visual Studio installs every field below is an array: "Cannot convert System.Object[] to
     # System.Version", public issue #25.)
-    try { $list = @($json | ConvertFrom-Json | ForEach-Object { $_ }) } catch { return @() }
+    try { $list = @($json | ConvertFrom-Json | ForEach-Object { $_ }) } catch { return $script:VsAll }
     $help = (& cmake --help 2>$null | Out-String)
-    $names = @{ 15 = "Visual Studio 15 2017"; 16 = "Visual Studio 16 2019"; 17 = "Visual Studio 17 2022"; 18 = "Visual Studio 18 2026" }
-    @($list | Where-Object { $_.installationPath -and $_.installationVersion } | ForEach-Object {
-        $major = [int]($_.installationVersion -split '\.')[0]
-        if ($names.ContainsKey($major) -and $help.Contains($names[$major])) {
-            [pscustomobject]@{ Path = $_.installationPath; Version = [version]$_.installationVersion; Generator = $names[$major] }
-        }
-    } | Sort-Object Version -Descending)
+    $script:VsAll = @(ConvertTo-VsCppInstances $list $help)
+    $script:VsAll
+}
+function Get-VsCppInstances { Select-VsInstances (Get-VsAllCpp) }
+# What a build folder was set up with, in one line: "Visual Studio Community 2022 17.14.20, MSVC 19.44.35229
+# (tools 14.44.35207, Hostx64), CMake 4.1.2". From the folder's own files (CMakeCache.txt and the compiler file
+# CMake writes when it tests the compiler), so it is right whatever chose it.
+function Get-CompilerReport([string]$Dir, $Installs) {
+    $cache = Join-Path $Dir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { return "" }
+    $get = { param($key) $m = Select-String -LiteralPath $cache -Pattern "^$key(?::[A-Za-z]+)?=(.*)$" | Select-Object -First 1
+             if ($m) { $m.Matches[0].Groups[1].Value.Trim() } else { "" } }
+    $gen = & $get "CMAKE_GENERATOR"
+    $inst = & $get "CMAKE_GENERATOR_INSTANCE"
+    $parts = [Collections.Generic.List[string]]::new()
+    $norm = { param($p) ("$p" -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
+    $vs = if ($inst) { @($Installs | Where-Object { (& $norm $_.Path) -eq (& $norm $inst) }) | Select-Object -First 1 }
+    if ($vs) { $parts.Add("$($vs.Name) $($vs.Shown)") } elseif ($gen) { $parts.Add("$gen$(if ($inst) { " ($inst)" })") }
+    $files = Join-Path $Dir "CMakeFiles"
+    $cxx = if (Test-Path -LiteralPath $files) { Get-ChildItem -LiteralPath $files -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName "CMakeCXXCompiler.cmake") -ErrorAction SilentlyContinue } |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 }
+    if ($cxx) {
+        $text = Get-Content -LiteralPath $cxx.FullName -Raw
+        $id = [regex]::Match($text, 'set\(CMAKE_CXX_COMPILER_ID "([^"]*)"\)').Groups[1].Value
+        $ver = [regex]::Match($text, 'set\(CMAKE_CXX_COMPILER_VERSION "([^"]*)"\)').Groups[1].Value
+        $path = [regex]::Match($text, 'set\(CMAKE_CXX_COMPILER "([^"]*)"\)').Groups[1].Value
+        $tools = [regex]::Match($path, '(?i)/MSVC/([0-9.]+)/bin/(Host[A-Za-z0-9]+)/')
+        $c = "$(if ($id -eq 'MSVC') { 'MSVC' } elseif ($id) { $id } else { 'compiler' }) $ver"
+        if ($tools.Success) { $c += " (tools $($tools.Groups[1].Value), $($tools.Groups[2].Value))" }
+        $parts.Add($c)
+    }
+    $cm = & $get "CMAKE_COMMAND"
+    $cmVer = @("CMAKE_CACHE_MAJOR_VERSION", "CMAKE_CACHE_MINOR_VERSION", "CMAKE_CACHE_PATCH_VERSION" | ForEach-Object { & $get $_ }) -join "."
+    if ($cmVer -ne "..") { $parts.Add("CMake $cmVer$(if ($cm -match '(?i)site-packages') { ' (pip)' })") }
+    $parts -join ", "
+}
+$script:CompilerText = ""
+function Write-CompilerReport([string]$Dir, [string]$What) {
+    $text = Get-CompilerReport $Dir (Get-VsAllCpp)
+    if (-not $text) { return }
+    if ($text -ne $script:CompilerText) { Write-Host "  $What built with: $text" }
+    $script:CompilerText = $text
+    Write-StepLog "build: $What built with: $text"
 }
 function Get-GeneratorArgs([string]$Dir) {
     $a = @("-A", "x64")
     if ($Generator) { return $a + @("-G", $Generator) }
     $vs = @(Get-VsCppInstances)
-    if (-not $vs) { return $a }   # (no vswhere, or no C++ install this CMake knows: CMake's own choice, as before)
+    if (-not $vs) {
+        # (TODO 407) C++ installs there, but none this CMake knows (Visual Studio 2026 with a CMake from before it): CMake's
+        # own choice would stop with "could not find any instance of Visual Studio" - say what to do instead.
+        $newer = @(Get-VsAllCpp | Where-Object { -not $_.Known })
+        if ($newer) {
+            $cmv = "$(& cmake --version 2>$null | Select-Object -First 1)".Trim()
+            throw "This CMake ($cmv) does not know $(($newer | ForEach-Object { "$($_.Name) $($_.Shown)" }) -join ' or '). " +
+                "Update CMake (in PowerShell: python -m pip install --user --upgrade cmake), then run the setup (or the build) again: finished steps are kept."
+        }
+        return $a   # (no vswhere, or no C++ install: CMake's own choice, as before)
+    }
     $norm = { param($p) ("$p" -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
     $cache = Join-Path $Dir "CMakeCache.txt"
     if (Test-Path -LiteralPath $cache) {
@@ -438,6 +511,9 @@ function Get-GeneratorArgs([string]$Dir) {
         Remove-Item -LiteralPath $cache -Force
         $files = Join-Path $Dir "CMakeFiles"
         if (Test-Path -LiteralPath $files) { Remove-Item -LiteralPath $files -Recurse -Force }
+    }
+    if ($vs[0].Major -lt $TestedVsMajor) {
+        Write-Host "  ($($vs[0].Name) is older than the Visual Studio 2022 the game is built and tested with. If the build stops, install Visual Studio 2022's Build Tools (the setup offers them) and run it again.)" -ForegroundColor Yellow
     }
     $a + @("-G", $vs[0].Generator, "-DCMAKE_GENERATOR_INSTANCE=$($vs[0].Path)")
 }
@@ -498,6 +574,7 @@ if (-not $SkipRecompile) {
     Run cmake (@("-S", (Join-Path $Root "PS2Recomp"), "-B", $ToolsBuild,
                  "-DPS2X_BUILD_RUNTIME=OFF", "-DPS2X_BUILD_TEST=OFF", "-DPS2X_BUILD_STUDIO=OFF") + $genArgs)
     Remove-EmptyBuildFiles $ToolsBuild    # (TODO 378)
+    Write-CompilerReport $ToolsBuild "The recompiler tools are"
     Invoke-HealingBuild (@("--build", $ToolsBuild, "--config", $Config, "--target", "ps2_recomp", "ps2_analyzer", "--") + $BuildParallel + @("/v:m")) $ToolsBuild { param($l) $l }
     # (both there right after the build: an antivirus that took one says so here, not as a puzzling failure later)
     foreach ($t in "ps2xAnalyzer\$Config\ps2_analyzer.exe", "ps2xRecomp\$Config\ps2_recomp.exe") { Assert-NotBlocked (Join-Path $ToolsBuild $t) }
@@ -704,6 +781,7 @@ function Get-CompileForecast {
 # batch - must be in the project before this build, the build's own check adds it only to the next)
 Step "Configuring game build" "configure"
 Run cmake $cmakeArgs
+Write-CompilerReport $Build "The game is"
 
 $forecast = $null
 try { $forecast = Get-CompileForecast } catch {}

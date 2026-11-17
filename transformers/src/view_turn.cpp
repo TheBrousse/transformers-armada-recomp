@@ -1,5 +1,6 @@
 // N9's camera turn for every picture - see view_turn.h.
 #include "view_turn.h"
+#include "flight_recorder.h" // (TODO 405)
 
 #include "cam_trace.h"
 #include "camera_mode.h"
@@ -7,6 +8,7 @@
 #include "runtime/ps2_settings.h"
 #include "playrec.h"
 #include "port.h"
+#include "game_version.h"
 #include "ps2_runtime.h"
 #include "static_aim.h"
 #include "runtime/ps2_host_input.h"
@@ -293,6 +295,7 @@ namespace view_turn
             uint64_t serial = 0;
             int64_t endNs = 0; // (when the frame before ended: TODO 292's slow frames)
             uint32_t viewNode = 0u; // (the view's camera node: noteViewNode)
+            uint64_t cameraNotedAt = 0u; // (the frame - serial - the sound listener last gave the camera: noteCameraObject)
             bool reticle = false;   // (TODO 292 B: the matrix sent now is the game's crosshair model's: not turned)
             uint64_t reticleDraws = 0, reticleDrawsAtEnd = 0;
         } g_game;
@@ -553,6 +556,7 @@ namespace view_turn
     {
         g_game.camera = camera;
         g_game.transform = transform;
+        g_game.cameraNotedAt = g_game.serial + 1u; // (this frame: endFrame counts it up after)
     }
 
     void noteViewNode(uint32_t node) { g_game.viewNode = node; }
@@ -797,12 +801,19 @@ namespace view_turn
         // The camera's transform (forward, left, up, position) and its target (the player).
         float rows[16] = {};
         bool have = false;
-        if (!g.transform && g.viewNode)
+        // (TODO 292 A: no sound listener's camera seen - Antarctica - so the view's own node's transform.)
+        // (TODO 408) Read again EVERY frame the listener gave none (in the last two): it was read once, while the transform
+        // was still 0, and then kept - a level begun after another (the HQ, Amazon) kept the camera the listener gave there,
+        // and a level loaded again kept its first camera's, wherever the game's objects had moved since. With a loadout that
+        // moved them (the Homing Missile, Safeguard, Deflector), every picture's turn was built from another object's matrix
+        // in Antarctica: on a mouse turn the whole picture black but for a line at 21:9, the scene flickering at 16:9 (the
+        // streamer's clip). The camera object and its target come only from the listener: without it, none (the pivot is
+        // the game's own, static_aim).
+        if (g.viewNode && g.serial + 1u > g.cameraNotedAt + 2u)
         {
-            // (TODO 292 A: no sound listener's camera seen - Antarctica - so the view's own node's transform)
             const uint32_t t = readWord(rdram, g.viewNode + 0x14u);
-            if (t >= 0x00100000u && t < PS2_RAM_SIZE - 0x50u)
-                g.transform = t;
+            g.transform = t >= 0x00100000u && t < PS2_RAM_SIZE - 0x50u ? t : 0u;
+            g.camera = 0u;
         }
         if (kind >= 0 && g.transform)
             if (const uint8_t *p = getConstMemPtr(const_cast<uint8_t *>(rdram), g.transform))
@@ -912,6 +923,13 @@ namespace view_turn
             }
             // (a cut: the angles or the target jumped - more than a frame's turn or walk can make)
             fc->cut = std::fabs(fc->dYaw) > 0.5 || std::fabs(fc->dPitch) > 0.5 || jump > 25.0 * 25.0 || eyeJump > 40.0 * 40.0;
+            // (TODO 405) And the game's own cut: taCamera::UpdateScripts (0x2CAB30) sets the byte 0x6CF8BC to 1 in a frame its
+            // camera was teleported or snapped - the collision pulling the boom in by more than 5 units at once (0x2CA0B0, e.g.
+            // a wall coming between), which the jumps above (40 units of eye) miss. Nothing is blended across it.
+            // TF_TURN_GAME_CUT=0: as before.
+            static const bool gameCut = !(std::getenv("TF_TURN_GAME_CUT") && *std::getenv("TF_TURN_GAME_CUT") == '0');
+            if (gameCut && rdram[TF_GA(0x006CF8BCu)] != 0u)
+                fc->cut = true;
             if (!fc->cut)
             {
                 fc->stickYawRate = (fc->dYaw - g.mouseYaw) / fc->frameSeconds;
@@ -1243,6 +1261,13 @@ namespace view_turn
             out.clip[i] = static_cast<float>(turnClip[i]);
         }
         out.any = true;
+        if (flight_recorder::enabled()) // (TODO 405: the eye this picture shows - the game's moved about the centre)
+        {
+            double z = move[14];
+            for (int i = 0; i < 3; ++i)
+                z += fc.eye[i] * move[4 * i + 2];
+            flight_recorder::notePicture(static_cast<float>(z), static_cast<float>(turnYaw * 57.2958), static_cast<float>(turnPitch * 57.2958));
+        }
         // (TF_XHAIR_PICTURE_LOG=1, a measuring aid for TODO 292 B: per picture, how far the picture's turn carries the game's
         // crosshair model off its place - GS pixels of the 448-line picture - and whether its draws were kept unturned)
         if (static const bool xlog = std::getenv("TF_XHAIR_PICTURE_LOG") && *std::getenv("TF_XHAIR_PICTURE_LOG") == '1'; xlog && fc.reticleKnown)

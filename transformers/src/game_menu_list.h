@@ -68,6 +68,7 @@ namespace game_menu_list
         // Audio (the Start menu's Options only: the HQ's and the pause menu's Audio Settings are the game's own screens)
         {Page::Audio, "volume", "Volume", kNone, nullptr},
         {Page::Audio, "TF_OPT_SOUND_MODE", "Sound Mode", kNone, nullptr}, // (the game's own option, kept in settings.ini)
+        {Page::Audio, "TF_SURROUND", "Surround Mix", kNone, nullptr}, // (TODO 364: Plain stereo / Pro Logic II, the port's own row)
         // Controls > Gamepad (the first three are the game's own options, kept in settings.ini)
         {Page::Gamepad, "TF_OPT_INVERT_Y", "Invert Y Axis", kNone, nullptr},
         {Page::Gamepad, "TF_OPT_LOOK_SPRING", "Look Spring", kNone, nullptr},
@@ -85,18 +86,29 @@ namespace game_menu_list
         {Page::Mouse, "TF_MENU_MOUSE", "Mouse in Menus", kNone, nullptr},
         {Page::Mouse, "TF_RIGHT_AIM", "Right-Click Aim", kNone, nullptr},
         {Page::Mouse, "TF_CAR_KEYS", "Drive with Keys", kNone, nullptr},
+        {Page::Mouse, "TF_SCOPE_SENSITIVITY", "Scope Speed", kNotInPause | kNotInStart, nullptr}, // (TODO 364: the page is full in the pause and Start menus: the HQ's only)
         // Gameplay
         {Page::Gameplay, "TF_CFG_showHUD", "HUD", kNone, nullptr},
         {Page::Gameplay, "TF_CRISP_TEXT", "Sharp Text", kNone, nullptr},
         {Page::Gameplay, "prompts", "Button Prompts", kNone, nullptr},
         {Page::Gameplay, "TF_SMALL_CROSSHAIR", "Crosshair", kNone, nullptr},
-        {Page::Gameplay, "TF_START_SCREENS", "Start-up", kNone, nullptr},
+        {Page::Gameplay, "TF_CROSSHAIR", "Crosshair Mode", kNotInStart, nullptr}, // (TODO 364: Original / Fixed; no aiming in the Start menu)
+        {Page::Gameplay, "TF_START_SCREENS", "Start-up", kNotInPause, nullptr}, // (a boot-time choice: left out of the pause menu, whose list holds six rows)
         {Page::Gameplay, "TF_OBJECTIVE_GUIDE", "Objective Guide", kNone, nullptr},
         // Other (the Start menu's Options only; the game's own Screen Position row follows these)
         {Page::Other, "TF_UPDATE_CHECK", "Check for Updates", kNone, nullptr},
+        {Page::Other, "TF_SCREEN_SHAPE", "Menu Shape", kNone, nullptr},       // (TODO 364: menus and movies)
+        {Page::Other, "TF_MENU_FADE_SPEED", "Menu Speed", kNone, nullptr},    // (TODO 364: Menu speed)
         // F1 only: shown by F1 by default, deliberately not in the game's menus. (F1's Camera row has no key: it is not checked.)
         {Page::F1Only, "PS2X_PADMAP", "Controller buttons", kNone, nullptr}, // (the HQ's Controls has the game's own Button Layout)
         {Page::F1Only, "trees", "Trees", kNone, nullptr}, // (TODO 350 b: the game's Graphics pages are full - six and seven rows)
+        // (TODO 364) Left out of the game's menus on purpose:
+        {Page::F1Only, "TF_SCREEN_SYNC_STATUS", "Screen refresh status", kNone, nullptr},  // a status line (what the screen runs at), not a choice
+        {Page::F1Only, "TF_CROSSHAIR_SIZE", "Crosshair size", kNone, nullptr},             // a fine slider under Crosshair Mode; the Gameplay page holds seven rows
+        {Page::F1Only, "TF_FOG_STRENGTH", "Distance haze", kNone, nullptr},                // the Graphics pages are full (preset members)
+        {Page::F1Only, "TF_FOREST_TRUNK_PICTURES", "Trunk-only trees: picture to 3D", kNone, nullptr}, // the tree rows follow "Trees" (above)
+        {Page::F1Only, "TF_TRUNK_SOFT", "Soft trunk-only trees", kNone, nullptr},          // (the same)
+        {Page::F1Only, "TF_FOREST_TRUNK_LEAVES", "Leaves on trunk-only trees", kNone, nullptr}, // (the same)
     };
 
     inline constexpr unsigned kEntryCount = sizeof(kEntries) / sizeof(kEntries[0]);

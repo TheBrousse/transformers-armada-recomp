@@ -6,6 +6,7 @@
 #include "nr_backend.h"
 #include "nr_device.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,11 +47,15 @@ namespace nr
 #else
         constexpr const char *kDefaultApi = "none (the emulated GS draws: this build has no native renderer)";
 #endif
+        // (S2a) The API the host chose through nr_core::open (-1: none chosen - the TF_GFX_API environment variable, as before)
+        std::atomic<int> g_apiChosen{-1};
+
         bool vulkanChosen()
         {
             static const bool chosen = [] {
                 const char *v = std::getenv("TF_GFX_API");
-                const bool asked = v && (std::strcmp(v, "vulkan") == 0 || std::strcmp(v, "Vulkan") == 0);
+                const int byHost = g_apiChosen.load(std::memory_order_acquire);
+                const bool asked = byHost >= 0 ? byHost == 1 : v && (std::strcmp(v, "vulkan") == 0 || std::strcmp(v, "Vulkan") == 0);
 #if defined(TF_VULKAN)
                 std::fprintf(stderr, "[native render] graphics API: %s\n", asked ? "Vulkan (TF_GFX_API=vulkan; in development)" : kDefaultApi);
                 return asked;
@@ -62,6 +67,12 @@ namespace nr
             }();
             return chosen;
         }
+    }
+
+    // (S2a, nr_core::open) The host's API: 0 the default, 1 Vulkan. Only before the backend's first use - the choice is made once.
+    void chooseApi(int api)
+    {
+        g_apiChosen.store(api, std::memory_order_release);
     }
 
     Backend &backend()

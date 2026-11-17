@@ -19,7 +19,7 @@
 #include "nr_policy.h"
 #include "nr_taa.h"
 #include "nr_pipeline_seed.h" // (TODO 317: the pipelines a first run makes ahead)
-#include "runtime/ps2_thread_placement.h"
+#include "nr_core.h" // (the thread placement hook: the core includes nothing of the runtime)
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -923,7 +923,18 @@ float4 psColour(VsOut i)
             discard;
     }
 #endif
+    // (TODO 351 b) Soft particles: fogx.z is the fade range in Z24 units (negative: an additive blend, its colour fades too). The
+    // particle is in front of the surface behind it by (its depth - the scene's) - 0 where it meets it, so its alpha grows from 0 there.
+    float softFade = 1.0;
+    if (fogx.z != 0.0)
+    {
+        const float sceneD = depthTex.Load(int3(i.pos.xy, 0));
+        softFade = saturate((i.pos.z - sceneD) * 268435456.0 / abs(fogx.z));
+        c.a *= softFade;
+    }
     float3 rgb = saturate(c.rgb);
+    if (fogx.z < 0.0)
+        rgb *= softFade;
     if (fogx.x > 0.5)
     {
         // (TODO 399) The game draws its 3D trees after the depth fog's pass, so the trees this port draws far past the console's
@@ -4075,7 +4086,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
 
             void work()
             {
-                ps2_thread_placement::place(ps2_thread_placement::Role::Helper); // (PS2X_THREAD_PLACEMENT: the HD texture uploads)
+                nr_core::placeThisThread(nr_core::ThreadRole::Helper); // (PS2X_THREAD_PLACEMENT: the HD texture uploads)
                 // (At most this much staging in one copy batch: the batch's copies run, the staging is
                 // let go of, the next taken - the upload heap never holds a level's worth at once.)
                 // (48 MB, was 160: the game's own textures - stand-ins drawn meanwhile, TODO 76 - wait behind at most

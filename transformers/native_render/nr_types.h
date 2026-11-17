@@ -60,6 +60,7 @@ namespace nr
         bool sprites = false;   // four corners a sprite (u, v the corner), from batch type 1
         bool immediate = false; // drawn this frame only (the display list's own GS drawing): screen space
         bool projective = false; // u, v are S, T and size is Q: divided per pixel, as the GS does (STQ)
+        bool particle = false;   // (TODO 351 b) made of a particle pipeline's packets (nr_particles.cpp): the soft-particles setting fades it near the surface behind it
         bool primitive = false;  // a microcode primitive's (vlMicrocodePrimitive: sprites the device builds itself), this frame's
         bool ocean = false;      // the FFT ocean's grid patch (vlxWaterEffect: its packet read from the list), this frame's
         bool devicePrimitive = false; // (TODO 295) the render device's own primitive's strips (slot 29), this frame's

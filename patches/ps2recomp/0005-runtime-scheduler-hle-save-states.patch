@@ -7710,7 +7710,7 @@ index 8590f14..fbd8f36 100644
 +    {
 +        if (g_windowTitle.empty())
 +            return;
-+        const std::string title = g_windowTitle + (captured ? "  -  mouse captured (Esc releases it)" : "  -  click to use the mouse");
++        const std::string title = g_windowTitle; (void)captured; // (the user, 2026-11-17: the name only, no mouse hint)
 +        SetWindowTitle(title.c_str());
 +    }
 +

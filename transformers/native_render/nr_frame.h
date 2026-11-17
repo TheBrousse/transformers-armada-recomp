@@ -120,6 +120,12 @@ namespace nr::frame
     // It scales the fog pass's alpha and the 3D trees' own fog the same way. TF_FOG_STRENGTH, read at first use, then live.
     inline std::atomic<float> g_fogStrength{-1.0f};
     inline float fogStrength() { return strengthOf(g_fogStrength, "TF_FOG_STRENGTH", 1.0f, 1.5f); }
+    // (TODO 351 b) Soft particles: a particle's alpha fades over this many Z24 units as it comes up to the surface behind it (water,
+    // ground, rocks), so it no longer ends in a straight cut. 0 = off (the PS2's own look). TF_SOFT_PARTICLES (the range), read at first
+    // use, then live from the F1 row.
+    inline std::atomic<float> g_softParticles{-1.0f};
+    inline float softParticles() { return strengthOf(g_softParticles, "TF_SOFT_PARTICLES", 20000.0f, 1000000.0f); }
+    inline void setSoftParticles(float r) { g_softParticles.store(std::clamp(r, 0.0f, 1000000.0f), std::memory_order_relaxed); }
     inline void setFogStrength(float s) { g_fogStrength.store(std::clamp(s, 0.0f, 1.5f), std::memory_order_relaxed); }
     inline void setBloomStrength(float s) { g_bloomStrength.store(std::clamp(s, 0.0f, 2.0f), std::memory_order_relaxed); }
     inline void setToneStrength(float s) { g_toneStrength.store(std::clamp(s, 0.0f, 1.0f), std::memory_order_relaxed); }

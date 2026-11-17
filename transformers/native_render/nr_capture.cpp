@@ -12,6 +12,7 @@
 // TF_NATIVE_DUMP=1: each saved frame's draws, as text beside the picture (runs\native_<tick>.txt).
 #include "nr_types.h"
 #include "port_ext.h" // (ext::renderHooks: an extension's own player, e.g. Playable Decepticons in the overlay)
+#include "nr_core.h"
 #include "nr_backend.h"
 #include "nr_install.h"
 #include "nr_policy.h"
@@ -2784,6 +2785,7 @@ namespace nr
         // The display list's own GS drawing (the HUD, menus, 2D): screen-space draws, in order.
         gif::State g_gif;
 
+        thread_local bool t_particleKick = false; // (TODO 351 b) set while a particle pipeline's primitive is added as a draw
         bool g_noImmediate = false, g_noGrass = false; // TF_NATIVE_IMMEDIATE=0, TF_NATIVE_GRASS=0
         // Type-0 batches on the sprite routine (TF_NATIVE_SPRITES0=0: off): the dispatcher converts no type 0,
         // so the routine reads them as it reads type 0x8001's - colour and position, the size in w - and
@@ -3257,6 +3259,7 @@ namespace nr
             auto mesh = std::make_shared<Mesh>();
             mesh->id = g_nextId++;
             mesh->immediate = true;
+            mesh->particle = t_particleKick; // (TODO 351 b)
             mesh->projective = true;
             mesh->hasColour = true;
             mesh->hasUv = true;
@@ -6304,7 +6307,9 @@ namespace nr
                                          static_cast<unsigned long long>(p.alpha), static_cast<unsigned long long>(p.tex0), static_cast<unsigned long long>(p.xyoffset),
                                          static_cast<unsigned long long>(p.scissor), p.vertices[0].colour, aMax);
                         }
+                        t_particleKick = true;
                         addImmediate(g_rdram, p);
+                        t_particleKick = false;
                     });
                     if (noListMode() != 0) // (N5.1: their register writes are the renderer's own - in the call state too)
                         gif::run(g_callGif, w, qwords, [](const gif::Primitives &) {});
@@ -6976,7 +6981,9 @@ namespace nr
             s.choices = {{"0", "Off"}, {"1", "FXAA"}, {"2", "SMAA 1x"}};
             s.defaultValue = graphics_driver::defaultFor("TF_NATIVE_AA", "1"); // (TODO 295: off on built-in graphics, the Low preset's)
             s.apply = [](const std::string &value) {
-                backend().setAntiAliasing(value == "0" ? 0 : value == "2" ? 2 : 1);
+                nr_core::Settings coreSettings;
+                coreSettings.antiAliasing = value == "0" ? 0 : value == "2" ? 2 : 1;
+                nr_core::applySettings(coreSettings);
                 return true;
             };
             s.available = []() {
@@ -7048,6 +7055,28 @@ namespace nr
             };
             s.available = []() { return ps2_settings::choice("TF_NATIVE_BLOOM") == "1"; };
             s.unavailableHelp = "Turn it on first (the row above).";
+            ps2_settings::add(s);
+        }
+        // (TODO 351 b) Soft particles: smoke, spray and glows fade out where they meet the water, ground or rocks behind them.
+        {
+            ps2_settings::Setting s;
+            s.key = "TF_SOFT_PARTICLES";
+            s.section = "Graphics";
+            s.label = "Soft particles (native renderer)";
+            s.order = 58;
+            s.help = "Native renderer: the waterfall's spray, smoke and glows fade out smoothly where they meet the water, ground or rocks "
+                     "behind them, instead of ending in a straight cut. Off is the console's own look. Bigger fades over a longer stretch.";
+            s.choices = {{"0", "Off (the console's look)"}, {"8000", "Small"}, {"20000", "Medium"}, {"40000", "Large"}};
+            s.defaultValue = "20000"; // Medium by default (the user, 2026-11-17)
+            s.apply = [](const std::string &value) {
+                frame::setSoftParticles(static_cast<float>(std::atof(value.c_str())));
+                return true;
+            };
+            s.available = []() {
+                const char *on = std::getenv("TF_NATIVE_RENDER");
+                return ps2_settings::choice("TF_RENDERER") == "native" || (on && *on && *on != '0');
+            };
+            s.unavailableHelp = "Only for the native renderer (Display: Renderer).";
             ps2_settings::add(s);
         }
         // (TODO 399) The distance haze (the game's depth fog) strength: the F1 slider, live. 100% = the console's; terrain and trees alike.
@@ -7195,7 +7224,9 @@ namespace nr
             s.choices = {{"0", "Off"}, {"1", "On (1.5x)"}};
             s.defaultValue = "0";
             s.apply = [](const std::string &value) {
-                backend().setSupersampling(value == "1");
+                nr_core::Settings coreSettings;
+                coreSettings.supersampling = value == "1" ? 1 : 0;
+                nr_core::applySettings(coreSettings);
                 return true;
             };
             s.available = []() {
@@ -7504,7 +7535,7 @@ namespace nr
             if (flag("TF_NATIVE_ONLY") && !flag("TF_NATIVE_EMU2D") && !flag("TF_NATIVE_LOOSE_COMPARE") && !(later && *later == '0'))
                 ps2_gpu::setStartDeferred(true);
         }
-        backend().prepare();
+        nr_core::open(nr_core::Settings{}); // (S2a: the backend chosen as before - TF_GFX_API - and prepared)
         startLivePicture();
     }
 

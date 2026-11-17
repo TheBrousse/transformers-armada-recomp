@@ -64,6 +64,7 @@ namespace fs = std::filesystem;
 extern PS2Runtime *g_tfRuntime; // profiler.cpp
 #if defined(_WIN32)
 void tfShowWindowWithoutFocus(void *window, int x, int y); // profiler.cpp
+void tfSetWindowIcon(void *window); // profiler.cpp (the exe's icon on the window)
 #endif
 void tfNoteWindow(void *window); // profiler.cpp (TF_TEST_WINDOW)
 void tfKeepFullSpeedInBackground(); // profiler.cpp (TODO 197: no Windows throttling with the window left)
@@ -600,7 +601,7 @@ int main(int argc, char *argv[])
 #endif
         }
         nr::beforeWindow(); // (Vulkan's own present of SDL3's window: nr_install.h)
-        if (!runtime.initialize("Transformers"))
+        if (!runtime.initialize("Transformers Armada"))
         {
             std::cerr << "Failed to initialize PS2 runtime" << std::endl;
             return 1;
@@ -620,6 +621,9 @@ int main(int argc, char *argv[])
         g_tfRuntime = &runtime;
 #endif
         tfNoteWindow(GetWindowHandle()); // (the window's state for TODO 117: tfWindowAway, TF_TEST_WINDOW)
+#if defined(_WIN32)
+        tfSetWindowIcon(GetWindowHandle()); // (the title bar / taskbar icon = the exe's, from the disc)
+#endif
 #if defined(__linux__)
         g_tfMonitorHz.store(GetMonitorRefreshRate(GetCurrentMonitor())); // (GLFW: on the main thread)
 #endif

@@ -47,6 +47,26 @@ if(TF_NATIVE_VKD3D)
         "${TF_VKD3D_DIR}/lib/libvkd3d-shader.a" dl pthread m)
 endif()
 
+# The native renderer's CORE (nr_core, native_render/nr_core.h; lane B's spec: runs/handover_2026-11-15/NR_CORE_SPEC.md): the
+# sources that build with NO runtime - the include path below cannot see src/, decomp/ or ps2_runtime, so a stray include of
+# the runtime, raylib, view_turn or ps2_settings in these files fails at compile time. The recomp's exe takes the objects
+# (as before: the same code, the same flags), and nr_core is the same objects as a static library for hosts that link
+# only the core. Grows step by step (S0: the backends' base, the passes, the upscaler, the policy).
+set(TF_NR_CORE_REGEX "/nr_(d3d|backend|passes|taa|policy|core_hooks|core_api|pacelog|texture|hires)\\.cpp$")
+set(TF_NR_CORE_SOURCES ${TF_NATIVE_RENDER_SOURCES})
+list(FILTER TF_NR_CORE_SOURCES INCLUDE REGEX "${TF_NR_CORE_REGEX}")
+list(FILTER TF_NATIVE_RENDER_SOURCES EXCLUDE REGEX "${TF_NR_CORE_REGEX}")
+add_library(nr_core_objects OBJECT ${TF_NR_CORE_SOURCES})
+target_include_directories(nr_core_objects PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/native_render" "${CMAKE_CURRENT_BINARY_DIR}/baked")
+target_compile_features(nr_core_objects PUBLIC cxx_std_20)
+add_library(nr_core STATIC $<TARGET_OBJECTS:nr_core_objects>)
+target_include_directories(nr_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/native_render")
+set_target_properties(nr_core PROPERTIES LINKER_LANGUAGE CXX)
+# (nr_core S1) The core's GS address functions against the runtime's own: build and run by hand, `cmake --build . --target nr_gs_decode_test`.
+add_executable(nr_gs_decode_test EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/native_render/tests/nr_gs_decode_test.cpp")
+target_include_directories(nr_gs_decode_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/native_render" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+target_compile_features(nr_gs_decode_test PRIVATE cxx_std_20)
+
 # The version the build is made from (TODO 104, updates.h): tf_version.h, written at every build by
 # version.cmake (only when it changes: the commit, its branch and date, a copy of the home repository
 # or a development checkout).
@@ -83,7 +103,7 @@ if(NOT TF_BATCH_SOURCES OR NOT EXISTS "${TF_REGISTER_FUNCTIONS}")
         "only the tools and runtime will be built.")
     # The port's own code still compiles without a disc (CI: tf_port_objects). vu1_native.cpp needs microcode made
     # from the disc, so it is left out.
-    set(TF_PORT_CHECK_SOURCES ${TF_GAME_SOURCES} ${TF_DECOMP_SOURCES} ${TF_NATIVE_RENDER_SOURCES})
+    set(TF_PORT_CHECK_SOURCES ${TF_GAME_SOURCES} ${TF_DECOMP_SOURCES} ${TF_NATIVE_RENDER_SOURCES} $<TARGET_OBJECTS:nr_core_objects>)
     list(FILTER TF_PORT_CHECK_SOURCES EXCLUDE REGEX "/vu1_native\\.cpp$")
     add_library(tf_port_objects OBJECT EXCLUDE_FROM_ALL ${TF_PORT_CHECK_SOURCES})
     add_dependencies(tf_port_objects tf_version)
@@ -107,6 +127,7 @@ add_executable(TransformersRecomp
     ${TF_GAME_SOURCES}
     ${TF_DECOMP_SOURCES}
     ${TF_NATIVE_RENDER_SOURCES}
+    $<TARGET_OBJECTS:nr_core_objects>
 )
 
 target_include_directories(TransformersRecomp PRIVATE

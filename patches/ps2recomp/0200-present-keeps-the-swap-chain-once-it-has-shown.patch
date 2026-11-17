@@ -1,0 +1,214 @@
+Subject: [PATCH] Present: once the swap chain has shown pictures it is kept; stuck pictures pause the hand-over (TODO 393)
+
+The user's RX 7900 XTX froze at an alt-tab: GL's copies into Direct3D's textures stopped finishing (the GPU had hung), 5 s
+later the watchdog of 0196 sent the window to GL's own swap, and the window's thread then hung inside GL's swap ("Not
+Responding"). A window that has shown a flip-model swap chain's picture stays black on GL's swap anyway (0196's own
+finding on the Intel laptops), so after the first shown picture none of 0196's reasons switch paths any more: the swap
+chain is kept (said once), and pictures that have not moved on for 5 s set stalled(): the window draws nothing into its
+pictures and hands nothing over, never waits for them (its thread keeps reading its messages), and resumes when they
+move again (said). Before the first shown picture (the Intel case of 0196) nothing changes. PS2X_PRESENT_KEEP=0: the
+fallback at any time, as before. Test switch PS2X_PRESENT_STALL_TEST=<from s>,<for s>: GL's copies held unfinished for
+that while (a stuck hand-over after pictures were shown, then its recovery). Also said: the present's mode (at the refresh /
+at once) and whether the window is in front, each time either changes.
+
+diff --git a/ps2xRuntime/include/runtime/ps2_host_present.h b/ps2xRuntime/include/runtime/ps2_host_present.h
+index 7cdd7b4..d5bc05d 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_present.h
++++ b/ps2xRuntime/include/runtime/ps2_host_present.h
+@@ -57,6 +57,9 @@ namespace ps2_host_present
+         // pictures have not moved on for 5 s (TODO 362): present() will not work here. Also writes the watchdog's line
+         // (no picture shown 10 s after the start). The window's thread, each picture.
+         bool broken();
++        // (TODO 393) The pictures handed over have not moved on for 5 s after the swap chain has shown some (broken() keeps
++        // the swap chain then): nothing is to be drawn into the pictures nor handed over until it is false again.
++        bool stalled();
+         void close();
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_host_present.cpp b/ps2xRuntime/src/lib/ps2_host_present.cpp
+index 9f7a8c7..b78e296 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present.cpp
+@@ -107,6 +107,11 @@ namespace ps2_host_present
+         const int width = GetScreenWidth(), height = GetScreenHeight();
+         if (width <= 0 || height <= 0) // (minimised)
+             return;
++        // (TODO 393) Pictures that have not moved on for 5 s after the swap chain has shown some: nothing drawn into the
++        // pictures nor handed over, and never a wait for them - the window's thread keeps reading its messages (it hung in
++        // GL's swap once on an alt-tab), and the hand-over resumes once they move again (dxgi::broken() watches them).
++        if (dxgi::stalled())
++            return;
+         if (width != g_width || height != g_height || g_targets[0].id == 0u)
+         {
+             for (size_t i = 0; i < g_targets.size(); ++i)
+@@ -250,6 +255,11 @@ namespace ps2_host_present::dxgi
+         return false;
+     }
+ 
++    bool stalled()
++    {
++        return false;
++    }
++
+     void close()
+     {
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+index 548becb..8ff5d0e 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -222,6 +222,24 @@ namespace ps2_host_present::dxgi
+             return forced;
+         }
+ 
++        // (TODO 393, a test switch) PS2X_PRESENT_STALL_TEST=<from s>,<for s>: GL's copies taken as unfinished from <from> s
++        // after the swap chain was made, for <for> s - a stuck hand-over after pictures were shown, then its recovery.
++        bool stallTest(std::chrono::steady_clock::time_point openedAt)
++        {
++            static const std::pair<double, double> window = []()
++            {
++                const char *env = std::getenv("PS2X_PRESENT_STALL_TEST");
++                double from = -1.0, length = 0.0;
++                if (env && std::sscanf(env, "%lf,%lf", &from, &length) != 2)
++                    from = -1.0;
++                return std::make_pair(from, length);
++            }();
++            if (window.first < 0.0)
++                return false;
++            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - openedAt).count();
++            return s >= window.first && s < window.first + window.second;
++        }
++
+         // (TODO 362) A present that failed: counted in a row; the first of each kind said, with its code.
+         enum Failure
+         {
+@@ -462,6 +480,9 @@ namespace ps2_host_present::dxgi
+             int width = 0, height = 0;
+         } g_check;
+         std::atomic<bool> g_zeros{false};
++        // (TODO 393) The pictures handed over have not moved on for 5 s after the swap chain has shown some: the window hands
++        // nothing over meanwhile (stalled()), never waits for them, and goes on once they move again.
++        std::atomic<bool> g_stalled{false};
+         bool checkEnabled()
+         {
+             static const bool enabled = !std::getenv("PS2X_PRESENT_CHECK") || *std::getenv("PS2X_PRESENT_CHECK") != '0';
+@@ -792,6 +813,23 @@ namespace ps2_host_present::dxgi
+                 // pictures at the start (one on a healthy machine).
+                 held = checkEnabled() && !g_check.done;
+                 const int interval = syncInterval();
++                // (TODO 393) The present's mode and the window's focus as the present thread meets them, said when they change:
++                // the user's RX 7900 XTX hung as the window came back to the front after minutes behind another one, the
++                // screen's refresh read as variable (present at once, tearing) in the same seconds.
++                {
++                    static int lastInterval = -2;
++                    static int lastFront = -1;
++                    const int front = GetForegroundWindow() == g.window ? 1 : 0;
++                    if (interval != lastInterval || front != lastFront)
++                    {
++                        std::fprintf(stderr, "[present] at %.3f s (present %llu): %s, the window %s\n",
++                                     std::chrono::duration<double>(Clock::now() - g.openedAt).count(),
++                                     static_cast<unsigned long long>(g.presents), interval ? "at the screen's refresh" : (g.tearing ? "at once (tearing)" : "at once"),
++                                     front ? "in front" : "not in front");
++                        lastInterval = interval;
++                        lastFront = front;
++                    }
++                }
+                 if (!held)
+                     hr = fault() == kFaultPresent ? DXGI_ERROR_DEVICE_REMOVED
+                                                   : g.swapChain->Present(static_cast<UINT>(interval), interval == 0 && g.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+@@ -861,7 +899,7 @@ namespace ps2_host_present::dxgi
+                 if (g.stop && g.abandon)
+                     break;
+                 bool progressed = false;
+-                if (!flying.empty() && (fault() != kFaultFence || !flying.front().picture) && passed(flying.front().copied))
++                if (!flying.empty() && (fault() != kFaultFence || !flying.front().picture) && !stallTest(g.openedAt) && passed(flying.front().copied))
+                 {
+                     lock.unlock();
+                     finishCopy(flying.front());
+@@ -1170,10 +1208,27 @@ namespace ps2_host_present::dxgi
+     // (The window's thread, each picture.)
+     bool broken()
+     {
+-        if (g.fitFailures.load(std::memory_order_relaxed) >= 3)
+-            return true;
+         const Clock::time_point now = Clock::now();
+         const uint64_t copied = g.copied.load(std::memory_order_acquire), shown = g.shownTotal.load(std::memory_order_relaxed);
++        // (TODO 393) Once a flip-model picture has been shown, the window never goes to GL's swap: it would stay black for
++        // good (both Intel laptops, TODO 362), and on the user's RX 7900 XTX the switch came after the GPU had hung at an
++        // alt-tab, the window's thread then held in GL's swap ("Not Responding"). The swap chain is kept; pictures that do
++        // not move on pause the window's hand-over (stalled()) until they move again. PS2X_PRESENT_KEEP=0: the fallback at
++        // any time, as before.
++        static const bool keepAfterShown = !std::getenv("PS2X_PRESENT_KEEP") || *std::getenv("PS2X_PRESENT_KEEP") != '0';
++        const bool kept = keepAfterShown && shown > 0u;
++        const auto keptInstead = [](const char *why)
++        {
++            static bool told = false;
++            if (!told)
++            {
++                told = true;
++                std::fprintf(stderr, "[present] %s, but the swap chain has shown pictures: kept (GL's swap would stay black)\n", why);
++            }
++            return false;
++        };
++        if (g.fitFailures.load(std::memory_order_relaxed) >= 3)
++            return kept ? keptInstead("Direct3D's textures could not be made 3 times") : true;
+         static bool watched = false;
+         if (!watched && g.handed > 0u && shown == 0u && now - g.openedAt > std::chrono::seconds(10))
+         {
+@@ -1196,9 +1251,12 @@ namespace ps2_host_present::dxgi
+             return true;
+         if (g.presentFailures.load(std::memory_order_relaxed) >= kFailedInARow)
+         {
+-            std::fprintf(stderr, "[present] %d presents in a row failed (the last: %s %08lx)\n", g.presentFailures.load(std::memory_order_relaxed),
+-                         failureName(g.lastFailure.load(std::memory_order_relaxed)), g.lastCode.load(std::memory_order_relaxed));
+-            return true;
++            static bool toldFailures = false;
++            if (!kept || !toldFailures)
++                std::fprintf(stderr, "[present] %d presents in a row failed (the last: %s %08lx)\n", g.presentFailures.load(std::memory_order_relaxed),
++                             failureName(g.lastFailure.load(std::memory_order_relaxed)), g.lastCode.load(std::memory_order_relaxed));
++            toldFailures = true;
++            return kept ? keptInstead("the presents failed") : true;
+         }
+         static uint64_t seen = 0u;
+         static Clock::time_point moved{};
+@@ -1206,13 +1264,25 @@ namespace ps2_host_present::dxgi
+         {
+             seen = copied;
+             moved = now;
++            if (g_stalled.load(std::memory_order_relaxed))
++            {
++                g_stalled.store(false, std::memory_order_relaxed);
++                std::fprintf(stderr, "[present] the pictures move on again (%llu copied): the window hands them over again\n",
++                             static_cast<unsigned long long>(copied));
++            }
+         }
+-        else if (now - moved > std::chrono::seconds(5))
++        else if (now - moved > std::chrono::seconds(5) && !g_stalled.load(std::memory_order_relaxed))
+         {
+             const int waiting = g.waitingOn.load(std::memory_order_relaxed);
+-            std::fprintf(stderr, "[present] the pictures have not moved on for 5 s (%llu handed over, %llu copied): the present thread %s\n",
++            std::fprintf(stderr, "[present] the pictures have not moved on for 5 s (%llu handed over, %llu copied): the present thread %s%s\n",
+                          static_cast<unsigned long long>(g.handed), static_cast<unsigned long long>(copied),
+-                         waiting == 1 ? "waits for GL's copy to finish" : waiting == 2 ? "waits for the presenting device's copy out" : "is not held up");
++                         waiting == 1 ? "waits for GL's copy to finish" : waiting == 2 ? "waits for the presenting device's copy out" : "is not held up",
++                         kept ? "; the swap chain is kept, the window hands nothing over until they move (TODO 393)" : "");
++            if (kept)
++            {
++                g_stalled.store(true, std::memory_order_relaxed);
++                return false;
++            }
+             {
+                 std::lock_guard<std::mutex> lock(g.mutex);
+                 g.abandon = true;
+@@ -1222,6 +1292,11 @@ namespace ps2_host_present::dxgi
+         return false;
+     }
+ 
++    bool stalled()
++    {
++        return g_stalled.load(std::memory_order_relaxed);
++    }
++
+     void waitCopied(uint64_t number)
+     {
+         if (number == 0u || g.copied.load(std::memory_order_acquire) >= number || !g.thread.joinable())

@@ -151,6 +151,19 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     Use-Python $Python   # (its user Scripts folder, where cmake.exe went, now exists)
     if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { Fail "cmake installed but not found on PATH" }
 }
+# (TODO 407) A CMake from before the PC's Visual Studio (Visual Studio 2026 alone, and an older pip CMake): updated, as
+# the build could not use that Visual Studio.
+$unknownVs = @(Get-VsUnknownToCmake)
+if ($unknownVs.Count) {
+    Step "Updating CMake (pip): this one does not know $($unknownVs -join ', ')"
+    if ((Invoke-Native { & $Python -m pip install --user --upgrade cmake }) -ne 0) { Fail "pip install --upgrade cmake failed" }
+    Use-Python $Python
+    $unknownVs = @(Get-VsUnknownToCmake)
+    if ($unknownVs.Count) {
+        Fail ("CMake ($("$(Invoke-Probe { & cmake --version } | Select-Object -First 1)".Trim()) still does not know $($unknownVs -join ', '). " +
+            "If another CMake comes first on PATH, remove it or update it; or install Visual Studio 2022's Build Tools (run the setup with -InstallPrerequisites).")
+    }
+}
 
 # The check that refuses commits with game data (tools\check_no_game_data.py), for anyone who commits.
 if (Test-Path (Join-Path $Root ".githooks")) { Invoke-Native { & git -C $Root config core.hooksPath .githooks } | Out-Null }

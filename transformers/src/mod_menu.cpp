@@ -5,6 +5,7 @@
 #include "pc_settings_row.h"
 
 #include "apex_keys.h"
+#include "flight_recorder.h"
 #include "camera_mode.h"
 #include "graphics_driver.h"
 #include "gpu_recovery.h"
@@ -1373,7 +1374,7 @@ namespace mod_menu
         // one page, the last): the emulated GPU's own switches, the sound engine, turbo loading and the
         // developers' test options.
         const char *const kDebugKeys[] = {"PS2X_GPU",          "PS2X_GPU_NATIVE",          "PS2X_GPU_TEXTURE_CACHE",
-                                          "PS2X_GPU_FULL_FIELDS", "PS2X_TEXTURE_DUMP",       "TF_NATIVE_SOUND",
+                                          "PS2X_GPU_FULL_FIELDS", "PS2X_TEXTURE_DUMP",
                                           "TF_FAST_LOAD",      "TF_CFG_enableWireframe",   "TF_CFG_debugRagdollMode",
                                           "TF_CFG_creaturesAlwaysUseCover", "TF_CFG_enableIncidentals",
                                           "TF_CFG_enableOcclusion"};
@@ -1553,7 +1554,6 @@ namespace mod_menu
             {"PS2X_STICK_VEHICLE_LIFT", "Car stick lift", "With Tuned car steering only. Auto: just past the game's own dead zone."},
             {"PS2X_STICK_VEHICLE_RESPONSE", "Car stick curve", "With Tuned car steering only. Higher: gentler near the centre."},
             {"TF_CAR_KEYS", "Drive with movement keys", "W and S drive the car."},
-            {"TF_NATIVE_SOUND", "Sound engine", "Native or the emulated PS2 sound chip."},
             {"TF_CFG_showHUD", "HUD", "Show the in-game HUD."},
             {"TF_START_SCREENS", "Start-up", "What shows when the game starts."},
             {"TF_OBJECTIVE_GUIDE", "Objective guide", "An arrow at the bottom of the screen to the level's next story place, with its name and distance."},
@@ -1881,12 +1881,13 @@ namespace mod_menu
             "TF_SMALL_CROSSHAIR", "TF_CROSSHAIR", "TF_CROSSHAIR_SIZE", "TF_HQ_PANELS", "TF_DISTANCE_METER", "TF_SPEEDRUN_TIMER", "TF_RENDERER", "PS2X_GPU_SCALE",
             "TF_DRAW_DISTANCE", "TF_SCENERY_DISTANCE", "TF_FOREST_DISTANCE", "TF_FOREST_SPRITES", "TF_GRASS_DISTANCE",
             "TF_TERRAIN_DETAIL", "TF_FOREST_ADAPTIVE", "TF_FOREST_FULL_DETAIL", "TF_ENEMY_DETAIL", "TF_NATIVE_AA", "PS2X_GPU_AA", "PS2X_GPU_MSAA",
+            "TF_FOREST_TRUNK_PICTURES", "TF_TRUNK_SOFT", "TF_FOREST_TRUNK_LEAVES", // (TODO 376 / 398)
             "TF_NATIVE_SSAA", "TF_NATIVE_QUALITY", "TF_SHARP_TEXTURES", "TF_SMOOTH_TEXTURES", "PS2X_TEXTURE_PACK", "PS2X_GPU_ANISOTROPY", "TF_HIRES",
             "TF_MOUSE", "PS2X_MOUSE_SENSITIVITY", "TF_MENU_MOUSE", "TF_RIGHT_AIM", "TF_FP_STEADY_EYE", "PS2X_SONYPAD_RUMBLE", "PS2X_SONYPAD_LIGHTBAR", "TF_LIGHTBAR_ALERTS", "TF_ADAPTIVE_TRIGGERS", "TF_TRIGGER_STRENGTH", "TF_PAD_SPEAKER", "TF_PAD_SPEAKER_VOLUME", "TF_PAD_SPEAKER_DELAY", "PS2X_GAMEPAD_BACKEND",
             "PS2X_STICK_LEFT_DEADZONE", "PS2X_STICK_RIGHT_DEADZONE",
             "PS2X_STICK_RESPONSE", "PS2X_STICK_VEHICLE_MODE", "PS2X_STICK_LEFT_LIFT", "PS2X_STICK_LEFT_SENSITIVITY",
             "PS2X_STICK_RIGHT_LIFT", "PS2X_STICK_VEHICLE_LIFT", "PS2X_STICK_VEHICLE_RESPONSE",
-            "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_NATIVE_SOUND", "TF_CFG_showHUD", "TF_START_SCREENS", "TF_MENU_FADE_SPEED", "TF_SCOPE_SENSITIVITY", "TF_OBJECTIVE_GUIDE",
+            "TF_CAR_KEYS", "PS2X_AUDIO", "PS2X_AUDIO_VOLUME", "TF_CFG_showHUD", "TF_START_SCREENS", "TF_MENU_FADE_SPEED", "TF_SCOPE_SENSITIVITY", "TF_OBJECTIVE_GUIDE",
             "TF_ENEMY_WAVES", "TF_PLAY_RECORDING", "TF_UPDATE_CHECK",
             // (Kept in settings.ini only, never a row: the HD texture pack's folder and the HD set's - the Graphics
             // page's pack button and the setup set them; without these "Show all settings" listed them as raw rows.)
@@ -1990,6 +1991,10 @@ namespace mod_menu
                       "cost frame rate, mostly processor time: in thick forest Far 3D draws a little fewer pictures a second "
                       "than Near 3D, Very far 3D and Full 3D up to half as many.",
                       trees(), true);
+            // (TODO 376 / 398: the bare-trunk rows)
+            keyRow("TF_FOREST_TRUNK_PICTURES");
+            keyRow("TF_TRUNK_SOFT");
+            keyRow("TF_FOREST_TRUNK_LEAVES");
             if (advanced("graphics-distance"))
             {
                 keyRow("TF_SCENERY_DISTANCE");
@@ -2244,9 +2249,6 @@ namespace mod_menu
         {
             pageHeading("Sound");
             mergedRow("volume", "Volume", "How loud the game plays. Off: no sound.", volumes(), false);
-            if (advanced("sound"))
-                keyRow("TF_NATIVE_SOUND");
-            advancedEnd();
             settingRows(Page::Sound);
         }
 
@@ -3554,6 +3556,7 @@ namespace mod_menu
         clickTestFrame(runtime.eeScheduler().currentVSyncTick(), g_open);
         loadControls(); // (controls.txt, once)
         apex_keys::windowFrame(); // (TODO 300 (6): the Apex mod's sprint key)
+        flight_recorder::windowFrame(); // (TODO 405: F10, the flight recorder's dump with a save state)
         updateCarKeys(); // (W / S drive the car)
         if (!g_open)
             photo_mode::windowFrame(); // (its keys, and its hint: photo_mode.h)
@@ -3753,6 +3756,56 @@ namespace mod_menu
         ps2_overlay::begin();
         if (ownInput)
             feedOverlayInput();
+        // (TODO 404, a test aid: TF_IMGUI_TIME_TEST=1 with the menu open, e.g. TF_MOD_MENU=1) ImGui's clock against the wall
+        // clock every 2 s, and from 5 s on: an arrow key held for 2 s (its presses counted: delay 0.275 s, then one every
+        // 0.05 s = about 35), two clicks 0.15 s apart (a double-click) and two 1 s apart (not one).
+        if (static const bool imguiTimeTest = std::getenv("TF_IMGUI_TIME_TEST") && *std::getenv("TF_IMGUI_TIME_TEST") == '1'; imguiTimeTest)
+        {
+            using Clock = std::chrono::steady_clock;
+            static const Clock::time_point t0 = Clock::now();
+            static double imguiAt = ImGui::GetTime(), lastLog = 0.0, dtSum = 0.0;
+            static int frames = 0, presses = 0, step = 0, quickDouble = 0, slowDouble = 0;
+            const double t = std::chrono::duration<double>(Clock::now() - t0).count();
+            ImGuiIO &io = ImGui::GetIO();
+            dtSum += io.DeltaTime;
+            ++frames;
+            if (t - lastLog >= 2.0)
+            {
+                const double imguiNow = ImGui::GetTime();
+                std::fprintf(stderr, "[tf] imgui time test: ImGui clock %.3f s in %.3f s of wall time (%.0f%%), DeltaTime %.2f ms a frame on average (%d frames)\n",
+                             imguiNow - imguiAt, t - lastLog, 100.0 * (imguiNow - imguiAt) / (t - lastLog), 1000.0 * dtSum / frames, frames);
+                imguiAt = imguiNow;
+                lastLog = t;
+                dtSum = 0.0;
+                frames = 0;
+            }
+            if (step == 1 && ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+                ++presses;
+            if ((step == 4 || step == 5) && io.MouseDoubleClicked[0])
+                ++quickDouble;
+            if ((step == 7 || step == 8 || step == 9) && io.MouseDoubleClicked[0])
+                ++slowDouble;
+            const double at[] = {5.0, 7.0, 9.0, 9.05, 9.15, 9.20, 11.0, 11.05, 12.05, 12.10, 13.0};
+            if (step < 11 && t >= at[step])
+            {
+                io.AddMousePosEvent(200.0f, 200.0f);
+                switch (step)
+                {
+                case 0: io.AddKeyEvent(ImGuiKey_DownArrow, true); break;
+                case 1:
+                    io.AddKeyEvent(ImGuiKey_DownArrow, false);
+                    std::fprintf(stderr, "[tf] imgui time test: the arrow held 2 s gave %d presses (about 35 expected)\n", presses);
+                    break;
+                case 2: case 4: case 6: case 8: io.AddMouseButtonEvent(0, true); break;
+                case 3: case 5: case 7: case 9: io.AddMouseButtonEvent(0, false); break;
+                case 10:
+                    std::fprintf(stderr, "[tf] imgui time test: two clicks 0.15 s apart -> double-click %s; two clicks 1 s apart -> double-click %s\n",
+                                 quickDouble ? "yes" : "NO", slowDouble ? "YES (wrong)" : "no");
+                    break;
+                }
+                ++step;
+            }
+        }
         {
             // The menu's own look, put back after it for the runtime's debugger (the same ImGui).
             const ImGuiStyle saved = ImGui::GetStyle();

@@ -4,6 +4,7 @@
 #include "controller_settings.h"
 #include "game_config.h"
 #include "ultrawide.h"
+#include "flight_recorder.h" // (TODO 405: TF_FLIGHT_RECORDER)
 #include "cam_trace.h"
 #include "file_trace.h"
 #include "camera_mode.h"
@@ -33,6 +34,7 @@
 #include "surround_mode.h"
 #include "pool_growth.h"
 #include "movement.h"
+#include "pickup_step.h"
 #include "ragdoll_step.h"
 #include "test_place.h"
 #include "ai_probe.h"
@@ -2078,6 +2080,7 @@ namespace
         const uint8_t *idField = camera != 0u ? getConstMemPtr(rdram, camera + 0x18u) : nullptr;
         if (angles && idField && view_turn::takeMouseTravel(pixelsX, pixelsY))
         {
+            flight_recorder::noteMouse(pixelsX, pixelsY); // (TODO 405: the travel as taken, before the zoom and the sensitivity)
             // (TODO 189) The aiming view's zoom (R3 / Circle into taTransformerStateLook, R3 again steps the zoom): the game's
             // stick turn is the rate times the state's +0x20 (0x46D74C: 1, then 0.57 and 0.33 at the two zoom steps - measured
             // 135, 77 and 45 deg/s), so zoomed in the view turns as much across the picture as before. The mouse went to the
@@ -3024,6 +3027,140 @@ namespace
     // The frame time of a level at the level's rate and at the console's 30 (setFrameWords, every
     // frame; 0 at 30): the Mini-Cons' cooldowns count down as the console would (abilityUpdate).
     float g_levelFramePeriod = 0.0f, g_consoleFramePeriod = 0.0f;
+
+    // (TODO 405) The camera's boom against walls. 0x2CA0B0 (decomp: taCameraScript_2.cpp) eases the boom +0x31C toward the
+    // wanted length by the share above (0x6CBE18), but once the camera has arrived (+0x329 = 0, the usual state) it takes
+    // the collision sweep's length raw each frame: pulled in at once when a wall comes between (right - the eye never
+    // behind a wall), and let out to full length the very frame the sweep misses. Against a jagged wall the sweep hits
+    // and misses by turns as the view moves, and the eye jumped in and out each frame - up to the boom's whole length,
+    // into or behind the wall's picture (measured at the user's Antarctica wall: 2305 jumps of up to 14 units in 34 s
+    // with the misses forced, none with this). Now a let-out of more than 0.5 units in a frame is taken back to the frame
+    // before's length and the camera marked not arrived, so the game's own ease lets it out from there (about half a
+    // second, at any rate - the share above); the pull-in and the game's cut (+0x32A) stay its own. In normal play it acts
+    // on a frame now and then (1 in 42,000 in a 4-minute soak). TF_CAM_RELEASE=0: as before.
+    constexpr uint32_t kCameraBoom = 0x002CA0B0u;
+    PS2Runtime::RecompiledFunction g_cameraBoom = nullptr;
+    bool g_camRelease = true;
+    void cameraBoomRelease(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t camera = getRegU32(ctx, 4), position = getRegU32(ctx, 5), sweepAt = getRegU32(ctx, 6), target = getRegU32(ctx, 8); // (a0, a1, a2, t0)
+        const bool ok = camera >= 0x00100000u && camera < PS2_RAM_SIZE - 0x340u && position >= 0x00100000u && position < PS2_RAM_SIZE - 0x10u &&
+                        target >= 0x00100000u && target < PS2_RAM_SIZE - 0x10u;
+        const bool record = flight_recorder::enabled();
+        const auto distTo = [rdram, target](uint32_t at)
+        {
+            if (at < 0x00100000u || at >= PS2_RAM_SIZE - 0x10u)
+                return -1.0f;
+            float v[3], t[3];
+            std::memcpy(v, rdram + at, sizeof(v));
+            std::memcpy(t, rdram + target, sizeof(t));
+            return std::sqrt((v[0] - t[0]) * (v[0] - t[0]) + (v[1] - t[1]) * (v[1] - t[1]) + (v[2] - t[2]) * (v[2] - t[2]));
+        };
+        float before = 0.0f;
+        flight_recorder::Camera rec{};
+        if (ok)
+        {
+            std::memcpy(&before, rdram + camera + 0x31Cu, 4);
+            if (record)
+            {
+                rec.wanted = distTo(position); // (the scripts' eye before the boom: the sweeps work on copies)
+                rec.sweep = distTo(sweepAt);   // (the first sweep's point: as far as the collision lets it)
+                // (the sweep's snapshot, +0x130 while the collision runs: +0x00 the scene triangles hit, +0x0C the models)
+                uint32_t snapshot = 0u;
+                std::memcpy(&snapshot, rdram + camera + 0x130u, 4);
+                if (snapshot >= 0x00100000u && snapshot < PS2_RAM_SIZE - 0x10u)
+                {
+                    std::memcpy(&rec.sceneHits, rdram + snapshot, 4);
+                    std::memcpy(&rec.modelHits, rdram + snapshot + 0x0Cu, 4);
+                }
+            }
+        }
+        g_cameraBoom(rdram, ctx, runtime);
+        if (!ok)
+            return;
+        float after = 0.0f;
+        std::memcpy(&after, rdram + camera + 0x31Cu, 4);
+        bool held = false;
+        if (g_camRelease && before > 0.0f && after > before + 0.5f && rdram[camera + 0x32Au] == 0u)
+        {
+            float p[3], t[3];
+            std::memcpy(p, rdram + position, sizeof(p));
+            std::memcpy(t, rdram + target, sizeof(t));
+            const float dx = p[0] - t[0], dy = p[1] - t[1], dz = p[2] - t[2], length = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (length > 0.0f && std::isfinite(length))
+            {
+                const float k = before / length;
+                const float q[3] = {t[0] + dx * k, t[1] + dy * k, t[2] + dz * k};
+                std::memcpy(rdram + position, q, sizeof(q));
+                std::memcpy(rdram + camera + 0x31Cu, &before, 4);
+                rdram[camera + 0x329u] = 1u;
+                held = true;
+            }
+        }
+        if (!record)
+            return;
+        std::memcpy(rec.eye, rdram + position, sizeof(rec.eye));
+        std::memcpy(rec.target, rdram + target, sizeof(rec.target));
+        rec.boomBefore = before;
+        rec.boomGame = after;
+        std::memcpy(&rec.boom, rdram + camera + 0x31Cu, 4);
+        rec.arrived329 = rdram[camera + 0x329u];
+        rec.cut32A = rdram[camera + 0x32Au];
+        rec.held = held ? 1u : 0u;
+        flight_recorder::camera(rec);
+    }
+    // (TF_FLIGHT_RECORDER) The game's own height check under the camera (0x2C9F10, after the collision in
+    // taCamera::UpdateScripts: the eye kept at least 1 above the ground found by a probe from 300 above it down - and above
+    // the water) and that probe (taCollisionSceneManager::GetIgnoreMaskedHeightAtPoint 0x2F6BB0: a0 the manager, a1 the
+    // result - +0x00 the distance down from its start, +0x24 the surface's flags; a2 the mask, a3 the start; v0 found).
+    // The check counts a hit only if the flags have 0x180800.
+    constexpr uint32_t kCameraGround = 0x002C9F10u, kHeightAtPoint = 0x002F6BB0u;
+    PS2Runtime::RecompiledFunction g_cameraGround = nullptr, g_heightAtPoint = nullptr;
+    bool g_inCameraGround = false, g_groundFound = false;
+    float g_groundZ = 0.0f;
+    void heightAtPointNote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t result = getRegU32(ctx, 5), from = getRegU32(ctx, 7);
+        g_heightAtPoint(rdram, ctx, runtime);
+        if (!g_inCameraGround || result < 0x00100000u || result >= PS2_RAM_SIZE - 0x30u || from < 0x00100000u || from >= PS2_RAM_SIZE - 0x10u)
+            return;
+        float distance = 0.0f, z = 0.0f;
+        uint32_t flags = 0u;
+        std::memcpy(&distance, rdram + result, 4);
+        std::memcpy(&flags, rdram + result + 0x24u, 4);
+        std::memcpy(&z, rdram + from + 8u, 4);
+        g_groundFound = (getRegU32(ctx, 2) & 0xFFu) != 0u && (flags & 0x180800u) != 0u;
+        g_groundZ = z - distance;
+    }
+    void cameraGroundNote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t position = getRegU32(ctx, 5);
+        float before = 0.0f, after = 0.0f;
+        const bool ok = position >= 0x00100000u && position < PS2_RAM_SIZE - 0x10u;
+        if (ok)
+            std::memcpy(&before, rdram + position + 8u, 4);
+        g_inCameraGround = true;
+        g_groundFound = false;
+        g_cameraGround(rdram, ctx, runtime);
+        g_inCameraGround = false;
+        if (ok)
+            std::memcpy(&after, rdram + position + 8u, 4);
+        flight_recorder::noteGround(g_groundFound, g_groundZ, after - before);
+    }
+    // (TF_FLIGHT_RECORDER, for its header) The sweep's radius (0x2CA560: f12) and the camera's field of view as set
+    // (vlCamera::SetFieldOfView 0x1F2850: f12, degrees).
+    constexpr uint32_t kCameraSweep = 0x002CA560u, kSetFieldOfViewRec = 0x001F2850u;
+    PS2Runtime::RecompiledFunction g_cameraSweep = nullptr, g_setFieldOfViewRec = nullptr;
+    void cameraSweepNote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        flight_recorder::noteRadius(2.0f * ctx->f[12]); // (the second sweep's: the radius x 0.5)
+        g_cameraSweep(rdram, ctx, runtime);
+    }
+    void setFieldOfViewNote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        flight_recorder::noteFieldOfView(ctx->f[12]);
+        g_setFieldOfViewRec(rdram, ctx, runtime);
+    }
 
     void setEcoScale(uint8_t *rdram); // (the draw distance, below)
     // (The forest's give-way, below: each frame's interval and work as the frame-rate ladder sees them, and whether
@@ -6594,12 +6731,211 @@ namespace
         return ecoLoadFloat(rdram, kind + 0x12Cu) * (ecoLoadFloat(rdram, kind + 0x148u) * common) / zoom;
     }
 
+    // (TODO 376, the bare trunks) A tree whose level data picks secondary layout 0 (the variant: +0x29's high nibble of
+    // the candidate, +0x99 of the node's copy), a layout with no secondary objects, is a trunk-only 3D model: the console
+    // draws it so within its reach, and as the kind's flat picture (the full tree) beyond. A longer reach (Trees over
+    // 1x) turned the ones between the console's reach and ours into bare 3D trunks - at Very far 3D nearly all of them,
+    // e.g. about 500 a frame in Deep Amazon's far band (docs/TREES_376_BARE_TRUNKS.md). Such a tree of a kind that has
+    // layouts with leaves now stays the picture beyond the console's reach (its kind's reach x the level's scale / the
+    // scale word): made 3D only inside TF_FOREST_HYSTERESIS of it, dropped at it (ecoDeleteAll), as S2 does at the
+    // reach. Inside the console's reach nothing changes. TF_FOREST_TRUNK_PICTURES=0: as before.
+    std::atomic<bool> g_forestTrunkPictures{[] {
+        const char *e = std::getenv("TF_FOREST_TRUNK_PICTURES");
+        return !(e && *e == '0');
+    }()};
+    // (a test aid) the swap point: a trunk-only tree turns 3D inside this share of the console's reach and
+    // back to its picture beyond it + 0.05 (TF_TRUNK_SWAP; 0.95 = the hysteresis the gate had)
+    std::atomic<float> g_trunkSwap{[] {
+        const char *e = std::getenv("TF_TRUNK_SWAP");
+        return e && *e ? std::clamp(static_cast<float>(std::atof(e)), 0.5f, 1.0f) : 0.95f;
+    }()};
+    uint32_t g_forestTrunksHeld = 0u, g_forestTrunksDropped = 0u; // (since the last log line)
+    // The console's reach of a tree when its layout (by the variant, as func_432AB0 picks it) has no secondary objects
+    // while its kind has a layout with some; 0 for every other tree (and with the switch off, or TF_FOREST=old).
+    // (TODO 376 / 398, the F1 row "Leaves on trunk-only trees", experimental) TF_FOREST_TRUNK_LEAVES=1 gives a
+    // trunk-only tree of a leafed kind that kind's layout 1 (option B); TF_TRUNK_RAMP=<from>:<to>:<seconds>[:<start>] the
+    // console's reach times a factor going from <from> to <to> over <seconds> of the forest's clock (trees cross it in place);
+    // TF_TRUNK_LOG=1 a line per trunk-only tree made 3D / dropped.
+    std::atomic<bool> g_trunkLeavesTest{[] { const char *e = std::getenv("TF_FOREST_TRUNK_LEAVES"); return e && *e == '1'; }()};
+    const bool g_trunkLog = [] { const char *e = std::getenv("TF_TRUNK_LOG"); return e && *e == '1'; }();
+    float trunkRamp()
+    {
+        static const std::array<float, 4> ramp = [] {
+            std::array<float, 4> r{0.0f, 0.0f, 0.0f, 0.0f};
+            if (const char *e = std::getenv("TF_TRUNK_RAMP"); e && *e)
+                std::sscanf(e, "%f:%f:%f:%f", &r[0], &r[1], &r[2], &r[3]);
+            return r;
+        }();
+        if (!(ramp[2] > 0.0f))
+            return 1.0f;
+        const float u = std::clamp((static_cast<float>(g_forestClock) - ramp[3]) / ramp[2], 0.0f, 1.0f);
+        return ramp[0] + (ramp[1] - ramp[0]) * u;
+    }
+    float ecoTrunkOnlyConsoleReach(const uint8_t *rdram, uint32_t source, bool any = false)
+    {
+        if (((!g_forestTrunkPictures || g_trunkLeavesTest) && !any) || g_forestOld) // (leaves on = option B, no pictures)
+            return 0.0f;
+        const uint32_t kind = ecoLoadWord(rdram, source + kEcoCandidateKind);
+        const uint32_t kinds = ecoLoadWord(rdram, 0x006CF8E0u);
+        if (kind >= 10u || kinds < 0x00100000u || kinds >= PS2_RAM_SIZE - 0x100u)
+            return 0.0f;
+        const uint32_t table = ecoLoadWord(rdram, kinds + 0x88u); // (12 bytes a kind: {?, count, layouts}, 64 bytes a layout)
+        if (table < 0x00100000u || table >= PS2_RAM_SIZE - 12u * 10u)
+            return 0.0f;
+        const uint32_t count = ecoLoadWord(rdram, table + 12u * kind + 4u), layouts = ecoLoadWord(rdram, table + 12u * kind + 8u);
+        if (count == 0u || count > 64u || layouts < 0x00100000u || layouts >= PS2_RAM_SIZE - 64u * count)
+            return 0.0f;
+        uint32_t variant = rdram[(source + 0x29u) & PS2_RAM_MASK] >> 4;
+        if (variant >= count)
+            variant = 0u;
+        if (ecoLoadWord(rdram, layouts + 64u * variant + 0x10u) != 0u)
+            return 0.0f;
+        bool leafed = false;
+        for (uint32_t v = 0u; v < count && !leafed; ++v)
+            leafed = ecoLoadWord(rdram, layouts + 64u * v + 0x10u) != 0u;
+        const float scale = ecoLoadFloat(rdram, kEcoScale), word = ecoLoadFloat(rdram, kEcoScaleWord);
+        if (!leafed || !(scale > 0.0f) || !(word > scale))
+            return 0.0f;
+        return forestKindReach(rdram, kind) * scale / word * trunkRamp();
+    }
+
+    // (a test aid) Where a point lands in the picture (TF_TRUNK_LOG at the shots' ticks): the camera's transform (rows
+    // forward / side / up) and 0x731ED0; TF_KD_FOV (50.3, vertical) and TF_KD_ASPECT (3456/1440, the shots'). false: behind.
+    bool trunkProject(const uint8_t *rdram, const float p[3], float &sx, float &sy)
+    {
+        static const float tanV = [] { const char *e = std::getenv("TF_KD_FOV"); const float deg = e && *e ? static_cast<float>(std::atof(e)) : 50.3f; return std::tan(deg * 0.5f * 3.14159265f / 180.0f); }();
+        static const float aspect = [] { const char *e = std::getenv("TF_KD_ASPECT"); return e && *e ? static_cast<float>(std::atof(e)) : 3456.0f / 1440.0f; }();
+        if (g_cameraTransform < 0x00100000u || g_cameraTransform >= PS2_RAM_SIZE - 64u)
+            return false;
+        float cam[3] = {}, r[3][3] = {};
+        std::memcpy(cam, rdram + 0x00731ED0u, sizeof(cam));
+        for (int i = 0; i < 3; ++i)
+        {
+            std::memcpy(r[i], rdram + g_cameraTransform + 16u * i, 3 * sizeof(float));
+            const float n = std::sqrt(r[i][0] * r[i][0] + r[i][1] * r[i][1] + r[i][2] * r[i][2]);
+            if (!(n > 0.0f))
+                return false;
+            for (float &x : r[i])
+                x /= n;
+        }
+        const float d[3] = {p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]};
+        float c[3];
+        for (int i = 0; i < 3; ++i)
+            c[i] = d[0] * r[i][0] + d[1] * r[i][1] + d[2] * r[i][2];
+        if (!(c[0] > 0.0f))
+            return false;
+        sx = c[1] / c[0] / (tanV * aspect);
+        sy = c[2] / c[0] / tanV;
+        return true;
+    }
+    bool trunkAtShot(uint64_t tick)
+    {
+        static const std::vector<uint64_t> shots = [] {
+            std::vector<uint64_t> v;
+            if (const char *e = std::getenv("TF_NATIVE_SHOT"))
+                for (const char *q = e; *q;)
+                {
+                    char *end = nullptr;
+                    const unsigned long long x = std::strtoull(q, &end, 10);
+                    if (end == q)
+                        ++q;
+                    else
+                    {
+                        v.push_back(x);
+                        q = end;
+                    }
+                }
+            return v;
+        }();
+        for (uint64_t s : shots)
+            if (tick >= s && tick <= s + 4u)
+                return true;
+        return false;
+    }
+    // (a test aid) A trunk-only tree's line at a shot: its base and its top (TF_TRUNK_H units above, 15) in the picture.
+    void trunkView(const uint8_t *rdram, uint64_t tick, const char *what, uint32_t position, float console)
+    {
+        static const float h = [] { const char *e = std::getenv("TF_TRUNK_H"); return e && *e ? static_cast<float>(std::atof(e)) : 15.0f; }();
+        float p[3] = {}, top[3], bx = 0.0f, by = 0.0f, tx = 0.0f, ty = 0.0f;
+        std::memcpy(p, rdram + (position & PS2_RAM_MASK), sizeof(p));
+        top[0] = p[0];
+        top[1] = p[1];
+        top[2] = p[2] + h;
+        if (!trunkProject(rdram, p, bx, by) || !trunkProject(rdram, top, tx, ty) || std::fabs(bx) > 1.0f || ty > 1.0f || by < -1.0f)
+            return;
+        std::fprintf(stderr, "[forest] trunk view: tick %llu %s at (%.1f, %.1f, %.1f), %.1f away, the console's reach %.1f, base x %.3f y %.3f, top x %.3f y %.3f\n",
+                     static_cast<unsigned long long>(tick), what, p[0], p[1], p[2], ecoDistance(rdram, position), console, bx, by, tx, ty);
+    }
+    // (TODO 376 / 398, the F1 row "Trunk-only trees: picture to 3D", experimental; TF_TRUNK_SOFT=1: the soft swap) ecoPromotionList::Render sorts its draw records (0x42AC00, comparator
+    // 0x42AA20) after making them and before drawing them; its draw loop reads a record's +0x8 (the instance), +0xC (the
+    // colour; its top byte = 255 x the picture share) and +0x10 (the 3D strength: the state fade x the far fade). For a
+    // trunk-only instance past the level's sprite0 of the CONSOLE's reach, those are rewritten as the console works them
+    // out at f = distance x instanceFar0 / the console's reach: the picture share between the level's sprite0 / sprite1,
+    // the far fade between the level's instanceFar1 and instanceFar0 - the console's own cross-fade there.
+    std::atomic<bool> g_trunkSoft{[] { const char *e = std::getenv("TF_TRUNK_SOFT"); return e && *e == '1'; }()};
+    // (a test aid, TF_TRUNK_ISOLATE=1) Only trunk-only trees are made 3D (and the ones TF_FOREST_TRUNK_LEAVES gave layout 1):
+    // every other tree stays its picture, so a trunk-only tree's swap is the only 3D change on screen.
+    const bool g_trunkIsolate = [] { const char *e = std::getenv("TF_TRUNK_ISOLATE"); return e && *e == '1'; }();
+    std::unordered_set<uint64_t> g_trunkGiven; // (the keys of the trees TF_FOREST_TRUNK_LEAVES gave layout 1)
+    PS2Runtime::RecompiledFunction g_trunkSort = nullptr;
+    uint32_t g_trunkSoftened = 0u;
+    void trunkSort(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t from = getRegU32(ctx, 4), to = getRegU32(ctx, 5), cmp = getRegU32(ctx, 6);
+        g_trunkSort(rdram, ctx, runtime);
+        if (!g_trunkSoft) // (always hooked: the F1 row turns it on and off)
+            return;
+        if (cmp != TF_GA(0x0042AA20u) || from < 0x00100000u || to < from || to - from > 0x10000u * 4u || to >= PS2_RAM_SIZE)
+            return;
+        float lvl[2] = {}, far0 = 1.0f, far1 = 0.8f, far1Word = 0.8f;
+        std::memcpy(lvl, rdram + kEcoSprite0, sizeof(lvl));
+        if (g_forestSpriteState)
+            std::memcpy(lvl, rdram + g_forestSpriteState, sizeof(lvl)); // (the level's own, before "3D to the edge")
+        std::memcpy(&far0, rdram + kEcoFar0, sizeof(far0));
+        std::memcpy(&far1, rdram + kEcoFar1, sizeof(far1));
+        std::memcpy(&far1Word, rdram + kEcoFar1Word, sizeof(far1Word));
+        for (uint32_t at = from; at < to; at += 4u)
+        {
+            const uint32_t rec = ecoLoadWord(rdram, at);
+            if (rec < 0x00100000u || rec >= PS2_RAM_SIZE - 0x60u)
+                continue;
+            const uint32_t node = ecoLoadWord(rdram, rec + 8u) - 0x20u;
+            if (node < 0x00100000u || node >= PS2_RAM_SIZE - 0x120u)
+                continue;
+            const float console = ecoTrunkOnlyConsoleReach(rdram, node + kEcoNodePosition, true);
+            if (!(console > 0.0f))
+                continue;
+            const float f = ecoDistance(rdram, node + kEcoNodePosition) * far0 / console;
+            if (f <= lvl[0])
+                continue;
+            const float share = lvl[1] > lvl[0] ? std::clamp((f - lvl[0]) / (lvl[1] - lvl[0]), 0.0f, 1.0f) : 1.0f;
+            const float fade = far0 > far1 ? std::clamp((far0 - f) / (far0 - far1), 0.0f, 1.0f) : 1.0f;
+            const float fNow = ecoLoadFloat(rdram, rec + 4u);
+            const float fadeNow = far0 > far1Word ? std::clamp((far0 - fNow) / (far0 - far1Word), 0.0f, 1.0f) : 1.0f;
+            float strength = ecoLoadFloat(rdram, rec + 0x10u);
+            if (fadeNow > 0.0f)
+                strength *= fade / fadeNow;
+            std::memcpy(rdram + rec + 0x10u, &strength, sizeof(strength));
+            rdram[rec + 0x0Fu] = static_cast<uint8_t>(std::lround(255.0f * share)); // (the colour word's top byte, little-endian)
+            ++g_trunkSoftened;
+        }
+    }
+
     void ecoCreateInstance(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ecoGrowPool(rdram, runtime);
         const uint32_t cap = ecoCap(rdram);
         std::memcpy(rdram + kEcoCapWord, &cap, sizeof(cap));
         const uint32_t candidate = getRegU32(ctx, 5);
+        if (g_trunkIsolate && !(ecoTrunkOnlyConsoleReach(rdram, candidate, true) > 0.0f)) // (a test aid)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        if (g_trunkLog) // (a test aid)
+            if (const uint64_t tick = runtime->eeScheduler().currentVSyncTick(); trunkAtShot(tick))
+                if (const float console = ecoTrunkOnlyConsoleReach(rdram, candidate, true); console > 0.0f)
+                    trunkView(rdram, tick, "a candidate", candidate, console);
         if (g_forestCandLog > 0u && !g_forestOld)
         {
             --g_forestCandLog;
@@ -6627,6 +6963,13 @@ namespace
                     g_forestDropped.erase(e);
                 }
         }
+        if (const float console = ecoTrunkOnlyConsoleReach(rdram, candidate); console > 0.0f)
+            if (ecoDistance(rdram, candidate) > g_trunkSwap.load(std::memory_order_relaxed) * console)
+            {
+                ++g_forestTrunksHeld; // (TODO 376: a trunk-only tree beyond the console's reach stays its picture)
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
         if (!g_forestOld && g_forestMakePerFrame > 0u)
         {
             const float d = ecoDistance(rdram, candidate);
@@ -6663,6 +7006,23 @@ namespace
             {
                 ++g_forestComebacks; // (given up, and asked for again within the second: the flip-flop to avoid)
                 g_forestEvicted.erase(e);
+            }
+        if (g_trunkLeavesTest || g_trunkLog)
+            if (const float console = ecoTrunkOnlyConsoleReach(rdram, candidate, true); console > 0.0f)
+            {
+                if (g_trunkLeavesTest)
+                {
+                    rdram[(candidate + 0x29u) & PS2_RAM_MASK] = static_cast<uint8_t>((rdram[(candidate + 0x29u) & PS2_RAM_MASK] & 0x0Fu) | 0x10u);
+                    g_trunkGiven.insert(ecoKey(rdram, candidate + kEcoCandidateKey));
+                }
+                if (g_trunkLog)
+                {
+                    float p[3] = {};
+                    std::memcpy(p, rdram + (candidate & PS2_RAM_MASK), sizeof(p));
+                    std::fprintf(stderr, "[forest] trunk test: tick %llu made 3D at (%.1f, %.1f, %.1f), %.1f away, the console's reach %.1f%s\n",
+                                 static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), p[0], p[1], p[2],
+                                 ecoDistance(rdram, candidate), console, g_trunkLeavesTest ? " (given layout 1)" : "");
+                }
             }
         g_ecoCreateInstance(rdram, ctx, runtime);
     }
@@ -6815,6 +7175,38 @@ namespace
         g_forestMadeFrame = 0u;
         for (auto e = g_forestEvicted.begin(); e != g_forestEvicted.end();)
             e = clock - e->second > 1.0 ? g_forestEvicted.erase(e) : std::next(e);
+        if (g_trunkIsolate) // (a test aid: every other 3D tree back to its picture)
+            ecoForEachNode(rdram, [&](uint32_t node) {
+                if ((rdram[node + kEcoNodeFlags] & kEcoNodeAsked) && !(ecoTrunkOnlyConsoleReach(rdram, node + kEcoNodePosition, true) > 0.0f) &&
+                    !g_trunkGiven.count(ecoKey(rdram, node + kEcoNodeKey)))
+                    rdram[node + kEcoNodeFlags] &= static_cast<uint8_t>(~kEcoNodeAsked);
+            });
+        if (g_trunkLog) // (a test aid)
+            if (const uint64_t tick = runtime->eeScheduler().currentVSyncTick(); trunkAtShot(tick))
+                ecoForEachNode(rdram, [&](uint32_t node) {
+                    if (rdram[node + kEcoNodeFlags] & kEcoNodeAsked)
+                        if (const float console = ecoTrunkOnlyConsoleReach(rdram, node + kEcoNodePosition, true); console > 0.0f)
+                            trunkView(rdram, tick, "3D", node + kEcoNodePosition, console);
+                });
+        if (g_forestTrunkPictures && !g_forestOld) // (TODO 376: a trunk-only tree that went beyond the console's reach: its picture again)
+            ecoForEachNode(rdram, [&](uint32_t node) {
+                if (!(rdram[node + kEcoNodeFlags] & kEcoNodeAsked))
+                    return;
+                const float console = ecoTrunkOnlyConsoleReach(rdram, node + kEcoNodePosition);
+                if (console > 0.0f && ecoDistance(rdram, node + kEcoNodePosition) > (g_trunkSwap.load(std::memory_order_relaxed) + 0.05f) * console)
+                {
+                    rdram[node + kEcoNodeFlags] &= static_cast<uint8_t>(~kEcoNodeAsked);
+                    ++g_forestTrunksDropped;
+                    if (g_trunkLog)
+                    {
+                        float p[3] = {};
+                        std::memcpy(p, rdram + ((node + kEcoNodePosition) & PS2_RAM_MASK), sizeof(p));
+                        std::fprintf(stderr, "[forest] trunk test: tick %llu dropped at (%.1f, %.1f, %.1f), %.1f away, the console's reach %.1f\n",
+                                     static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), p[0], p[1], p[2],
+                                     ecoDistance(rdram, node + kEcoNodePosition), console);
+                    }
+                }
+            });
         if (g_forestDiag)
             forestDiagFrame(rdram);
         // (The instances a tree asked for this frame: the rest go at the end of it, their slots free for next frame.)
@@ -6937,6 +7329,13 @@ namespace
                          static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), count, g_forestPeak, ecoCap(rdram), g_forestCreated,
                          g_forestMadeFrameMax, g_forestRefusedTotal, g_forestEvictions, g_forestComebacks, g_forestOld ? 1.0f : g_forestFit, g_forestTurns,
                          g_forestDeferredTotal, g_forestHeldBack, g_forestFlips, g_forestMadeInside, forestCostMedian(static_cast<size_t>(std::max(30, g_levelRate))), g_forestBehind ? ", frames late" : "");
+            if (g_forestTrunksHeld || g_forestTrunksDropped) // (TODO 376)
+                std::fprintf(stderr, "[forest] trunk-only trees (layout 0) kept as their picture beyond the console's reach: %u held back, %u dropped at it in 2 s\n",
+                             g_forestTrunksHeld, g_forestTrunksDropped);
+            g_forestTrunksHeld = g_forestTrunksDropped = 0u;
+            if (g_trunkSoft) // (the log line)
+                std::fprintf(stderr, "[forest] trunk test: %u draw records softened in 2 s\n", g_trunkSoftened);
+            g_trunkSoftened = 0u;
             if (g_layoutRender && g_layoutFrames)
                 std::fprintf(stderr, "[forest] a frame: the leaves' trees %.3f ms, the drawing %.3f ms - of it the mesh surfaces (their capture included) %.3f ms "
                                      "and the secondary layouts %.3f ms (%.0f calls; of it their draws %.3f ms)\n",
@@ -6981,8 +7380,26 @@ namespace
         g_ecoDeleteAll(rdram, ctx, runtime);
     }
 
+    // (TODO 393 follow-up) The bare-trunk rows' variables are read by static initialisers, before main's
+    // ps2_settings::loadFile puts settings.ini into the environment: from the ini alone a row stayed at its default until
+    // it was toggled in F1. Read again here (installForest runs after loadFile) and the values in force logged once.
+    void trunkRowsAtStart()
+    {
+        auto flag = [](const char *key, bool dflt) {
+            const char *e = std::getenv(key);
+            return e && *e ? *e == '1' : dflt;
+        };
+        g_forestTrunkPictures.store([] { const char *e = std::getenv("TF_FOREST_TRUNK_PICTURES"); return !(e && *e == '0'); }());
+        g_trunkSoft.store(flag("TF_TRUNK_SOFT", false));
+        g_trunkLeavesTest.store(flag("TF_FOREST_TRUNK_LEAVES", false));
+        if (const char *e = std::getenv("TF_TRUNK_SWAP"); e && *e)
+            g_trunkSwap.store(std::clamp(static_cast<float>(std::atof(e)), 0.5f, 1.0f));
+        std::fprintf(stderr, "[forest] trunk rows at start (after settings.ini): pictures %d, cross-fade %d, leaves %d, swap %.2f\n",
+                     g_forestTrunkPictures.load() ? 1 : 0, g_trunkSoft.load() ? 1 : 0, g_trunkLeavesTest.load() ? 1 : 0, g_trunkSwap.load());
+    }
     void installForest(PS2Runtime &runtime)
     {
+        trunkRowsAtStart();
         const char *mode = std::getenv("TF_FOREST");
         g_forestOld = mode && std::string(mode) == "old";
         // (TODO 376, option D) A budget of 3D trees under the frame-rate cliff: 2,200 at once. Past ~2,600-3,200 3D trees
@@ -7049,6 +7466,8 @@ namespace
             runtime.registerFunction(TF_GA(0x00430190u), ecoTimed<0>);
         if ((g_ecoDraw = runtime.lookupFunction(TF_GA(0x00429510u))) != nullptr)
             runtime.registerFunction(TF_GA(0x00429510u), ecoTimed<1>);
+        if ((g_trunkSort = runtime.lookupFunction(TF_GA(0x0042AC00u))) != nullptr) // (always: the F1 row switches it)
+            runtime.registerFunction(TF_GA(0x0042AC00u), trunkSort);
         if (const char *diag = std::getenv("TF_FOREST_DIAG"); diag && *diag == '1')
         {
             g_forestDiag = true;
@@ -7997,6 +8416,22 @@ namespace
                              level, radius);
             }
         }
+        // (TODO 369, a testing aid) TF_PICKUP_LOG=<ticks>: each drawn Mini-Con / Data-Con panel that often - its place, the glow's
+        // lift (+0x130), its state (+0x170) and clock (+0x12C), the model's turn (+0x194).
+        static const int panelLog = std::getenv("TF_PICKUP_LOG") ? std::atoi(std::getenv("TF_PICKUP_LOG")) : 0;
+        if (panelLog > 0 && tf::port::testTickNow() % static_cast<uint64_t>(panelLog) == 0u)
+        {
+            float pos[3] = {}, lift = 0.0f, clock = 0.0f, turn = 0.0f;
+            uint32_t state = 0u, pv = 0u;
+            std::memcpy(&pv, rdram + panel, 4);
+            std::memcpy(pos, rdram + panel + 0x40u, 12);
+            std::memcpy(&lift, rdram + panel + 0x130u, 4);
+            std::memcpy(&state, rdram + panel + 0x170u, 4);
+            std::memcpy(&clock, rdram + panel + 0x12Cu, 4);
+            std::memcpy(&turn, rdram + panel + 0x194u, 4);
+            std::fprintf(stderr, "[pickup panel] tick %llu %08x (vtable %06x): %.3f %.3f %.3f lift %.4f state %u clock %.3f turn %.2f\n",
+                         static_cast<unsigned long long>(tf::port::testTickNow()), panel, pv, pos[0], pos[1], pos[2], lift, state, clock, turn);
+        }
         // (the model node's own cull: its detail level and the size test - as for an animation actor)
         R5900Context *c = ctx;
         const uint32_t a0 = getRegU32(c, 4);
@@ -8939,7 +9374,6 @@ namespace
         dualsense::addSettings();   // ... and what the game shows on the pad (dualsense.h)
         discord_presence::addSettings(); // the Discord status (discord_presence.h)
         ultrawide::addSettings();   // Graphics: the picture's shape (ultrawide.h)
-        native_sound::addSettings(); // Sound: the native sound server (native_sound.h)
         surround_mode::addSettings(); // Sound: plain stereo or Pro Logic II for the 3D sounds (surround_mode.h)
         fast_load::addSettings();   // Gameplay: fast loading (fast_load.h)
         menu_fade_speed::addSettings(); // Gameplay: Menu speed Original / Double / Four times (menu_fade_speed.h, TODO 386)
@@ -9367,6 +9801,66 @@ namespace
                 s.apply = [](const std::string &value)
                 {
                     g_forestAdaptive.store(value == "1");
+                    return true;
+                };
+                ps2_settings::add(s);
+            }
+            // (TODO 376 / 398: the bare-trunk rows; the user picked full-tree pictures, and tries Cross-fade and Leaves himself.
+            // Cross-fade and Leaves stay off by default while TODO 393 (a GPU hang with both on) is parked.)
+            {
+                Setting s;
+                s.key = "TF_FOREST_TRUNK_PICTURES";
+                s.section = "Graphics";
+                s.label = "Trunk-only trees far away";
+                s.order = 43;
+                s.help = "Some trees the level gives no leaves of their own. Within the console's own tree distance the PS2 "
+                         "draws them as bare trunks too; beyond it as a full-tree picture. Full-tree pictures: they stay the "
+                         "full-tree picture beyond the console's distance, as on the console. Bare trunks: with Trees above "
+                         "Console they turn into bare 3D trunks out there. Live; easiest to see at Very far 3D.";
+                s.choices.push_back(Choice{"0", "Bare trunks"});
+                s.choices.push_back(Choice{"1", "Full-tree pictures"});
+                s.defaultValue = "1";
+                s.apply = [](const std::string &value)
+                {
+                    g_forestTrunkPictures.store(value != "0");
+                    return true;
+                };
+                ps2_settings::add(s);
+            }
+            {
+                Setting s;
+                s.key = "TF_TRUNK_SOFT";
+                s.section = "Graphics";
+                s.label = "Trunk-only trees: picture to 3D";
+                s.order = 43;
+                s.help = "How such a tree changes from its full-tree picture to the 3D trunk as you come nearer (with Full-tree "
+                         "pictures). In one frame: at once. Cross-fade: the picture fades into the trunk over a stretch, as the "
+                         "PS2 does at its own distance. Experimental. Live.";
+                s.choices.push_back(Choice{"0", "In one frame"});
+                s.choices.push_back(Choice{"1", "Cross-fade (experimental)"});
+                s.defaultValue = "0";
+                s.apply = [](const std::string &value)
+                {
+                    g_trunkSoft.store(value == "1");
+                    return true;
+                };
+                ps2_settings::add(s);
+            }
+            {
+                Setting s;
+                s.key = "TF_FOREST_TRUNK_LEAVES";
+                s.section = "Graphics";
+                s.label = "Leaves on trunk-only trees";
+                s.order = 43;
+                s.help = "On: those trees get the leaves of the same kind of tree, at every distance (this changes the PS2's "
+                         "own bare trunks near you too), and the first row no longer matters. Off: as the level has them. "
+                         "Applies to trees as they turn 3D: walk or turn a little after changing it, or reload the level.";
+                s.choices.push_back(Choice{"0", "Off"});
+                s.choices.push_back(Choice{"1", "On (experimental)"});
+                s.defaultValue = "0";
+                s.apply = [](const std::string &value)
+                {
+                    g_trunkLeavesTest.store(value == "1");
                     return true;
                 };
                 ps2_settings::add(s);
@@ -9971,6 +10465,14 @@ namespace
         {
             testTick(runtime); // (g_testTick for the log)
             logFrame(rdram, runtime->eeScheduler().currentVSyncTick());
+        }
+        if (flight_recorder::enabled())
+        {
+            float player[3] = {};
+            if (const uint32_t at = playerPositionAddress(rdram))
+                if (const uint8_t *p = getConstMemPtr(rdram, at))
+                    std::memcpy(player, p, sizeof(player));
+            flight_recorder::frame(rdram, *runtime, runtime->eeScheduler().currentVSyncTick(), player); // (TODO 405)
         }
         if (!g_peeked.empty())
             reportPeekedWords(rdram, testTick(runtime));
@@ -10685,6 +11187,7 @@ namespace
         pool_growth::install(runtime);    // the game's look-and-sound pools x4 with the 256 MB RAM (pool_growth.h, N7 step 3)
         movement::install(runtime);       // the run on a modern stick (movement.h, TODO 41)
         ragdoll_step::install(runtime);   // the ragdolls stepped at the console's 1/30 s (ragdoll_step.cpp, TODO 182/172)
+        pickup_step::install(runtime);    // a dropped pickup's fall by the frame's time (pickup_step.cpp, TODO 369)
         test_place::install(runtime);     // TF_PLACE (a testing aid: test_place.h)
         playrec::install(runtime);        // play recordings: the pad read's hook (playrec.h, N12 b)
         playrec::bindForest(&g_forestFit);
@@ -11007,6 +11510,26 @@ namespace
             runtime.registerFunction(kSetVelocity, setVelocityAtRate); // (TODO 153)
         if ((g_lerp = runtime.lookupFunction(kLerp)) != nullptr)
             runtime.registerFunction(kLerp, lerpAtRate); // (the rate sweep)
+        {
+            // (TODO 405) The boom's release (on; TF_CAM_RELEASE=0 off) and the flight recorder (TF_FLIGHT_RECORDER=1).
+            g_camRelease = !(std::getenv("TF_CAM_RELEASE") && *std::getenv("TF_CAM_RELEASE") == '0');
+            flight_recorder::install(runtime);
+            if ((g_camRelease || flight_recorder::enabled()) && (g_cameraBoom = runtime.lookupFunction(TF_GA(kCameraBoom))) != nullptr)
+                runtime.registerFunction(TF_GA(kCameraBoom), cameraBoomRelease);
+            if (flight_recorder::enabled())
+            {
+                if ((g_cameraSweep = runtime.lookupFunction(TF_GA(kCameraSweep))) != nullptr)
+                    runtime.registerFunction(TF_GA(kCameraSweep), cameraSweepNote);
+                if ((g_setFieldOfViewRec = runtime.lookupFunction(TF_GA(kSetFieldOfViewRec))) != nullptr)
+                    runtime.registerFunction(TF_GA(kSetFieldOfViewRec), setFieldOfViewNote);
+                if ((g_cameraGround = runtime.lookupFunction(TF_GA(kCameraGround))) != nullptr)
+                    runtime.registerFunction(TF_GA(kCameraGround), cameraGroundNote);
+                if ((g_heightAtPoint = runtime.lookupFunction(TF_GA(kHeightAtPoint))) != nullptr)
+                    runtime.registerFunction(TF_GA(kHeightAtPoint), heightAtPointNote);
+            }
+            if (!g_camRelease)
+                std::fprintf(stderr, "[tf] TF_CAM_RELEASE=0: the camera's boom lets out at once against walls, as the game does (TODO 405)\n");
+        }
         if ((g_slerp = runtime.lookupFunction(kSlerp)) != nullptr)
             runtime.registerFunction(kSlerp, slerpAtRate);
         if ((g_optionByIndex = runtime.lookupFunction(kOptionByIndex)) != nullptr)

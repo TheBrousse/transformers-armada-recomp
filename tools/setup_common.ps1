@@ -158,6 +158,27 @@ function Test-WindowsSdk {
     return $false
 }
 
+# (TODO 407) The Visual Studio installs with the C++ tools that this CMake does not know, when it knows none of them
+# (Visual Studio 2026 alone, and a CMake from before it): their names - the build would stop at "could not find any
+# instance of Visual Studio". Empty when one is usable, or nothing to say. $List/$CMakeHelp: for the tests.
+function Get-VsUnknownToCmake($List = $null, [string]$CMakeHelp = $null) {
+    if ($null -eq $List) {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (-not (Test-Path $vswhere)) { return @() }
+        $json = "$(Invoke-Probe { & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json } | Out-String)"
+        try { $List = @($json | ConvertFrom-Json | ForEach-Object { $_ }) } catch { return @() }
+    }
+    if ($null -eq $CMakeHelp) { $CMakeHelp = "$(Invoke-Probe { & cmake --help } | Out-String)" }
+    $names = @{ 15 = "Visual Studio 15 2017"; 16 = "Visual Studio 16 2019"; 17 = "Visual Studio 17 2022"; 18 = "Visual Studio 18 2026" }
+    $known = @(); $unknown = @()
+    foreach ($i in @($List | Where-Object { $_.installationPath -and $_.installationVersion })) {
+        $major = [int]("$($i.installationVersion)" -split '\.')[0]
+        if ($names.ContainsKey($major) -and $CMakeHelp.Contains($names[$major])) { $known += $i } else { $unknown += "$(if ($i.displayName) { $i.displayName } else { "Visual Studio $major" }) $($i.installationVersion)" }
+    }
+    if ($known.Count) { return @() }
+    return @($unknown)
+}
+
 # Visual Studio installs (any edition, the Build Tools too) the setup can repair: their folders, the one to use first.
 # winget sees such an install as "already installed" and adds nothing, so the setup kept stopping with "not found yet:
 # vs" (issue #2, 2026-11-09; again 2026-11-11, a player's "No available upgrade found"). Three kinds:

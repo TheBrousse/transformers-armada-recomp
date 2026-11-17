@@ -6,6 +6,7 @@
 // docs/RENDERER_BACKEND.md describes the split and what a backend has to provide.
 
 #include "nr_frame.h"
+#include "flight_recorder.h" // (TODO 405)
 #include "nr_types.h"
 #include "nr_draw.h"
 #include "nr_device.h"
@@ -268,6 +269,73 @@ namespace nr::frame
         float g_standInColour[4] = {};
         std::unordered_map<uint64_t, std::array<float, 4>> g_averages; // (a texture's average colour, by id)
         std::unordered_map<uint64_t, bool> g_cutOuts; // (TODO 290 (14): a small texture with clear texels, by id: no stand-in)
+        // (TODO 402) A game texture converted again with the same texels - the HQ's characters at every screen change, its
+        // textures uploaded to other GS blocks: a new texture each, the same content - drawn with the GPU copy of the one already
+        // made (made, by its content: g_madeByContent; matched to it once: g_sameContent), never with a stand-in: past the
+        // frame's budget a model's large textures came out as flat colours for a picture (Red Alert's head dark purple at the
+        // swing to his page; the slower the GPU, the more often). TF_NATIVE_SAMECONTENT=0: as before.
+        std::unordered_map<uint64_t, uint64_t> g_madeByContent; // (content key -> the id the GPU copy is kept by)
+        struct SameContent
+        {
+            uint64_t id = 0; // the made one's id
+            std::weak_ptr<const Texture> texture; // the one drawn with it
+        };
+        std::unordered_map<uint64_t, SameContent> g_sameContent; // (by the new texture's id)
+        uint64_t g_sameContentUses = 0;
+        bool sameContentOn()
+        {
+            static const bool off = std::getenv("TF_NATIVE_SAMECONTENT") && *std::getenv("TF_NATIVE_SAMECONTENT") == '0';
+            return !off;
+        }
+        // Its content key (0: none - not a converted game texture, or its texels' hash not made).
+        uint64_t contentOf(const Texture &t)
+        {
+            if (t.upscaled || t.format != 0u || !t.pixelHash || (t.pending && !t.pending->done.load(std::memory_order_acquire)) || t.keys || t.xbox || t.pixels.empty())
+                return 0u;
+            uint64_t h = t.pixelHash;
+            for (const uint64_t v : {static_cast<uint64_t>(t.width) << 32 | t.height, static_cast<uint64_t>(t.gameMips)})
+                h = (h ^ v) * 1099511628211ull;
+            return h ? h : 1u;
+        }
+        // The GPU copy of a texture with the same texels, made already (null: none).
+        GpuTexture *madeWithSameContent(const std::shared_ptr<const Texture> &texture)
+        {
+            if (!sameContentOn())
+                return nullptr;
+            if (auto same = g_sameContent.find(texture->id); same != g_sameContent.end())
+            {
+                if (auto made = g.textures.find(same->second.id); made != g.textures.end() && !made->second.texture.expired())
+                    return &made->second;
+                g_sameContent.erase(same);
+                return nullptr;
+            }
+            const uint64_t content = contentOf(*texture);
+            if (!content)
+                return nullptr;
+            auto byContent = g_madeByContent.find(content);
+            if (byContent == g_madeByContent.end())
+                return nullptr;
+            auto made = g.textures.find(byContent->second);
+            const std::shared_ptr<const Texture> other = made != g.textures.end() ? made->second.texture.lock() : nullptr;
+            if (!other)
+            {
+                g_madeByContent.erase(byContent);
+                return nullptr;
+            }
+            // (the texels compared once, not only their hash: the copy drawn instead must be exactly this)
+            if (other->width != texture->width || other->height != texture->height || other->gameMips != texture->gameMips ||
+                other->pixels != texture->pixels || other->mips != texture->mips)
+                return nullptr;
+            g_sameContent[texture->id] = SameContent{made->first, texture};
+            ++g_sameContentUses;
+            return &made->second;
+        }
+        void noteMade(const std::shared_ptr<const Texture> &texture)
+        {
+            if (sameContentOn())
+                if (const uint64_t content = contentOf(*texture))
+                    g_madeByContent[content] = texture->id;
+        }
         const double kTexBudgetMs = [] {
             const char *e = std::getenv("TF_NATIVE_TEXBUDGET");
             return e && *e ? std::atof(e) : 3.0;
@@ -593,6 +661,16 @@ namespace nr::frame
                 }
                 else
                     ++it;
+            for (auto it = g_sameContent.begin(); it != g_sameContent.end();)
+                if (it->second.texture.expired() || !g.textures.count(it->second.id))
+                    it = g_sameContent.erase(it);
+                else
+                    ++it;
+            for (auto it = g_madeByContent.begin(); it != g_madeByContent.end();)
+                if (!g.textures.count(it->second))
+                    it = g_madeByContent.erase(it);
+                else
+                    ++it;
             for (auto it = g.meshes.begin(); it != g.meshes.end();)
                 if (it->second.mesh.expired())
                 {
@@ -731,6 +809,9 @@ namespace nr::frame
             auto it = g.textures.find(texture->id);
             if (it != g.textures.end())
                 return &it->second;
+            // (TODO 402: the same texels made already - that copy, made or not this one)
+            if (GpuTexture *same = madeWithSameContent(texture))
+                return same;
             // (A large image: made by the uploader, the game's own texture drawn until it is done.)
             if (texture->upscaled && askLater(texture))
                 return texture->fallback ? textureFor(texture->fallback, standInOk) : nullptr;
@@ -818,7 +899,9 @@ namespace nr::frame
                 std::vector<uint32_t>().swap(own.pixels);
                 std::vector<std::vector<uint32_t>>().swap(own.mips);
             }
-            return &g.textures.emplace(texture->id, t).first->second;
+            GpuTexture *made = &g.textures.emplace(texture->id, t).first->second;
+            noteMade(texture);
+            return made;
         }
 
 
@@ -851,6 +934,7 @@ namespace nr::frame
                     g_largeBytes += gt.largeBytes;
                 }
                 g.textures.emplace(it->first, gt);
+                noteMade(t);
                 g_averages.erase(it->first);
                 ++g_made;
                 // (The game's texture no longer stands in: let go of - render thread only reads it.)
@@ -2068,6 +2152,14 @@ namespace nr::frame
                              static_cast<unsigned long long>(kTexCap.second >> 20));
             g_deferredSince = (g_deferredSince + 1u) % 300u;
         }
+        if (flight_recorder::enabled()) // (TODO 405: the frame's counts and a signature of its draws for the flight recorder)
+        {
+            uint64_t sig = 1469598103934665603ull;
+            for (const Draw &d : input.draws)
+                sig = (sig ^ reinterpret_cast<uintptr_t>(d.mesh.get()) ^ (reinterpret_cast<uintptr_t>(d.texture.get()) << 1)) * 1099511628211ull;
+            flight_recorder::renderFrame(input.tick, static_cast<uint32_t>(g_frameMade), static_cast<uint32_t>(g_frameDeferred),
+                                         static_cast<uint32_t>(g_frameStandIns), static_cast<uint32_t>(input.draws.size()), sig);
+        }
         g_frameMade = g_frameTexels = g_frameDeferred = 0;
         g_frameMakeMs = 0.0;
         if (g_frameStandIns)
@@ -3226,6 +3318,114 @@ namespace nr::frame
                     out[i].y0 = now[i].y0;
                     out[i].y1 = now[i].y1;
                 }
+                // (TODO 354: a HUD corner group that something new joined. The Mini-Con ring with Safeguard reaches up to
+                // y 259 and out to x 157 of the 4:3 picture; a warp gate's name banner drawn across its box ("Ruined Temple
+                // Warp Gate", its first letters from x 115) joined its group, which reached past the middle and went to the
+                // 4:3 place: the pieces still pinned by their unchanged rectangle stayed in the corner, the rest of the ring
+                // jumped to the 4:3 place with its red rim stretched back to the corner - and, once moved, they were no longer
+                // "kept" the picture after, so the ring flickered between the two places every few pictures for as long as
+                // the banner showed (the user at 16:9, 2026-11-17). Each frame the corner groups (pinned to an edge, holding
+                // kept pieces) are remembered by their extent; when a group holding pieces kept at an edge comes out about the
+                // middle and all its other pieces are text, its pieces lying in such a remembered extent keep that edge and the
+                // text (letters of a page drawn as 8 or more letters this frame - the banner, the autosave notice - and what lies
+                // in a full-width band's rows) goes about the middle as it would alone. (Not by texture page: the HUD's textures
+                // are sent to other GS blocks from picture to picture.) TF_NATIVE_HUDSPLIT=0: as before.)
+                static const bool hudSplit = !(std::getenv("TF_NATIVE_HUDSPLIT") && *std::getenv("TF_NATIVE_HUDSPLIT") == '0');
+                struct CornerArea
+                {
+                    float x0, x1, y0, y1;
+                    int edge;
+                    uint64_t seen;
+                };
+                static std::vector<CornerArea> cornerAreas;
+                if (hudSplit && hudSticky && hudCorners && input.has3D)
+                {
+                    // (Only a group whose every other piece is text - a letter of a text page, or a piece inside a full-width band's
+                    // rows, 64 at most - is split: a panel sliding over the corner (the Mini-Con panel, TODO 138) is still narrowed whole.)
+                    auto isText = [&](size_t i) {
+                        if (now[i].tex != ~0u && now[i].x1 - now[i].x0 <= 24.0f && now[i].y1 - now[i].y0 <= 24.0f)
+                            if (const auto c = letters.find(now[i].tex); c != letters.end() && c->second >= 8u)
+                                return true;
+                        for (const Bar &b : bars) // (a band like the prompt / name bar, not the full-screen fade)
+                            if (b.y1 - b.y0 <= 64.0f && now[i].y0 >= b.y0 - 1.0f && now[i].y1 <= b.y1 + 1.0f)
+                                return true;
+                        return false;
+                    };
+                    auto areaOf = [&](size_t i, int edge) -> CornerArea * {
+                        for (CornerArea &a : cornerAreas)
+                            if (a.edge == edge && now[i].x0 >= a.x0 - 2.0f && now[i].x1 <= a.x1 + 2.0f && now[i].y0 >= a.y0 - 2.0f && now[i].y1 <= a.y1 + 2.0f)
+                                return &a;
+                        return nullptr;
+                    };
+                    std::vector<uint8_t> splittable(n, 0); // (by root: 1 = to split, 2 = holds a piece neither in the area nor text)
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        const uint32_t r = root(static_cast<uint32_t>(i));
+                        if (out[r].anchor != 0 || keptOf[r] <= 0 || splittable[r] == 2u)
+                            continue;
+                        if (isText(i))
+                            continue;
+                        splittable[r] = areaOf(i, keptOf[r]) ? 1u : 2u;
+                    }
+                    size_t split = 0;
+                    int splitEdge = 0;
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        const uint32_t r = root(static_cast<uint32_t>(i));
+                        if (splittable[r] != 1u || isText(i))
+                            continue;
+                        if (CornerArea *a = areaOf(i, keptOf[r]))
+                        {
+                            out[i].anchor = a->edge;
+                            a->seen = pinFrame;
+                            ++split;
+                            splitEdge = a->edge;
+                        }
+                    }
+                    if (groupLog && split)
+                    {
+                        static uint64_t lastSplitLog = 0;
+                        if (lastSplitLog == 0 || pinFrame - lastSplitLog > 60u) // (once each time it starts)
+                            std::fprintf(stderr, "[native render] HUD corner kept in a joined group at tick %llu: %zu pieces back to edge %d (TODO 354)\n",
+                                         static_cast<unsigned long long>(input.tick), split, splitEdge);
+                        lastSplitLog = pinFrame;
+                    }
+                    // (this frame's corner groups, for the frames after: one area per corner group - an area of the same edge it
+                    // mostly overlaps grows to hold it, as the ring's rim pulses and its extent differs a little picture to picture)
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        const uint32_t r = static_cast<uint32_t>(i);
+                        if (root(r) != r || (out[i].anchor != 1 && out[i].anchor != 2) || keptOf[i] != out[i].anchor)
+                            continue;
+                        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+                        for (size_t j = 0; j < n; ++j)
+                            if (root(static_cast<uint32_t>(j)) == r)
+                                x0 = std::min(x0, now[j].x0), x1 = std::max(x1, now[j].x1), y0 = std::min(y0, now[j].y0), y1 = std::max(y1, now[j].y1);
+                        bool found = false;
+                        for (CornerArea &a : cornerAreas)
+                        {
+                            const float w = std::min(a.x1, x1) - std::max(a.x0, x0), h = std::min(a.y1, y1) - std::max(a.y0, y0);
+                            const float shared = w > 0.0f && h > 0.0f ? w * h : 0.0f;
+                            const float smaller = std::min((a.x1 - a.x0) * (a.y1 - a.y0), (x1 - x0) * (y1 - y0));
+                            if (a.edge == out[i].anchor && smaller > 0.0f && shared >= 0.5f * smaller)
+                            {
+                                a.x0 = std::min(a.x0, x0), a.x1 = std::max(a.x1, x1), a.y0 = std::min(a.y0, y0), a.y1 = std::max(a.y1, y1);
+                                a.seen = pinFrame;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found)
+                            cornerAreas.push_back(CornerArea{x0, x1, y0, y1, out[i].anchor, pinFrame});
+                    }
+                    cornerAreas.erase(std::remove_if(cornerAreas.begin(), cornerAreas.end(), [&](const CornerArea &a) { return pinFrame - a.seen >= kPinFrames; }),
+                                      cornerAreas.end());
+                    if (cornerAreas.size() > 64u)
+                    {
+                        std::sort(cornerAreas.begin(), cornerAreas.end(), [](const CornerArea &a, const CornerArea &b) { return a.seen > b.seen; });
+                        cornerAreas.resize(64u);
+                    }
+                }
                 if (hudSticky && hudCorners && input.has3D)
                 {
                     for (size_t i = 0; i < n; ++i)
@@ -3919,18 +4119,24 @@ namespace nr::frame
                     if (!draw.mesh->immediate && tgDepth && (!probeScene || tg.gsW * tg.gsH > probeScene->gsW * probeScene->gsH))
                         probeScene = &tg;
                 }
-                if (&tg != current || fog != currentFog)
+                // (TODO 351 b) Soft particles: a particle draw that tests the depth and does not write it reads the scene's depth in its
+                // shader like the fog's pass does (the read-only view), and fades near the surface behind it.
+                const float softRange = softParticles();
+                const bool soft = softRange > 0.0f && !fog && !tg.main && tgDepth && draw.mesh && draw.mesh->particle &&
+                                  ((pass.test >> 16) & 1u) != 0u && ((pass.zbuf >> 32) & 1u) != 0u;
+                const bool readsDepth = fog || soft;
+                if (&tg != current || readsDepth != currentFog)
                 {
                     dev.use(tg.id, gfx::UseFor::Draw);
                     // (The depth read by the fog's pass: its read-only view, the shader's state too.)
                     if (!tg.main)
-                        dev.useDepth(tg.id, fog ? gfx::DepthUse::ReadSample : gfx::DepthUse::Write);
+                        dev.useDepth(tg.id, readsDepth ? gfx::DepthUse::ReadSample : gfx::DepthUse::Write);
                     // (Anything run between draws - the anti-aliasing - sets its own: all set again after a target change.)
                     dev.setTarget(tg.id, true);
                     ++g_cntTargets;
                     dev.setViewport(0.0f, 0.0f, static_cast<float>(tg.w), static_cast<float>(tg.h));
                     current = &tg;
-                    currentFog = fog;
+                    currentFog = readsDepth;
                 }
                 {
                     // The draw's scissor, in the target's pixels.
@@ -4478,9 +4684,14 @@ namespace nr::frame
                 // fog's depth. Unused, t1 and t2 are left at what they were bound to: the shader reads them only for those.)
                 const bool treeFog = treeFogPalette && !destSlot && !topSource;
                 c.fogx[0] = treeFog ? 1.0f : 0.0f;
+                {
+                    // (TODO 351 b: the fade range in Z24 units; negative = an additive blend, whose colour fades too)
+                    const bool addBlend = blend.enabled && blend.dst == gfx::Blend::One;
+                    c.fogx[2] = soft ? (addBlend ? -softRange : softRange) : 0.0f;
+                }
                 dev.bindTextures(selfSlot ? selfSlot : source ? sourceSlot : t ? t->id : 0u,
                                  fog ? fogPalette->id : destSlot ? destSlot : topSource ? topPalette->id : treeFog ? treeFogPalette->id : gfx::kKeepTexture,
-                                 fog ? tgDepth : gfx::kKeepTexture);
+                                 readsDepth ? tgDepth : gfx::kKeepTexture);
                 // (The rings: the pass's constants, then its instance entries. Full - the frame's ring room spent - the
                 // draw's passes from here are left out, as the check at a pass's start left them before.)
                 gfx::RingSpan cSpan;
@@ -5209,9 +5420,11 @@ namespace nr::frame
             dev.report(gfx::Report::Profile); // (the device's: its uploads, targets' and textures' video memory, its counters)
             std::fprintf(stderr, "[native render] profile: the whole frame %.2f ms on the GPU (%u frames timed); the render thread waited %.2f ms a frame for a frame slot (in setup); window %u\n",
                          g_frameGpuFrames ? g_frameGpu / g_frameGpuFrames : 0.0, g_frameGpuFrames, g_slotWaitMs / 300.0, g_profWindow);
-            std::fprintf(stderr, "[native render] profile: stand-ins (game textures on the uploader's way) drawn %llu times in %llu frames, %llu textures\n",
+            std::fprintf(stderr, "[native render] profile: stand-ins (game textures on the uploader's way) drawn %llu times in %llu frames, %llu textures; "
+                                 "%llu textures drawn with the copy of the same texels made already\n",
                          static_cast<unsigned long long>(g_standInDraws), static_cast<unsigned long long>(g_standInFrames),
-                         static_cast<unsigned long long>(g_standInTextures));
+                         static_cast<unsigned long long>(g_standInTextures), static_cast<unsigned long long>(g_sameContentUses));
+            g_sameContentUses = 0;
             g_standInDraws = g_standInFrames = g_standInTextures = 0;
             std::fprintf(stderr, "[native render] profile: clipping draws' runs a frame: %.1f inside (no clipping shader), %.1f through it\n",
                          g_clipRuns[0] / 300.0, g_clipRuns[1] / 300.0);

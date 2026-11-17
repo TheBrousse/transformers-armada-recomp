@@ -25,6 +25,7 @@ $global:SimVsListed = [bool]$env:SIM_VS_NOCPP
 function Get-WingetProblem { if ($env:SIM_WINGET) { return $env:SIM_WINGET } else { return $null } }
 function Get-MissingPrerequisites { return @($global:SimMissing) }
 function Update-PathFromRegistry { }
+function Get-VsUnknownToCmake { return @() }
 function Get-PythonFindings { return "sim: python findings" }
 function Get-VsFindings { return "sim: vs findings" }
 function Write-PrerequisiteEvidence([string]$When) { Write-Host "sim evidence ($When)" }
@@ -139,7 +140,7 @@ try {
     $iso = Join-Path $tmp "disc.iso"; Set-Content $iso "x"
     # (a copy of the game folder's scripts: setup.ps1 writes .setup.json beside itself)
     $copy = Join-Path $tmp "port"; New-Item -ItemType Directory "$copy\tools" | Out-Null
-    Copy-Item (Join-Path $Root "setup.ps1") $copy; Copy-Item (Join-Path $Root "tools\setup_common.ps1") "$copy\tools"
+    Copy-Item (Join-Path $Root "setup.ps1") $copy; foreach ($t in "setup_common.ps1", "step_log.ps1", "install_layout.ps1") { Copy-Item (Join-Path $Root "tools\$t") "$copy\tools" }   # (what setup.ps1 dot-sources)
     $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"   # (the setup program's own PowerShell)
     $cases = @(
         @{ Name = "permission declined: says click Yes, no retry phrase"; Env = @{ SIM_MISSING = "vs"; SIM_VS = "-1978335226|You cancelled the installation.\nInstaller failed with exit code: 2|0" }
@@ -170,7 +171,7 @@ try {
 Write-Host "3. an antivirus taking a program built on this PC (build.ps1)"
 # (build.ps1's own functions, taken out of it by the PowerShell parser: running it would build)
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root "build.ps1"), [ref]$null, [ref]$null)
-$defs = $ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in "Get-AntivirusBlockMessage", "Test-AntivirusBlock", "Assert-NotBlocked") -or
+$defs = $ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in "Get-AntivirusBlockMessage", "Test-AntivirusBlock", "Assert-NotBlocked", "Test-SmartAppBlock", "Get-SmartAppBlockMessage") -or
                                ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$BuiltHere') }, $true)
 $Root0 = $Root
 $Root = "C:\Games\TFA\transformers-armada-recomp"
@@ -190,6 +191,49 @@ $threw = $null; try { Assert-NotBlocked $gone } catch { $threw = "$_" }
 Check ([regex]::Match("$threw", "Your antivirus blocked (\S+?\.exe)\.").Groups[1].Value -eq "ps2_recomp.exe") "setup.ps1 recognises the message (its regex)"
 Remove-Item $an
 $Root = $Root0
+
+Write-Host "4. which Visual Studio builds, and the compiler named in the log (build.ps1, TODO 407)"
+$defs = $ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in "ConvertTo-VsCppInstances", "Select-VsInstances", "Get-CompilerReport") -or
+                               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$TestedVsMajor') }, $true)
+foreach ($d in $defs) { Invoke-Expression $d.Extent.Text }
+$vsJson = @'
+[{"installationPath":"C:/VS/2026","installationVersion":"18.3.11312.210","displayName":"Visual Studio Community 2026","catalog":{"productDisplayVersion":"18.3.0"}},
+ {"installationPath":"C:/VS/2022","installationVersion":"17.14.36717.8","displayName":"Visual Studio Build Tools 2022","catalog":{"productDisplayVersion":"17.14.20"}},
+ {"installationPath":"C:/VS/2019","installationVersion":"16.11.36631.11","displayName":"Visual Studio Community 2019","catalog":{"productDisplayVersion":"16.11.53"}}]
+'@
+$list = @($vsJson | ConvertFrom-Json | ForEach-Object { $_ })
+$helpNew = "Generators`n  Visual Studio 18 2026        = Generates Visual Studio 2026 project files.`n  Visual Studio 17 2022`n  Visual Studio 16 2019"
+$helpOld = "Generators`n  Visual Studio 17 2022`n  Visual Studio 16 2019"
+$all = @(ConvertTo-VsCppInstances $list $helpNew)
+$sel = @(Select-VsInstances $all)
+Check ($sel.Count -eq 3 -and $sel[0].Major -eq 17 -and $sel[1].Major -eq 18 -and $sel[2].Major -eq 16) "2026 + 2022 + 2019: Visual Studio 2022 first (built and tested with it), then the newest"
+Check ($sel[0].Name -eq "Visual Studio Build Tools 2022" -and $sel[0].Shown -eq "17.14.20" -and $sel[0].Generator -eq "Visual Studio 17 2022") "its name, shown version and generator"
+$only26 = @(ConvertTo-VsCppInstances @($list[0]) $helpNew)
+Check (@(Select-VsInstances $only26)[0].Major -eq 18) "2026 alone: 2026"
+$old = @(ConvertTo-VsCppInstances @($list[0]) $helpOld)
+Check ($old.Count -eq 1 -and -not $old[0].Known -and @(Select-VsInstances $old).Count -eq 0) "2026 alone with a CMake from before it: not usable (build.ps1 then says to update CMake)"
+$future = @(ConvertTo-VsCppInstances @([pscustomobject]@{ installationPath = "C:\VS\X"; installationVersion = "19.0.1.2"; displayName = "Visual Studio 2028" }) $helpNew)
+Check ($future.Count -eq 1 -and -not $future[0].Known -and $future[0].Generator -eq "Visual Studio 19") "an unknown later major: listed, not known"
+# (a build folder as CMake leaves it: the cache and the compiler file of its compiler test)
+$dir = Join-Path ([IO.Path]::GetTempPath()) "tc407_$PID"
+New-Item -ItemType Directory -Force (Join-Path $dir "CMakeFiles\4.1.2") | Out-Null
+Set-Content (Join-Path $dir "CMakeCache.txt") @("CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022", "CMAKE_GENERATOR_INSTANCE:UNINITIALIZED=C:\VS\2022",
+    "CMAKE_COMMAND:INTERNAL=C:/Home/AppData/Roaming/Python/Python312/site-packages/cmake/data/bin/cmake.exe",
+    "CMAKE_CACHE_MAJOR_VERSION:INTERNAL=4", "CMAKE_CACHE_MINOR_VERSION:INTERNAL=1", "CMAKE_CACHE_PATCH_VERSION:INTERNAL=2")
+Set-Content (Join-Path $dir "CMakeFiles\4.1.2\CMakeCXXCompiler.cmake") @('set(CMAKE_CXX_COMPILER "C:/VS/2022/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe")',
+    'set(CMAKE_CXX_COMPILER_ID "MSVC")', 'set(CMAKE_CXX_COMPILER_VERSION "19.44.35229.0")')
+$rep = Get-CompilerReport $dir $all
+Check ($rep -eq "Visual Studio Build Tools 2022 17.14.20, MSVC 19.44.35229.0 (tools 14.44.35207, Hostx64), CMake 4.1.2 (pip)") "the log line: $rep"
+$rep2 = Get-CompilerReport $dir @()
+Check ($rep2.StartsWith("Visual Studio 17 2022 (C:\VS\2022), MSVC 19.44.35229.0")) "no vswhere entry for it: the generator and the folder"
+Check ((Get-CompilerReport (Join-Path $dir "none") $all) -eq "") "a folder not set up: nothing"
+Remove-Item -Recurse -Force $dir
+# (setup.ps1's CMake check: setup_common.ps1's own function, given the list and the help text)
+. (Join-Path $Root "tools\setup_common.ps1")
+Check (@(Get-VsUnknownToCmake @($list[0]) $helpOld).Count -eq 1) "setup: Visual Studio 2026 alone, CMake from before it: update CMake"
+Check (@(Get-VsUnknownToCmake @($list[0]) $helpNew).Count -eq 0) "setup: Visual Studio 2026 alone, CMake that knows it: nothing to do"
+Check (@(Get-VsUnknownToCmake $list $helpOld).Count -eq 0) "setup: 2026 + 2022 with the older CMake: 2022 is usable, nothing to do"
+Check (@(Get-VsUnknownToCmake @() $helpOld).Count -eq 0) "setup: no Visual Studio: nothing here (the prerequisite step's)"
 
 if ($failed) { Write-Host "`n$failed check(s) failed" -ForegroundColor Red; exit 1 }
 Write-Host "`nall checks passed" -ForegroundColor Green

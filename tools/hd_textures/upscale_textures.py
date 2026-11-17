@@ -2074,6 +2074,11 @@ def main():
             left = ""
             if done >= 24 and len(todo) > done:
                 left = f", about {max(1, round(el / done * (len(todo) - done) / 60))} min left"
+            if redo:
+                # (TODO 374: images that came out broken are made again another way after this pass - a small tile, then the
+                # lighter network - and that is several times slower per image than the rest, so the estimate from the
+                # normal pace was far too short: "about 1 min left" before a retry pass of 271 s.)
+                left = ", then the broken ones again another way (a few more minutes)"
             print(f"HD textures: {made} of {total} made{left}", flush=True)
 
         def game_gone():

@@ -10,13 +10,8 @@
 #include "nr_types.h"
 #include "nr_movie.h"
 
-#include "ps2_runtime.h"
-#include "runtime/ps2_memory.h"
-#include "runtime/gs/ps2_gs_psmct16.h"
-#include "runtime/gs/ps2_gs_psmct32.h"
-#include "runtime/gs/ps2_gs_psmt4.h"
-#include "runtime/gs/ps2_gs_psmt8.h"
-#include "runtime/gs/gs_threaded_backend.h" // (gsupload: the upload skip's check)
+#include "nr_core.h"
+#include "gs_decode.h"           // (nr_core S1: the GS page layouts, no runtime include)
 
 #include <algorithm>
 #include <cstdio>
@@ -61,6 +56,33 @@ namespace nr
         bool indexed(uint32_t psm) { return psm == kPsmT8 || psm == kPsmT4 || highByte(psm); }
         uint32_t entriesOf(uint32_t psm) { return psm == kPsmT8 || psm == kPsmT8H ? 256u : 16u; }
 
+        // (nr_core S1b: main memory and the GS upload skip's bookkeeping come from the host, nr_core::TextureHost)
+        const uint8_t *guestPtr(const uint8_t *rdram, uint32_t addr)
+        {
+            const auto fn = nr_core::textureHost().guestPtr;
+            return fn ? fn(rdram, addr) : nullptr;
+        }
+        void gsEnsureWhole(uint64_t first, uint64_t last)
+        {
+            if (const auto fn = nr_core::textureHost().ensureWhole)
+                fn(first, last);
+        }
+        bool gsCheckMode()
+        {
+            const auto fn = nr_core::textureHost().checkMode;
+            return fn && fn();
+        }
+        bool gsStaleAt(uint32_t address, bool topByte)
+        {
+            const auto fn = nr_core::textureHost().staleAt;
+            return fn && fn(address, topByte);
+        }
+        void gsReportRead(const char *what, uint32_t tbp, uint32_t psm, uint32_t staleBytes, uint32_t bytes)
+        {
+            if (const auto fn = nr_core::textureHost().reportRead)
+                fn(what, tbp, psm, staleBytes, bytes);
+        }
+
         uint32_t word(const uint8_t *rdram, uint32_t addr)
         {
             if (t_inputs)
@@ -74,7 +96,7 @@ namespace nr
                     }
                 return v;
             }
-            const uint8_t *p = getConstMemPtr(rdram, addr);
+            const uint8_t *p = guestPtr(rdram, addr);
             uint32_t v = 0u;
             if (p)
                 std::memcpy(&v, p, 4);
@@ -84,8 +106,8 @@ namespace nr
         // The bytes of [addr, addr + size) in guest memory (main RAM: contiguous).
         const uint8_t *bytes(const uint8_t *rdram, uint32_t addr, uint32_t size)
         {
-            const uint8_t *first = getConstMemPtr(rdram, addr);
-            const uint8_t *last = size ? getConstMemPtr(rdram, addr + size - 1u) : first;
+            const uint8_t *first = guestPtr(rdram, addr);
+            const uint8_t *last = size ? guestPtr(rdram, addr + size - 1u) : first;
             return first && last && last == first + size - 1u ? first : nullptr;
         }
 
@@ -100,13 +122,13 @@ namespace nr
             switch (psm)
             {
             case kPsmCt16:
-                return GSPSMCT16::addrPSMCT16(0u, bw, x, y);
+                return nr_core::gs::gspsmct16::addrPSMCT16(0u, bw, x, y);
             case kPsmT8:
-                return GSPSMT8::addrPSMT8(0u, bw, x, y);
+                return nr_core::gs::gspsmt8::addrPSMT8(0u, bw, x, y);
             case kPsmT4:
-                return GSPSMT4::addrPSMT4(0u, bw, x, y);
+                return nr_core::gs::gspsmt4::addrPSMT4(0u, bw, x, y);
             default:
-                return GSPSMCT32::addrPSMCT32(0u, bw, x, y);
+                return nr_core::gs::gspsmct32::addrPSMCT32(0u, bw, x, y);
             }
         }
 
@@ -178,7 +200,7 @@ namespace nr
                 uint8_t rgb[3] = {};
                 if (psm == kPsmCt16 || psm == 0x0Au)
                 {
-                    const uint32_t at = GSPSMCT16::addrPSMCT16(tbp, bw, x, y);
+                    const uint32_t at = nr_core::gs::gspsmct16::addrPSMCT16(tbp, bw, x, y);
                     if (at + 2u <= kGsBytes)
                     {
                         const uint32_t c = g_vram[at] | g_vram[at + 1u] << 8;
@@ -188,13 +210,13 @@ namespace nr
                 }
                 else if (psm == 0x7Fu) // (a debug choice: a CT32 buffer's alpha, as grey)
                 {
-                    const uint32_t at = GSPSMCT32::addrPSMCT32(tbp, bw, x, y);
+                    const uint32_t at = nr_core::gs::gspsmct32::addrPSMCT32(tbp, bw, x, y);
                     if (at + 4u <= kGsBytes)
                         rgb[0] = rgb[1] = rgb[2] = g_vram[at + 3u];
                 }
                 else
                 {
-                    const uint32_t at = GSPSMCT32::addrPSMCT32(tbp, bw, x, y);
+                    const uint32_t at = nr_core::gs::gspsmct32::addrPSMCT32(tbp, bw, x, y);
                     if (at + 4u <= kGsBytes)
                         std::memcpy(rgb, g_vram + at, 3u);
                 }
@@ -398,24 +420,24 @@ namespace nr
             // Its pages copied to block 0, where the reading below looks.
             const uint32_t rbw = key.tbw ? key.tbw : pageWidth(psm, width);
             // (gsupload: the uploads a skip left out that reach into its pages written first - PS2Recomp patch 0073)
-            gsupload::ensureWhole(static_cast<uint64_t>(key.tbp) * 256u,
+            gsEnsureWhole(static_cast<uint64_t>(key.tbp) * 256u,
                                   static_cast<uint64_t>(key.tbp) * 256u + ((static_cast<uint64_t>(height - 1u) / 32u) * std::max(rbw, 1u) + (width - 1u) / 64u + 1u) * 8192u);
             for (uint32_t y = 0; y < height; ++y)
                 for (uint32_t x = 0; x < width; ++x)
                 {
-                    const uint32_t from = GSPSMCT32::addrPSMCT32(key.tbp, rbw, x, y), to = GSPSMCT32::addrPSMCT32(0u, rbw, x, y);
+                    const uint32_t from = nr_core::gs::gspsmct32::addrPSMCT32(key.tbp, rbw, x, y), to = nr_core::gs::gspsmct32::addrPSMCT32(0u, rbw, x, y);
                     if (from + 4u <= kGsBytes && to + 4u <= kGsBytes)
                         std::memcpy(&gs[to], g_vram + from, 4u);
                 }
             // (PS2X_GS_SKIP_UPLOADS=check: would a skip of the uploads have left any of it stale - its top bytes, a light map's)
-            if (gsupload::mode() == gsupload::Mode::Check)
+            if (gsCheckMode())
             {
                 uint32_t stale = 0u;
                 for (uint32_t y = 0; y < height; ++y)
                     for (uint32_t x = 0; x < width; ++x)
-                        if (gsupload::staleAt(GSPSMCT32::addrPSMCT32(key.tbp, rbw, x, y), true))
+                        if (gsStaleAt(nr_core::gs::gspsmct32::addrPSMCT32(key.tbp, rbw, x, y), true))
                             ++stale;
-                gsupload::reportRead("a light map read from GS memory", key.tbp, psm, stale, width * height);
+                gsReportRead("a light map read from GS memory", key.tbp, psm, stale, width * height);
             }
         }
         const uint32_t dbw = pageWidth(upsm, uw);
@@ -631,11 +653,11 @@ namespace nr
         {
             // (gsupload: the uploads a skip left out that reach into its texels or its palette written first - patch 0073)
             const uint32_t pw = tbw ? tbw : std::max(1u, width / 64u);
-            gsupload::ensureWhole(static_cast<uint64_t>(tbp) * 256u,
+            gsEnsureWhole(static_cast<uint64_t>(tbp) * 256u,
                                   static_cast<uint64_t>(tbp) * 256u + ((static_cast<uint64_t>(height - 1u) / 32u) * pw + (width - 1u) / 64u + 1u) * 8192u);
-            gsupload::ensureWhole(static_cast<uint64_t>(cbp) * 256u, static_cast<uint64_t>(cbp) * 256u + 8192u);
+            gsEnsureWhole(static_cast<uint64_t>(cbp) * 256u, static_cast<uint64_t>(cbp) * 256u + 8192u);
         }
-        if (gsupload::mode() == gsupload::Mode::Check)
+        if (gsCheckMode())
         {
             // (PS2X_GS_SKIP_UPLOADS=check) Its texels' and palette's GS memory, every 4th texel each way: stale under a skip?
             uint32_t stale = 0u, seen = 0u;
@@ -646,27 +668,27 @@ namespace nr
                     uint32_t at;
                     switch (psm)
                     {
-                    case 0x02u: case 0x0Au: at = GSPSMCT16::addrPSMCT16(tbp, w, x, y); break;
-                    case 0x13u: at = GSPSMT8::addrPSMT8(tbp, w, x, y); break;
-                    case 0x14u: at = GSPSMT4::addrPSMT4(tbp, w, x, y) >> 1u; break;
-                    default: at = GSPSMCT32::addrPSMCT32(tbp, w, x, y); break;
+                    case 0x02u: case 0x0Au: at = nr_core::gs::gspsmct16::addrPSMCT16(tbp, w, x, y); break;
+                    case 0x13u: at = nr_core::gs::gspsmt8::addrPSMT8(tbp, w, x, y); break;
+                    case 0x14u: at = nr_core::gs::gspsmt4::addrPSMT4(tbp, w, x, y) >> 1u; break;
+                    default: at = nr_core::gs::gspsmct32::addrPSMCT32(tbp, w, x, y); break;
                     }
                     ++seen;
-                    if (gsupload::staleAt(at, psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu))
+                    if (gsStaleAt(at, psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu))
                         ++stale;
                 }
-            gsupload::reportRead("a texture read from GS memory (TEX0)", tbp, psm, stale, seen);
+            gsReportRead("a texture read from GS memory (TEX0)", tbp, psm, stale, seen);
         }
         const uint32_t bw = tbw ? tbw : std::max(1u, width / 64u);
         const auto ct32 = [](uint32_t block, uint32_t w, uint32_t x, uint32_t y) {
-            const uint32_t at = GSPSMCT32::addrPSMCT32(block, w, x, y);
+            const uint32_t at = nr_core::gs::gspsmct32::addrPSMCT32(block, w, x, y);
             uint32_t c = 0u;
             if (at + 4u <= kGsBytes)
                 std::memcpy(&c, g_vram + at, 4u);
             return c;
         };
         const auto ct16 = [](uint32_t block, uint32_t w, uint32_t x, uint32_t y) {
-            const uint32_t at = GSPSMCT16::addrPSMCT16(block, w, x, y);
+            const uint32_t at = nr_core::gs::gspsmct16::addrPSMCT16(block, w, x, y);
             const uint32_t v = at + 2u <= kGsBytes ? static_cast<uint32_t>(g_vram[at] | g_vram[at + 1u] << 8) : 0u;
             return (v & 0x1Fu) << 3 | ((v >> 5) & 0x1Fu) << 11 | ((v >> 10) & 0x1Fu) << 19 | (v & 0x8000u ? 0x80000000u : 0u);
         };
@@ -704,13 +726,13 @@ namespace nr
                 {
                 case kPsmT4:
                 {
-                    const uint32_t at = GSPSMT4::addrPSMT4(tbp, bw, x, y);
+                    const uint32_t at = nr_core::gs::gspsmt4::addrPSMT4(tbp, bw, x, y);
                     c = (at >> 1) < kGsBytes ? palette[(g_vram[at >> 1] >> ((at & 1u) * 4u)) & 0xFu] : 0u;
                     break;
                 }
                 case kPsmT8:
                 {
-                    const uint32_t at = GSPSMT8::addrPSMT8(tbp, bw, x, y);
+                    const uint32_t at = nr_core::gs::gspsmt8::addrPSMT8(tbp, bw, x, y);
                     c = at < kGsBytes ? palette[g_vram[at]] : 0u;
                     break;
                 }

@@ -1039,8 +1039,7 @@ runtime does what that TV did, and keeps the 2D in shape.
 
 ## Sound
 
-**Since 2026-10-22 the sound server runs natively by default** (`transformers/src/native_sound*.cpp`;
-`TF_NATIVE_SOUND=0`, the Sound tab's "Sound engine", for the emulated one below):
+**The sound server runs natively, and only so (since 2026-10-22 by default; the emulated IOP choice, `TF_NATIVE_SOUND=0`, was removed in TODO 388 E; the reference build that still has it is named in TODO 388)** (`transformers/src/native_sound*.cpp`):
 
 - **The protocol** (`native_sound.cpp`). The game's sound classes reach SIRENS3 only through
   `slSIFCommander` (USA addresses): `0x1F0470` SendAsynchronousCommand (the 41 commands, one RPC
@@ -1070,7 +1069,7 @@ runtime does what that TV did, and keeps the 2D in shape.
   stream's voices take the channel loudness (tag 0x49) as their volume words, the loudness (tag
   0x40) only where no channel loudness came; the whole mix is halved (the emulated SPU2's output
   sits at half of tone x envelope x volume word, music and voices alike).
-- **The disc** (`native_disc.cpp`, `TF_NATIVE_DISC=0` for the IOP's). The game reads its files
+- **The disc** (`native_disc.cpp`; the IOP's TwoFish path, `TF_NATIVE_DISC=0`, was removed with it). The game reads its files
   through TwoFish, its own IOP disc server (EE side `0x192FF0` sends a request: LSN, sector
   count, buffer; `0x192FB0`/`0x192FE0` wait on its status). With the IOP parked those requests
   were never answered (the boot stalled at the first load after `Sys_Startup`), so the request
@@ -1087,7 +1086,7 @@ runtime does what that TV did, and keeps the 2D in shape.
   `Switch` calls, the music file it opens or crossfades to by index (a level starts on its warp gate's
   `WarpGateMusicTrack` entry of METAGAME.TDB; `NextMusicTrack` triggers step it), stings and the duck,
   and `slMusicStream_PlayStation2`'s channel loudness / loudness / part calls. The same game calls run
-  on both servers, so two logs (`TF_NATIVE_SOUND=0` and `=1`) show whether a difference is the server's.
+  on the native server; before TODO 388 E two logs (`TF_NATIVE_SOUND=0` and `=1`) showed whether a difference was the server's (the reference build's logs and dumps are in TODO 388).
 - **Channels and priority** (TODO 106, 2026-11-01). When the 48 channels less the streams' (38 in a
   level with music and ambience) are all in use, the voice with the LARGEST priority number gives way:
   SIRENS3's steal fallback (IOP 0x4DE74) sorts the playing voices by priority (voice +0x1C, the tag 0x22
@@ -1105,7 +1104,7 @@ runtime does what that TV did, and keeps the 2D in shape.
   side, the game's requests to the sound list (`ask 3d|imm ... -> node | NO NODE`), every key-on sent
   (`play h <handle> '<tone>' prio vol`), and from the server's status buffer whether it was ever listed
   as playing (`NEVER`) and how it ended (`stopped` / `not stopped`), with the peak number of playing
-  voices - the same lines for both servers, so a run with `TF_NATIVE_SOUND=0` is the comparison.
+  voices (before TODO 388 E the same lines for both servers; the comparison is now the reference build's tallies, TODO 388).
 - Protocol notes: `TF_SIRENS_LOG` /
   `TF_SIRENS_SCHEMA` (`sirens_trace.cpp`) record what the game sends.
 

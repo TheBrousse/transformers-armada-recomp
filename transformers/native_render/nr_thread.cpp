@@ -14,6 +14,10 @@
 #include "nr_taa.h"
 #include "view_turn.h"
 #include "runtime/ps2_thread_placement.h"
+#include "nr_core.h"
+#include "ps2_runtime.h"
+#include "runtime/ps2_memory.h"
+#include "runtime/gs/gs_threaded_backend.h"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +49,30 @@ namespace tf::port
     int fixedLogicRate();  // (overrides.cpp, TODO 161 a: the levels' fixed logic rate - 0: the rate follows the PC)
     bool vsyncOff();       // (overrides.cpp, TODO 266: the settings' VSync off - the presents at once)
     int frameCap();        // (overrides.cpp, TODO 266: the settings' frame rate cap - 0: Unlimited)
+}
+
+// (nr_core S0) The core's threads are placed by the runtime's rule (PS2X_THREAD_PLACEMENT): the hook set before main.
+namespace
+{
+    const bool g_coreThreadPlacer = []
+    {
+        nr_core::setThreadPlacer([](nr_core::ThreadRole role)
+                                 { ps2_thread_placement::place(static_cast<ps2_thread_placement::Role>(static_cast<int>(role))); });
+        return true;
+    }();
+    // (nr_core S1b) The texture conversion's host: guest RAM and the GS upload skip's bookkeeping (PS2Recomp's gsupload).
+    const bool g_coreTextureHost = []
+    {
+        nr_core::TextureHost host;
+        host.guestPtr = [](const uint8_t *ram, uint32_t addr) -> const uint8_t * { return getConstMemPtr(ram, addr); };
+        host.ensureWhole = [](uint64_t first, uint64_t last) { gsupload::ensureWhole(first, last); };
+        host.checkMode = []() { return gsupload::mode() == gsupload::Mode::Check; };
+        host.staleAt = [](uint32_t address, bool topByte) { return gsupload::staleAt(address, topByte); };
+        host.reportRead = [](const char *what, uint32_t tbp, uint32_t psm, uint32_t staleBytes, uint32_t bytes)
+        { gsupload::reportRead(what, tbp, psm, staleBytes, bytes); };
+        nr_core::setTextureHost(host);
+        return true;
+    }();
 }
 
 namespace nr
@@ -2296,9 +2324,17 @@ namespace nr
                 const size_t dot = job.shot.rfind('.');
                 const std::string stem = dot == std::string::npos ? job.shot : job.shot.substr(0, dot);
                 const std::string ext = dot == std::string::npos ? std::string(".bmp") : job.shot.substr(dot);
-                backend().setSpeedupsForced(0);
+                {
+                    nr_core::Settings coreSettings;
+                    coreSettings.speedupsForced = 0;
+                    nr_core::applySettings(coreSettings);
+                }
                 backend().render(job.frame, stem + "_a" + ext);
-                backend().setSpeedupsForced(1);
+                {
+                    nr_core::Settings coreSettings;
+                    coreSettings.speedupsForced = 1;
+                    nr_core::applySettings(coreSettings);
+                }
                 backend().render(job.frame, stem + "_b" + ext);
                 backend().setSpeedupsForced(-1);
             }

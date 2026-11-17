@@ -20,9 +20,12 @@
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <thread>
 #include <vector>
 
 namespace native_disc
@@ -36,6 +39,18 @@ namespace native_disc
 
         bool g_active = false;
         bool g_trace = false;
+        // TF_FILE_READ_LOG=<ms> (TODO 385 (1), a measuring aid, off by default): every TwoFish request that took this many
+        // milliseconds or more is logged with the thread it ran on, and once a second the totals of the requests of that
+        // second (count, sectors, ms in all, the slowest) while any came. Nothing else changes: the request is answered as
+        // before. 0 or "all" logs every request.
+        double g_logOverMs = -1.0;
+        struct ReadSecond
+        {
+            std::chrono::steady_clock::time_point start{};
+            uint32_t count = 0u, sectors = 0u, slow = 0u;
+            double totalMs = 0.0, maxMs = 0.0;
+            uint32_t maxLsn = 0u, maxSectors = 0u;
+        } g_second;
         PS2Runtime *g_runtime = nullptr;
         std::vector<uint8_t> g_buffer;
 
@@ -71,8 +86,34 @@ namespace native_disc
             return true;
         }
 
+        void noteRead(uint32_t lsn, uint32_t sectors, double ms)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (g_second.count != 0u && now - g_second.start >= std::chrono::seconds(1))
+            {
+                std::fprintf(stderr, "[file read] last second: %u requests, %u sectors (%.1f MB), %.2f ms in all, slowest %.2f ms (%u sectors at LSN %u), %u over %.1f ms\n",
+                             g_second.count, g_second.sectors, g_second.sectors * 2048.0 / 1048576.0, g_second.totalMs, g_second.maxMs, g_second.maxSectors,
+                             g_second.maxLsn, g_second.slow, g_logOverMs);
+                g_second = ReadSecond{};
+            }
+            if (g_second.count == 0u)
+                g_second.start = now;
+            ++g_second.count;
+            g_second.sectors += sectors;
+            g_second.totalMs += ms;
+            if (ms >= g_logOverMs)
+            {
+                ++g_second.slow;
+                std::fprintf(stderr, "[file read] %.2f ms: %u sectors at LSN %u, thread %zu\n", ms, sectors, lsn,
+                             std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000u);
+            }
+            if (ms > g_second.maxMs)
+                g_second.maxMs = ms, g_second.maxLsn = lsn, g_second.maxSectors = sectors;
+        }
+
         void sendRequestFn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
         {
+            const auto t0 = g_logOverMs >= 0.0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const uint32_t request = getRegU32(ctx, 4);
             const uint32_t lsn = read32(rdram, request + 0x00u);
             const uint32_t sectors = read32(rdram, request + 0x04u);
@@ -112,6 +153,8 @@ namespace native_disc
                 std::fprintf(stderr, "[native disc] read of %u sectors at LSN %u into %08x failed\n", sectors, lsn, buffer);
             else if (g_trace)
                 std::fprintf(stderr, "[native disc] read %u sectors at LSN %u into %08x\n", sectors, lsn, buffer);
+            if (g_logOverMs >= 0.0)
+                noteRead(lsn, sectors, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             write32(rdram, request + 0x10u, ok ? kStatusDone : kStatusError);
             SET_GPR_U32(ctx, 2, 1u);
             ctx->pc = getRegU32(ctx, 31);
@@ -122,10 +165,14 @@ namespace native_disc
 
     void install(PS2Runtime &runtime)
     {
-        const char *env = std::getenv("TF_NATIVE_DISC");
-        if (env && *env == '0')
-            return;
+        if (const char *env = std::getenv("TF_NATIVE_DISC"); env && *env == '0')
+            std::fprintf(stderr, "[native disc] TF_NATIVE_DISC=0 is ignored: TwoFish's IOP path is gone, the disc is read on the host\n");
         g_trace = std::getenv("TF_NATIVE_DISC_TRACE") != nullptr;
+        if (const char *log = std::getenv("TF_FILE_READ_LOG"); log && *log)
+        {
+            g_logOverMs = std::strcmp(log, "all") == 0 ? 0.0 : std::max(0.0, std::atof(log));
+            std::fprintf(stderr, "[file read] logging the disc requests of %.1f ms and more (TF_FILE_READ_LOG)\n", g_logOverMs);
+        }
         if (!runtime.lookupFunction(kSendRequest))
         {
             std::fprintf(stderr, "[native disc] the TwoFish request function was not found: not installed\n");
@@ -134,6 +181,6 @@ namespace native_disc
         g_runtime = &runtime;
         runtime.registerFunction(kSendRequest, sendRequestFn);
         g_active = true;
-        std::fprintf(stderr, "[native disc] TwoFish's reads are answered on the host (TF_NATIVE_DISC=0: the IOP's)\n");
+        std::fprintf(stderr, "[native disc] TwoFish's reads are answered on the host\n");
     }
 }

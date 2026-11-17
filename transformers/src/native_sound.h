@@ -3,8 +3,7 @@
 // command and frame packet the game's sound classes send to the IOP's SIRENS3 is answered on
 // the host, the sound is mixed there (voices from the tone libraries, music and dialogue
 // streams, movie audio, the reverb), the status buffer the game reads back is written from it,
-// and the IOP is parked. On by default; TF_NATIVE_SOUND=0 (the Sound tab's "Sound engine") runs
-// the original module on the emulated IOP and SPU2 instead.
+// and the IOP is parked. The only sound engine (TODO 388 E: the emulated IOP choice, TF_NATIVE_SOUND=0, is gone).
 
 #include <cstdint>
 #include <functional>
@@ -38,6 +37,4 @@ namespace native_sound
     // first, and no mix of the thread's own (keeping the output from running dry) meanwhile. For
     // anything that uses the mixer from outside the server (the port's own voices).
     std::unique_lock<std::mutex> lockMixer();
-    // The Sound tab's "Sound engine" (TF_NATIVE_SOUND): native (default) or the IOP's.
-    void addSettings();
 }

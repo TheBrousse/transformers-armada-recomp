@@ -617,17 +617,6 @@ namespace native_sound
         {
             if (g_iopParked || !g_runtime)
                 return;
-            static const bool keep = [] {
-                const char *env = std::getenv("TF_NATIVE_SOUND_IOP");
-                return env && *env == '1';
-            }();
-            if (keep)
-                return;
-            if (!native_disc::active())
-            {
-                std::fprintf(stderr, "[native sound] the IOP stays: the disc is read through its TwoFish (TF_NATIVE_DISC=0)\n");
-                return;
-            }
             g_runtime->setIopParked(true);
             g_iopParked = true;
             iop_tripwire::noteParked(*g_runtime); // (the boot's record: emulation-out S1)
@@ -942,31 +931,18 @@ namespace native_sound
         return std::unique_lock<std::mutex>(g_access);
     }
 
-    void addSettings()
-    {
-        ps2_settings::Setting s;
-        s.key = "TF_NATIVE_SOUND";
-        s.section = "Sound";
-        s.label = "Sound engine";
-        s.order = 5;
-        s.help = "Native: the game's sound server runs on the PC (no IOP or SPU2 emulated: a lighter load). "
-                 "Emulated: the original IOP module on the emulated sound chip. Takes a restart.";
-        s.choices = {{"1", "Native"}, {"0", "Emulated (IOP)"}};
-        s.defaultValue = "1";
-        s.apply = [](const std::string &) { return false; }; // (takes a restart)
-        ps2_settings::add(s);
-    }
-
     void setLibraryRedirect(std::function<std::string(const std::string &)> redirect) { g_libraryRedirect = std::move(redirect); }
     void setModLibraries(std::function<std::vector<std::string>()> libraries) { g_modLibraries = std::move(libraries); }
 
     void install(PS2Runtime &runtime)
     {
-        const char *env = std::getenv("TF_NATIVE_SOUND");
-        if (env && *env == '0')
+        // (TODO 388 E) The emulated IOP sound engine is gone: the sound always runs natively. A settings file or environment
+        // that still asks for the old one gets the native server, with this one line.
+        for (const char *old : {"TF_NATIVE_SOUND", "TF_NATIVE_SOUND_IOP"})
         {
-            sound_ledger::install(runtime); // (TF_SOUND_LEDGER=1: around the IOP's path)
-            return;
+            const char *env = std::getenv(old);
+            if ((env && *env == '0' && std::strcmp(old, "TF_NATIVE_SOUND") == 0) || (env && *env == '1' && std::strcmp(old, "TF_NATIVE_SOUND_IOP") == 0))
+                std::fprintf(stderr, "[native sound] %s=%s is ignored: the emulated sound engine is gone, the sound runs natively\n", old, env);
         }
         g_trace = std::getenv("TF_NATIVE_SOUND_TRACE") != nullptr;
         if (!runtime.lookupFunction(kSendCommand) || !runtime.lookupFunction(kMemoryRequest) || !runtime.lookupFunction(kTransferStart))
@@ -980,7 +956,7 @@ namespace native_sound
         runtime.registerFunction(kMemoryRequest, memoryRequestFn);
         runtime.registerFunction(kTransferStart, transferStartFn);
         g_active = true;
-        std::fprintf(stderr, "[native sound] the Sirens server runs natively (TF_NATIVE_SOUND=0: the IOP's)\n");
+        std::fprintf(stderr, "[native sound] the Sirens server runs natively\n");
         if (const char *thread = std::getenv("TF_NATIVE_SOUND_THREAD"); !(thread && *thread == '0'))
         {
             g_mixThreaded = true;

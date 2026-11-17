@@ -1,0 +1,37 @@
+From: TPepperoni666 <TPepperoni666@users.noreply.github.com>
+Subject: [PATCH] Gamepads: only joysticks with a gamepad mapping (a Logitech receiver was gamepad 0 on Linux)
+
+GLFW's Linux joysticks are any input device with keys and an absolute axis. A Logitech receiver's media
+keys (a volume axis) were joystick 0, so the pad read (firstGamepad) took them and never Steam's virtual
+pad (a Steam Controller in Game Mode): no gamepad input until the receiver was unplugged. raylib reads
+gamepads only through glfwGetGamepadState, which gives nothing without a mapping, so raylib's poll now
+counts a joystick as a gamepad only when GLFW has a mapping for it (glfwJoystickIsGamepad).
+---
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -167,6 +167,24 @@
+                 file(WRITE "${_ps2x_rcore}" "${_ps2x_rcore_new}")
+             endif()
+         endif()
++        # (Linux) Only a joystick GLFW has a gamepad mapping for is one of raylib's gamepads. raylib reads them through
++        # glfwGetGamepadState alone, which gives nothing without a mapping, but GLFW's Linux joysticks are any input
++        # device with keys and an absolute axis: a Logitech receiver's media keys (a volume axis) came first, as
++        # gamepad 0, and the pad read (firstGamepad) took it in place of Steam's virtual pad (a Steam Controller)
++        # after it - no gamepad input at all in Game Mode until the receiver was unplugged.
++        file(READ "${_ps2x_rcore}" _ps2x_rcore_text)
++        if(NOT _ps2x_rcore_text MATCHES "PS2X_GAMEPADS_MAPPED")
++            set(_ps2x_gp_poll "glfwJoystickPresent(i)) CORE.Input.Gamepad.ready[i] = true;")
++            string(FIND "${_ps2x_rcore_text}" "${_ps2x_gp_poll}" _ps2x_at_gp)
++            if(_ps2x_at_gp EQUAL -1)
++                message(WARNING "raylib's gamepad poll not found: joysticks without a gamepad mapping stay gamepads")
++            else()
++                string(REPLACE "${_ps2x_gp_poll}"
++                    "glfwJoystickPresent(i) && glfwJoystickIsGamepad(i)) CORE.Input.Gamepad.ready[i] = true; /* PS2X_GAMEPADS_MAPPED */"
++                    _ps2x_rcore_new "${_ps2x_rcore_text}")
++                file(WRITE "${_ps2x_rcore}" "${_ps2x_rcore_new}")
++            endif()
++        endif()
+         # (TODO 302) No display (a monitor off or asleep after a reboot, a session without a screen): GLFW cannot make
+         # the window, and raylib 5.5 went on with the null one - GetCurrentMonitor's glfwGetWindowPos(NULL), an access
+         # violation inside InitWindow - and InitWindow ignored InitPlatform's failure (rlglInit without an OpenGL
