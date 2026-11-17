@@ -1,0 +1,17 @@
+diff --git a/ps2xRecomp/CMakeLists.txt b/ps2xRecomp/CMakeLists.txt
+index 857102a..d483ec2 100644
+--- a/ps2xRecomp/CMakeLists.txt
++++ b/ps2xRecomp/CMakeLists.txt
+@@ -30,6 +30,12 @@ FetchContent_Declare(
+     GIT_TAG 12.1.0
+ )
+ FetchContent_MakeAvailable(fmt)
++# fmt 12 checks format strings with consteval; some Visual Studio versions reject those calls
++# (error C7595 "call to immediate function is not a constant expression"), so the recompiler
++# failed to build on those PCs. Turning the compile-time check off changes no output.
++if(MSVC)
++    target_compile_definitions(fmt PUBLIC FMT_USE_CONSTEVAL=0)
++endif()
+  
+ FetchContent_Declare(
+     libdwarf

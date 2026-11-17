@@ -1,5 +1,10 @@
 # What's new
 
+## 0.8.2
+
+**Fixed**
+- Setup: the game builds again with newer Visual Studio versions. Setup stopped at "Disc and game" with errors C7595 ("call to immediate function is not a constant expression").
+
 ## 0.8.1
 
 **Fixed**
