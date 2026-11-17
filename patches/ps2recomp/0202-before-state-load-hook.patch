@@ -1,0 +1,45 @@
+Subject: [PATCH] Runtime: a host layer is told right before a state is loaded (TODO 406)
+
+A host renderer that reads a frame's display lists from guest memory on a thread of its own could still be reading when
+an in-session state load (F9) overwrote that memory: it read half the old frame and half the loaded memory, and drew
+thousands of draws into GS buffers that do not exist (on an RX 5700 XT: 37 new full-size render targets in one frame,
+5.5 GB of video memory, then a GPU hang). setBeforeStateLoadHook is called on the EE executor right before the load, so
+the layer can finish (or drop) its reads first. Nothing changes without a hook.
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index a01ae89..c875dd3 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -578,6 +578,9 @@ public:
+     // Called on the EE executor right after a state has loaded, before any guest code runs
+     // again: for a game's own state that has to agree with the loaded memory.
+     void setStateLoadedHook(std::function<void()> hook) { m_stateLoadedHook = std::move(hook); }
++    // Called on the EE executor right before a state is loaded into memory: a host layer that reads guest memory on
++    // threads of its own finishes (or drops) those reads here.
++    void setBeforeStateLoadHook(std::function<void()> hook) { m_beforeStateLoadHook = std::move(hook); }
+     // Host time the EE thread has spent waiting for the host clock so far (a VBlank, a timer
+     // or another event due later than the guest got there; turbo mode waits for nothing): the
+     // headroom of a game that runs in real time.
+@@ -843,6 +846,7 @@ private:
+     mutable std::mutex m_refusedStateMutex;
+     std::string m_lastRefusedState;
+     std::function<void()> m_stateLoadedHook; // setStateLoadedHook
++    std::function<void()> m_beforeStateLoadHook; // setBeforeStateLoadHook
+     std::function<std::string()> m_saveStateBlockerHook; // setSaveStateBlockerHook
+     uint64_t m_saveStateGiveUpTick = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index ae4ded3..5c93cf9 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2759,6 +2759,10 @@ bool EeScheduler::serviceStateRequests()
+     if (!load.empty())
+     {
+         bool untouched = false;
++        // (A host layer that reads guest memory on threads of its own - a renderer reading a frame's display lists - is
++        // told first, so no read of it runs while the memory is overwritten.)
++        if (m_beforeStateLoadHook)
++            m_beforeStateLoadHook();
+         const auto loadStart = std::chrono::steady_clock::now();
+         if (ps2_savestate::load(m_runtime, load, reason, &untouched))
+         {

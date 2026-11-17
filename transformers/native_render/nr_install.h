@@ -18,6 +18,10 @@ namespace nr
     // Call on the EE thread (or while it is stopped) after a reset/state load.
     // Retains the callback, but clears the current capture's policy snapshot.
     void resetFrameTexturePolicy();
+    // (TODO 406) After an in-session state load, on the EE thread: the frame being captured (the old timeline's) dropped.
+    void captureStateLoaded();
+    // (TODO 406) Right before a state is loaded, on the EE thread: the frames being read from guest memory read to the end.
+    void finishReadsBeforeLoad();
     // Capture proven interframe native program uploads; default null does nothing.
     // Set/reset on the EE thread or while it is stopped.
     void setInterframeMicrocodePolicy(bool (*policy)(const uint8_t *, size_t));

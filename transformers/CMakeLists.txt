@@ -52,7 +52,7 @@ endif()
 # the runtime, raylib, view_turn or ps2_settings in these files fails at compile time. The recomp's exe takes the objects
 # (as before: the same code, the same flags), and nr_core is the same objects as a static library for hosts that link
 # only the core. Grows step by step (S0: the backends' base, the passes, the upscaler, the policy).
-set(TF_NR_CORE_REGEX "/nr_(d3d|backend|passes|taa|policy|core_hooks|core_api|pacelog|texture|hires)\\.cpp$")
+set(TF_NR_CORE_REGEX "/nr_(d3d|backend|passes|taa|policy|core_hooks|core_api|pacelog|queue|pictures|texture|hires)\\.cpp$")
 set(TF_NR_CORE_SOURCES ${TF_NATIVE_RENDER_SOURCES})
 list(FILTER TF_NR_CORE_SOURCES INCLUDE REGEX "${TF_NR_CORE_REGEX}")
 list(FILTER TF_NATIVE_RENDER_SOURCES EXCLUDE REGEX "${TF_NR_CORE_REGEX}")

@@ -1,0 +1,22 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -518,12 +518,15 @@
+             return;
+         }
+ 
+-        std::time_t now = std::time(nullptr);
++        // The console's clock keeps Japan's time (UTC+9): the system library's sceScfGetLocalTimefromRTC turns it into the
++        // local time with the OSD time zone (GetOsdConfigParam: the host's offset) minus 540 minutes. The host's local
++        // time here made every local time a game shows (Transformers' Saved Games list) early by 9 h less the zone.
++        std::time_t now = std::time(nullptr) + 9 * 3600;
+         std::tm localTm{};
+ #ifdef _WIN32
+-        localtime_s(&localTm, &now);
++        gmtime_s(&localTm, &now);
+ #else
+-        localtime_r(&now, &localTm);
++        gmtime_r(&now, &localTm);
+ #endif
+ 
+         // sceCdCLOCK format (BCD fields).

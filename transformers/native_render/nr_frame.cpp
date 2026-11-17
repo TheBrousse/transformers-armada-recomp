@@ -154,6 +154,10 @@ namespace nr::frame
             struct Target
             {
                 gfx::TargetId id = 0;         // the device's target (0: none - not made, or made in vain)
+                uint64_t used = 0;            // (TODO 406) the frame (g_targetFrame) it was last drawn into or read
+                bool read = false;            // (TODO 406) read as a texture at least once: kept however long unused
+                float seenW = 0.0f, seenH = 0.0f; // (TODO 406) the largest GS extent drawn into it since seenSince
+                uint64_t seenSince = 0;
                 uint32_t w = 0, h = 0;            // pixels
                 float gsW = 0.0f, gsH = 0.0f; // GS pixels it covers
                 bool main = false;
@@ -953,11 +957,13 @@ namespace nr::frame
         {
             return std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(static_cast<uint32_t>(gs)) * scale)));
         }
+        uint64_t g_targetTick = 0; // (TODO 406: the frame's tick, for the log below)
         bool makeTarget(State::Target &t, float gsW, float gsH, float sx, float sy)
         {
             ++g_targetsMade;
             if (std::getenv("TF_NATIVE_TARGETLOG"))
-                std::fprintf(stderr, "[native render] target made %gx%g at %gx%g\n", gsW, gsH, sx, sy);
+                std::fprintf(stderr, "[native render] target made %gx%g at %gx%g (was %gx%g; tick %llu)\n", gsW, gsH, sx, sy, t.gsW, t.gsH,
+                             static_cast<unsigned long long>(g_targetTick));
             gfx::TargetDesc d;
             d.width = targetPixels(gsW, sx);
             d.height = targetPixels(gsH, sy);
@@ -1179,6 +1185,7 @@ namespace nr::frame
         // A frame buffer's identity: its base and width (the same pages are another buffer at
         // another width - the 3D field and, later in the frame, the glare's small buffers).
         uint32_t targetKey(uint32_t frame) { return (frame & 0x1FFu) | ((frame >> 16) & 0x3Fu) << 9; }
+        uint64_t g_targetFrame = 0; // (TODO 406) frames the targets were worked out for: Target::used
         bool depthFormat(uint32_t frame) { return ((frame >> 24) & 0x30u) == 0x30u; } // (PSMZ*: a depth buffer written as colour)
 
 
@@ -2399,6 +2406,37 @@ namespace nr::frame
         g.passIds[gfx::device().frameSlot()].clear();
         g.passNotes[gfx::device().frameSlot()].clear();
         passMark(255u);
+        ++g_targetFrame;
+        g_targetTick = input.tick;
+        // (TODO 406) Targets never read as a texture and not drawn into for 300 frames let go of, once there are more than a level
+        // keeps (8-9 in play). Kept for good before: an in-session state load on the RX 5700 XT left 46, then 131 of them (5.5 GB
+        // and more on an 8 GB card: over Windows's budget, the GPU hung). One ever read stays, however long unused: the game may
+        // read it again without drawing it first (the cloak's "Downsampled Screen 1", written only while the screen effects run).
+        // TF_NATIVE_TARGETKEEP=<n>: targets kept without this (0: all, as before), default 16.
+        {
+            static const int keep = std::getenv("TF_NATIVE_TARGETKEEP") ? std::atoi(std::getenv("TF_NATIVE_TARGETKEEP")) : 16;
+            static const uint64_t kIdleFrames = std::getenv("TF_NATIVE_TARGETIDLE") ? std::strtoull(std::getenv("TF_NATIVE_TARGETIDLE"), nullptr, 10) : 300u; // (a test switch)
+            if (keep > 0 && g.targets.size() > static_cast<size_t>(keep))
+            {
+                size_t let = 0;
+                for (auto it = g.targets.begin(); it != g.targets.end();)
+                    if (!it->second.main && !it->second.read && it->first != mainFbp && it->second.used + kIdleFrames < g_targetFrame)
+                    {
+                        dev.releaseTarget(it->second.id);
+                        it = g.targets.erase(it);
+                        ++let;
+                    }
+                    else
+                        ++it;
+                static int told = 20;
+                if (let && told > 0)
+                {
+                    --told;
+                    std::fprintf(stderr, "[native render] %zu targets not used for %llu frames let go of at tick %llu: %zu left (TODO 406)\n", let,
+                                 static_cast<unsigned long long>(kIdleFrames), static_cast<unsigned long long>(input.tick), g.targets.size());
+                }
+            }
+        }
         // The main target: the picture's resources.
         for (auto it = g.targets.begin(); it != g.targets.end();)
             if (it->second.main && it->first != mainFbp)
@@ -2503,16 +2541,67 @@ namespace nr::frame
                         fieldRead.insert(key);
                 }
             }
+            size_t fresh = 0;
+            std::string freshKeys;
             for (auto &e : extent)
             {
                 State::Target &t = g.targets[e.first];
+                t.used = g_targetFrame;
+                if (!t.id)
+                {
+                    ++fresh;
+                    if (freshKeys.size() < 600u)
+                    {
+                        char k[64];
+                        std::snprintf(k, sizeof(k), " %x/%u %gx%g", e.first & 0x1FFu, e.first >> 9, e.second.first, e.second.second);
+                        freshKeys += k;
+                    }
+                }
                 const auto ef = effect.find(e.first);
                 const bool unit = (ef != effect.end() && ef->second > 0) ||
                                   (topRead.count(e.first) && e.second.first <= 256.0f && e.second.second <= 256.0f);
                 const float sx = unit ? 1.0f : g.scaleX, sy = unit ? 1.0f : fieldRead.count(e.first) ? g.scaleYField : g.scaleY;
+                // (TODO 406) A target grown for a while - seen after every in-session load, most likely the game's supersampling scheme, which draws the scene buffer at twice its
+                // rows (vlRenderDevicePS2: D_006CD8DC, the 30-frame mode the port turns off at PC rates; an in-session load
+                // brings the state's value back for a frame or two) - kept that size for good: 2x the scene's video memory
+                // after every load. Made again at the size it was drawn at over the last kShrinkFrames frames, when that is
+                // clearly smaller. TF_NATIVE_TARGETSHRINK=0: never (as before).
+                {
+                    static const bool shrinkOn = !(std::getenv("TF_NATIVE_TARGETSHRINK") && *std::getenv("TF_NATIVE_TARGETSHRINK") == '0');
+                    constexpr uint64_t kShrinkFrames = 1200;
+                    t.seenW = std::max(t.seenW, e.second.first);
+                    t.seenH = std::max(t.seenH, e.second.second);
+                    if (!t.seenSince)
+                        t.seenSince = g_targetFrame;
+                    if (g_targetFrame - t.seenSince >= kShrinkFrames)
+                    {
+                        if (shrinkOn && t.id && (t.gsW >= 1.5f * t.seenW || t.gsH >= 1.5f * t.seenH))
+                        {
+                            static int toldShrink = 12;
+                            if (toldShrink > 0)
+                            {
+                                --toldShrink;
+                                std::fprintf(stderr, "[native render] target %x/%u made again smaller at tick %llu: GS %gx%g -> %gx%g, drawn no larger for %llu frames (TODO 406)\n",
+                                             e.first & 0x1FFu, e.first >> 9, static_cast<unsigned long long>(input.tick), t.gsW, t.gsH, t.seenW,
+                                             t.seenH, static_cast<unsigned long long>(kShrinkFrames));
+                            }
+                            makeTarget(t, t.seenW, t.seenH, sx, sy);
+                        }
+                        t.seenW = t.seenH = 0.0f;
+                        t.seenSince = 0;
+                    }
+                }
                 if (t.id && t.gsW >= e.second.first && t.gsH >= e.second.second && t.w == targetPixels(t.gsW, sx) && t.h == targetPixels(t.gsH, sy))
                     continue;
                 makeTarget(t, std::max(e.second.first, t.gsW), std::max(e.second.second, t.gsH), sx, sy);
+            }
+            // (TODO 406: a frame that makes many targets at once - which GS buffers, for the hunt)
+            static int toldFresh = 12;
+            if (fresh >= 4u && toldFresh > 0 && g_targetFrame > 1u)
+            {
+                --toldFresh;
+                std::fprintf(stderr, "[native render] %zu new targets at tick %llu (%zu draws, %zu targets now): fbp/fbw and GS size%s (TODO 406)\n", fresh,
+                             static_cast<unsigned long long>(input.tick), input.draws.size(), g.targets.size(), freshKeys.c_str());
             }
         }
         // Depth starts each frame cleared (the game clears it with a draw into the depth buffer's
@@ -3990,7 +4079,7 @@ namespace nr::frame
                     const uint32_t key = (tbp / 32u) | tbw << 9;
                     auto rt = (tbp % 32u) == 0u && drawnTargets.count(key) ? g.targets.find(key) : g.targets.end();
                     if (rt != g.targets.end() && rt->second.id && &rt->second != &tg)
-                        if ((topPalette = textureFor(pass.topPalette)) != nullptr)
+                        if ((rt->second.used = g_targetFrame, rt->second.read = true, topPalette = textureFor(pass.topPalette)) != nullptr)
                         {
                             topSource = source = &rt->second;
                             t = nullptr;
@@ -4063,7 +4152,7 @@ namespace nr::frame
                     const uint32_t tbp = static_cast<uint32_t>(pass.tex0) & 0x3FFFu, tbw = static_cast<uint32_t>(pass.tex0 >> 14) & 0x3Fu;
                     auto rt = (tbp % 32u) == 0u ? g.targets.find((tbp / 32u) | tbw << 9) : g.targets.end();
                     if (rt != g.targets.end() && rt->second.id && &rt->second != &tg)
-                        source = &rt->second;
+                        source = &rt->second, rt->second.used = g_targetFrame, rt->second.read = true;
                     else if (rt != g.targets.end() && rt->second.id && !tg.main && !selfReadOff && ((draw.target >> 24) & 0x3Fu) <= 1u &&
                              ((pass.tex0 >> 20) & 0x3Fu) == ((draw.target >> 24) & 0x3Fu) && (selfSlot = dev.snapshot(tg.id)) != 0u)
                         source = &tg; // (the target read while drawn into - the glow's channel shifts: from a copy of it as it is now)

@@ -1,5 +1,26 @@
 # What's new
 
+## 0.8.4
+
+**Changed**
+- The European disc now also starts without the emulated PS2 sound processor, like the USA disc: its sound, movies and memory card all run natively on the PC (tested by TheBrousse on the European release).
+
+**Fixed**
+- The game no longer crashes at start-up on some PCs with Intel built-in graphics (a crash inside the graphics driver a moment after the window opened). Thanks to TheBrousse, who found the exact step that crashed.
+- The sun's lens flare is right at frame rates above 30: its rings run from the sun across the middle of the screen, as
+  on the console, instead of going missing or bunching up near the sun.
+- Trees: a tree standing on its own (one tree away from the others, like the pines on the small island in Alaska's sea)
+  was never drawn as its flat far picture, so it vanished entirely past the 3D trees' reach. It now shows at every Trees
+  setting.
+- The time shown for a save in the Saved Games list is right again (it was several hours early: 8 hours at UTC+1). Saves made before keep the old time.
+- Loading a save state in the middle of play no longer draws a burst of garbage in the first pictures after it (which could stall the graphics card for seconds and leave the picture full of noise).
+- F1 > Display > Aspect ratio 4:3 now stays 4:3 after you load a save: a save made in widescreen switched the game back to its wide mode, and the picture then followed the window's shape when it was resized or made full screen.
+- Cloaked enemies and the cloak Mini-Con look see-through again: you see the scene behind them, as on the console. They
+  showed the Autobot's red and yellow when you stood below them, and were drawn fully black when they were low on the
+  screen (Alaska's Sarges, the cloaking Guerrillas, the cloak with Powerlinx).
+- Deep Amazon: Cyclonus (and many of the level's enemies) no longer go missing after you played another level you had not finished yet. The game kept one list of defeated enemies and used it in the wrong level; now each level keeps its own.
+- Loading a save state in the middle of play (F9, or a state from the pause menu) no longer leaves the graphics card short of video memory: the extra video memory a load can take is freed again within seconds (before, it stayed taken until the game was closed, and on 8 GB cards the picture could fill with green noise or the graphics driver could restart).
+
 ## 0.8.3
 
 **New**

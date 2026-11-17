@@ -3523,10 +3523,43 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         // that this frame or the one in flight has bound is read by the GPU as the new view, not the one the draw was
         // recorded with: the descriptors are read when the list runs. Counted and the first few logged.)
         uint64_t g_slotBound[kSlots] = {};
-        uint64_t g_srvRewrites = 0;
-        void srvWritten(UINT slot, const char *what)
+        uint64_t g_srvRewrites = 0, g_slotsRetired = 0;
+        // (TODO 406) A slot whose view a draw of this frame's list - or of the frame before, its fence not passed yet - may
+        // still read: the GPU reads the descriptor when the list runs, so a view written into it now is what those draws see.
+        bool slotLive(UINT slot)
         {
             if (slot == 0u || slot >= kSlots || !g_slotBound[slot] || g_slotBound[slot] + State::kFrames <= g.frameIndex)
+                return false;
+            if (g_slotBound[slot] == g.frameIndex)
+                return true;
+            const UINT before = (g.slot + State::kFrames - 1u) % State::kFrames;
+            return !g.slotFence[before] || g.fence->GetCompletedValue() < g.slotFence[before];
+        }
+        // (TODO 406) The slot to write a target's new view into: a live one (above) is given back once this frame's fence has
+        // passed and another taken, so the draws recorded with it keep the view - and the surfaces - they were made with.
+        // Written in place, a target made again at an in-session state load (the same slot, new surfaces) was read by the
+        // frame in flight and by this frame's earlier draws before its first clear: never-written video memory read as a
+        // texture. TF_NATIVE_SLOTRETIRE=0: written in place, as before.
+        UINT freshSlot(UINT slot)
+        {
+            static const bool on = !(std::getenv("TF_NATIVE_SLOTRETIRE") && *std::getenv("TF_NATIVE_SLOTRETIRE") == '0');
+            if (!on || !slotLive(slot) || g.freeSlots.empty())
+                return slot;
+            g.slotFreeSlots[g.slot].push_back(slot);
+            const UINT s = g.freeSlots.back();
+            g.freeSlots.pop_back();
+            ++g_slotsRetired;
+            static int told = 10;
+            if (told > 0)
+            {
+                --told;
+                std::fprintf(stderr, "[native render] a view written into slot %u, not %u: draws recorded with %u may still read it (TODO 406)\n", s, slot, slot);
+            }
+            return s;
+        }
+        void srvWritten(UINT slot, const char *what)
+        {
+            if (!slotLive(slot))
                 return;
             ++g_srvRewrites;
             static int told = 20;
@@ -4927,7 +4960,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         }
 #endif
 
-        void finishSlot(UINT slot)
+        void finishSlot(UINT slot, bool keepViews = false)
         {
             if (const UINT n = std::min(g.slotPictures[slot], kMaxPictures); n && g.picTimes && g.timestampHz)
             {
@@ -5097,6 +5130,10 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 releaseLater(std::move(g.slotReleases[slot]));
             g.slotReleases[slot].clear();
             g_releaseMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - releaseStart).count();
+            // (TODO 406: not the views' slots let go of during the frame being recorded - waitIdle in a target's resize does not
+            // make its earlier draws' slots free: the frame's list has not run yet. Given back when the slot comes round.)
+            if (keepViews)
+                return;
             g.freeSlots.insert(g.freeSlots.end(), g.slotFreeSlots[slot].begin(), g.slotFreeSlots[slot].end());
             g.slotFreeSlots[slot].clear();
         }
@@ -5126,7 +5163,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
         {
             waitForGpu();
             for (UINT f = 0; f < State::kFrames; ++f)
-                finishSlot(f);
+                finishSlot(f, f == g.slot); // (the current slot's views kept: its frame may be being recorded, TODO 406)
         }
 
         void saveBmp(const std::string &path)
@@ -5888,7 +5925,9 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (t.srvOf == t.colour)
                 return;
             // (Written again whenever the target's resource is: a grown target is a new resource, and
-            // a view of the old one would read memory already released - the GPU hangs on it.)
+            // a view of the old one would read memory already released - the GPU hangs on it. Into a fresh slot when
+            // draws recorded with the old view may still read it: freshSlot, TODO 406.)
+            t.srv = freshSlot(t.srv);
             t.srvOf = t.colour;
             D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
             sd.Format = t.colour->GetDesc().Format;
@@ -6022,6 +6061,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                 }
                 if (t.depthSrv)
                 {
+                    t.depthSrv = freshSlot(t.depthSrv); // (TODO 406: not under a draw recorded with the old depth)
                     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
                     sd.Format = DXGI_FORMAT_R32_FLOAT;
                     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -6087,6 +6127,7 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
                                                              IID_PPV_ARGS(&t.destCopy))))
                     return 0u;
                 t.destState = D3D12_RESOURCE_STATE_COPY_DEST;
+                t.destSrv = freshSlot(t.destSrv); // (TODO 406: not under a draw recorded with the old copy)
                 D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = td.Format;
                 sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -7543,11 +7584,12 @@ void CsWrite(uint3 id : SV_DispatchThreadID)
             if (what == gfx::Report::Rings)
             {
                 // (TODO 99 check: the frame's rings - used of their room - and the views rewritten under a frame's use so far)
-                std::fprintf(stderr, "[native render] rings: constants %llu of %llu, instances %u of %u, vertices %llu of %llu KB; slot %u; views rewritten %llu\n",
+                std::fprintf(stderr, "[native render] rings: constants %llu of %llu, instances %u of %u, vertices %llu of %llu KB; slot %u; views rewritten %llu, moved to a fresh slot %llu\n",
                              static_cast<unsigned long long>((g.ringConstantsAt - g.slot * kConstantRing) / kConstantStride),
                              static_cast<unsigned long long>(kConstantRing / kConstantStride), g.ringInstanceAt - g.slot * kInstanceRing, kInstanceRing,
                              static_cast<unsigned long long>((g.dynamicUsed - g.slot * kDynamicRing) >> 10),
-                             static_cast<unsigned long long>(kDynamicRing >> 10), g.slot, static_cast<unsigned long long>(g_srvRewrites));
+                             static_cast<unsigned long long>(kDynamicRing >> 10), g.slot, static_cast<unsigned long long>(g_srvRewrites),
+                             static_cast<unsigned long long>(g_slotsRetired));
                 return;
             }
             if (up::state.load() != 0)

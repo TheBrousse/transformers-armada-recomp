@@ -1,5 +1,5 @@
-// The IOP-less boot (iop_boot.h): the "emulation out" plan's step 2 (S2). The only boot on the USA disc since TODO 388 E;
-// the European disc keeps the IOP's boot until it is tested without (TF_IOP_BOOT=0: without).
+// The IOP-less boot (iop_boot.h): the "emulation out" plan's step 2 (S2). The only boot on both discs: the USA disc since
+// TODO 388 E, the European disc since TheBrousse's test without the IOP (public issue #5, 2026-11-17).
 //
 // What the game asks of the IOP, measured in S1 (iop_tripwire.cpp, every episode, PAL, movies, states): at boot it
 // reboots it (sceSifRebootIop), syncs, loads 8 modules through _sceSifLoadModuleBuffer - TWOFISH, SIO2MAN, LIBSD,
@@ -20,8 +20,6 @@
 // Decomp equivalent: the EE's boot without an IOP.
 
 #include "iop_boot.h"
-
-#include "game_version.h" // TF_GAME_PAL: the European disc keeps the IOP's boot (install)
 
 #include "native_disc.h"
 #include "native_sound.h"
@@ -174,21 +172,11 @@ namespace iop_boot
 
     void install(PS2Runtime &runtime)
     {
-        // (TODO 388 E) The USA disc: the only boot is without the IOP; a leftover TF_IOP_BOOT=1 is ignored with one line.
-        // The European disc keeps the IOP's boot (the native sound server and disc still serve it; the IOP is parked once
-        // the game has booted) until it is tested without: TF_IOP_BOOT=0 boots it without the IOP.
-        const char *want = std::getenv("TF_IOP_BOOT");
-#if defined(TF_GAME_PAL)
-        if (!(want && *want == '0'))
-        {
-            std::fprintf(stderr, "[iop boot] the IOP's boot: the European disc keeps it until it is tested without the IOP "
-                                 "(TF_IOP_BOOT=0: without)\n");
-            return;
-        }
-#else
-        if (want && *want == '1')
+        // (TODO 388 E) Both discs: the only boot is without the IOP (the European disc since TheBrousse's test, public
+        // issue #5: a movie, a level, the card's saves and loads, the sound sample-identical); a leftover TF_IOP_BOOT=1 is
+        // ignored with one line.
+        if (const char *want = std::getenv("TF_IOP_BOOT"); want && *want == '1')
             std::fprintf(stderr, "[iop boot] TF_IOP_BOOT=1 is ignored: the IOP's boot is gone, the game boots without the IOP\n");
-#endif
         if (!native_sound::active() || !native_disc::active())
         {
             std::fprintf(stderr, "[iop boot] WARNING: the native sound server or disc is not installed: the IOP boots as before\n");

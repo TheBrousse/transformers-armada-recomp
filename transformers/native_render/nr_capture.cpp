@@ -6894,6 +6894,35 @@ namespace nr
     {
         g_interframePolicy=policy;resetInterframeMicrocodeCapture();
     }
+    // (TODO 406) A state loaded in the session: the frame being captured is the old timeline's - its draws so far, and the
+    // place in the display list it read up to (g_packetEnd). The game goes on from the state's moment with the packet
+    // pointer the state holds; a range from the old place to it ran over thousands of stale words - 5,000 to 9,000 draws
+    // into GS buffers that do not exist, the burst of 406. Now the capture starts again as at a start-up load: nothing
+    // kept, no list position until the next draw or frame sets one. TF_NATIVE_LOADRESET=0: as before.
+    void captureStateLoaded()
+    {
+        static const bool off = std::getenv("TF_NATIVE_LOADRESET") && *std::getenv("TF_NATIVE_LOADRESET") == '0';
+        if (off)
+            return;
+        const size_t draws = g_frame.draws.size();
+        const uint32_t was = g_packetEnd;
+        g_packetEnd = 0u;
+        g_listStartPending = false;
+        g_frame.draws.clear();
+        g_frame.list.clear();
+        g_frame.ranges.clear();
+        g_frame.regStream.clear();
+        g_frame.nativeRegs.clear();
+        g_frame.rainBlocks.clear();
+        g_primitives.clear();
+        g_divertDepth = 0;
+        static int told = 8;
+        if (told > 0)
+        {
+            --told;
+            std::fprintf(stderr, "[native render] a state loaded: the frame being captured (%zu draws, list at %08x) left out (TODO 406)\n", draws, was);
+        }
+    }
     void resetFrameTexturePolicy()
     {
         resetFrameTexturePolicySnapshot(g_frame);

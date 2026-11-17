@@ -29,6 +29,7 @@
 #include "guest_code.h"
 #include "key_text.h"
 #include "actor_guard.h"
+#include "kill_list.h"
 #include "revisit_music.h"
 #include "objective_guide.h"
 #include "surround_mode.h"
@@ -669,7 +670,12 @@ namespace
     // the card's settings are copied at boot (0x2780A0, reached by a tail jump from 0x32EE40:
     // that one is hooked, a jump bypasses the function table). With PS2X_WIDESCREEN=1 the game
     // plays in widescreen whatever the save says: the switch is put back on after either (the
-    // Options menu still turns it off for the rest of the session).
+    // Options menu still turns it off for the rest of the session). (TODO 410) And with
+    // PS2X_WIDESCREEN=0 (F1 > Display > Aspect ratio 4:3) it is put back OFF: a save made in
+    // widescreen turned the game's 16:9 mode back on at Continue, and the picture then took the
+    // Picture shape setting - "The screen's", the window's shape - so the 4:3 chosen in F1 followed
+    // the window as it was resized (bbatts: a 2.4:1 picture in a wide window). TF_WIDE_SAVE=1: the
+    // save's switch as before when 4:3 is chosen.
     constexpr uint32_t kCopyOptions = 0x0032EE40u;
     constexpr uint32_t kApplyProfileOptions = 0x002780E0u;
     constexpr uint32_t kOptionsPointer = 0x006CF244u; // -> the options (byte 4: widescreen)
@@ -679,11 +685,17 @@ namespace
 
     void forceWidescreenOption(uint8_t *rdram)
     {
+        const uint8_t on = ps2_host_display::widescreenTv() ? 1u : 0u;
         uint32_t options = 0u;
         std::memcpy(&options, rdram + kOptionsPointer, sizeof(options));
         if (options != 0u && (options & PS2_RAM_MASK) + 4u < PS2_RAM_SIZE)
-            rdram[(options & PS2_RAM_MASK) + 4u] = 1u;
-        rdram[kWidescreenFlag] = 1u;
+        {
+            uint8_t &stored = rdram[(options & PS2_RAM_MASK) + 4u];
+            if (stored != on)
+                std::fprintf(stderr, "[tf] the save's widescreen switch (%u) set to F1's Aspect ratio: %s\n", stored, on ? "16:9 and wider" : "4:3");
+            stored = on;
+        }
+        rdram[kWidescreenFlag] = on;
     }
 
     // (TODO 178) Invert Y off by default. The options' two default-setters (0x32DFD0, 0x32E0F0: each option from the
@@ -1767,6 +1779,7 @@ namespace
         applyPokes(rdram, tick);
         game_config::frame(rdram); // the Cheats and Debug tabs (game_config.h)
         mod_menu::frame(rdram);    // the mod menu's Levels tab (mod_menu.h)
+        kill_list::frame(rdram);   // the kill list's episode taken where it changed without us (kill_list.h, TODO 412)
         {
             uint32_t game = 0u; // (the taGame: there while a level runs)
             std::memcpy(&game, rdram + 0x006CF2B8u, sizeof(game)); // (kGame, below)
@@ -2695,6 +2708,104 @@ namespace
         if (g_pictureLock != 0)
             return g_pictureLock == 120; // (locked: the level at 60)
         return g_inBetween && g_frameRate <= 240;
+    }
+
+    // (TODO 361 / 31) The screen effects' frame copy: before the creature effects are drawn, the screen-effect list's
+    // PreRender (taDisplayListScreenEffectBehaviour, 0x4BA7F0) copies the frame into "Downsampled Screen 1" (256 x 256,
+    // TBP 0x3A00) with func_002078C0, the copy that the cloak (Sarges, Guerrillas, the Powerlinx cloak) and the heat haze
+    // sample at the field's screen coordinates. With betwixtMode on - the console's frames of two fields - it copies the
+    // top half alone (its source rectangle's bottom halved): field A. The PC port clears betwixtMode in a level at its own
+    // rate whenever there are no in-between pictures (always with the native renderer); the game then draws field A
+    // alone, rows 0-223, but the copy took all 448 rows: the picture in the copy's top half, nothing below it. The cloak
+    // read twice as far down the screen as the creature stood - the player's colours when he was below it, and black
+    // (the empty half) whenever the creature was in the screen's lower half. Here that copy takes field A as with
+    // betwixtMode. TF_CLOAK_FIELDCOPY=0: as before.
+    constexpr uint32_t kResampleSurface = 0x002078C0u;       // func_002078C0(source, target, source rect, target rect)
+    constexpr uint32_t kScreenCopyReturn = TF_GA(0x004BA8F4u); // its call in PreRender (0x4BA7F0), the return address
+    PS2Runtime::RecompiledFunction g_resampleSurface = nullptr;
+
+    void resampleSurface(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool off = std::getenv("TF_CLOAK_FIELDCOPY") && *std::getenv("TF_CLOAK_FIELDCOPY") == '0';
+        // (The call site checked once in guest memory: the instruction before the return address must be the game's
+        // `jal func_002078C0` (0x0C081E30). Any other code there - another release - and this does nothing.)
+        static const bool siteOk = [&] {
+            uint32_t word = 0u;
+            if (const uint8_t *p = getConstMemPtr(rdram, kScreenCopyReturn - 8u))
+                std::memcpy(&word, p, sizeof(word));
+            const bool ok = word == 0x0C081E30u;
+            if (!off)
+                std::fprintf(stderr, "[tf] the screen effects' frame copy (TODO 361): call site %08x %s\n", kScreenCopyReturn - 8u,
+                             ok ? "found - field A at the PC rate" : "NOT the game's call - left as it is");
+            return ok;
+        }();
+        if (!off && siteOk && g_levelRate != 0 && rdram[kBetwixtMode] == 0u && getRegU32(ctx, 31) == kScreenCopyReturn)
+        {
+            static bool told = false;
+            if (!told)
+            {
+                told = true;
+                std::fprintf(stderr, "[tf] the screen effects' frame copy takes field A (betwixtMode off at the PC rate)\n");
+            }
+            // (the source rectangle: x0, y0, x1, y1 as floats; the game's own two-field branch: y1 *= 0.5)
+            if (uint8_t *rect = getMemPtr(rdram, getRegU32(ctx, 6)))
+            {
+                float y1 = 0.0f;
+                std::memcpy(&y1, rect + 12, sizeof(y1));
+                y1 *= 0.5f;
+                std::memcpy(rect + 12, &y1, sizeof(y1));
+            }
+        }
+        g_resampleSurface(rdram, ctx, runtime);
+    }
+
+    // (TODO 416) The sun's lens flare (taLensFlare::Render, 0x407CD0) lays its rings along the line from the sun's screen
+    // position through the screen's centre, from the viewport's rectangle - which it halves to one field's height only with
+    // betwixtMode (the console's frames of two fields). At the PC rate (betwixtMode cleared, the game drawing field A alone)
+    // it kept the frame's full height: the centre at the field's bottom edge, so the rings ran toward the bottom of the
+    // screen and off it - mostly not seen. Here the rectangle's bottom is halved as the game's own two-field branch does,
+    // right after the viewport's GetRect filled it (sp+0x110: x0, y0, x1, y1): at the next call, func_0020CB20 (the camera
+    // display's rectangle), which only reads its argument. Only the halving - the flare still draws once, with no field
+    // scissor. TF_FLARE_FIELD=0: as before.
+    constexpr uint32_t kDisplayRect = 0x0020CB20u;        // func_0020CB20(display): the display's rectangle
+    constexpr uint32_t kFlareRectReturn = TF_GA(0x00407DA0u); // its call in the flare (0x407CD0), the return address
+    PS2Runtime::RecompiledFunction g_displayRect = nullptr;
+
+    void displayRect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (getRegU32(ctx, 31) == kFlareRectReturn)
+        {
+            static const bool off = std::getenv("TF_FLARE_FIELD") && *std::getenv("TF_FLARE_FIELD") == '0';
+            // (The call site checked once in guest memory: the game's `jal func_0020CB20` (0x0C0832C8) before the return
+            // address, else this does nothing.)
+            static const bool siteOk = [&] {
+                uint32_t word = 0u;
+                if (const uint8_t *p = getConstMemPtr(rdram, kFlareRectReturn - 8u))
+                    std::memcpy(&word, p, sizeof(word));
+                const bool ok = word == 0x0C0832C8u;
+                if (!off)
+                    std::fprintf(stderr, "[tf] the sun's lens flare (TODO 416): call site %08x %s\n", kFlareRectReturn - 8u,
+                                 ok ? "found - one field's height at the PC rate" : "NOT the game's call - left as it is");
+                return ok;
+            }();
+            if (!off && siteOk && g_levelRate != 0 && rdram[kBetwixtMode] == 0u)
+            {
+                if (uint8_t *rect = getMemPtr(rdram, getRegU32(ctx, 29) + 0x110u))
+                {
+                    float y1 = 0.0f;
+                    std::memcpy(&y1, rect + 12, sizeof(y1));
+                    y1 *= 0.5f;
+                    std::memcpy(rect + 12, &y1, sizeof(y1));
+                    static bool told = false;
+                    if (!told)
+                    {
+                        told = true;
+                        std::fprintf(stderr, "[tf] the sun's lens flare takes one field's height (betwixtMode off at the PC rate)\n");
+                    }
+                }
+            }
+        }
+        g_displayRect(rdram, ctx, runtime);
     }
 
     // Held off in this level by adaptFrameRate: the host fell behind with them.
@@ -5492,6 +5603,7 @@ namespace
     void adoptLoadedState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         nr::resetFrameTexturePolicy(); // also clears interframe microcode receipts/prefix and advances their epoch
+        nr::captureStateLoaded(); // (TODO 406: the old timeline's capture and list position dropped)
         g_statesSeen = runtime->eeScheduler().loadedStateCount();
         setPlace(placeInMemory(rdram), "a state loaded: from memory", runtime); // (TODO 341: the executor seen last is the session's before it)
         tuning::thawLoadedState(rdram); // (TODO 269: before the level's rate is read from its period below)
@@ -11181,6 +11293,7 @@ namespace
         game_config::installHud(runtime); // the HUD setting and photo mode's hidden HUD at once (game_config.h, TODO 228)
         if (!ext::install(ext::Phase::AfterPhotoMode, runtime)) runtime.requestStop(); // (the jet bike: its addresses stay put)
         actor_guard::install(runtime);    // freed actors' child walks left out (actor_guard.h, TODO 51)
+        kill_list::install(runtime);      // the kill list kept to its episode (kill_list.h, TODO 412: no Cyclonus after the unlocks)
         revisit_music::install(runtime);  // a finished Antarctica's cliff music (revisit_music.h, TODO 83: an original PS2 bug)
         objective_guide::install(runtime); // (TODO 315) the objective guide: the triggers' wait, after revisit_music's (objective_guide.h)
         surround_mode::install(runtime);  // the 3D sounds' Pro Logic II phase inversion, off by default (surround_mode.h, TODO 305 (10))
@@ -11339,6 +11452,8 @@ namespace
                 pc_settings_row::stateLoaded(); // (pages open before the load are not the state's: pc_settings_row.h)
                 menu_fade_speed::stateLoaded(); // (the state's screens: their fade rates as made at this menu speed)
             });
+        // (TODO 406) And before it: the native renderer's reads of guest memory finished, not overwritten under them.
+        runtime.eeScheduler().setBeforeStateLoadHook([]() { nr::finishReadsBeforeLoad(); });
         // The frame rate (see "The frame rate"): TF_FRAME_RATE=<frames a second>, 60 by default;
         // 30 (or TF_60FPS=0) for the console's. TF_60FPS=force also plays the level of a state
         // made at 30 at it. TF_ADAPTIVE_RATE=0 keeps a rate above 60 when the host falls behind.
@@ -11444,6 +11559,12 @@ namespace
             runtime.registerFunction(kEffectsUpdate, effectsUpdate);
         if ((g_preGameEnd = runtime.lookupFunction(kPreGameEnd)) != nullptr)
             runtime.registerFunction(kPreGameEnd, preGameEnd);
+        // (TODO 361 / 31: the screen effects' frame copy takes field A at the PC rate too - resampleSurface)
+        if ((g_resampleSurface = runtime.lookupFunction(kResampleSurface)) != nullptr)
+            runtime.registerFunction(kResampleSurface, resampleSurface);
+        // (TODO 416: the sun's lens flare takes one field's height at the PC rate too - displayRect)
+        if ((g_displayRect = runtime.lookupFunction(kDisplayRect)) != nullptr)
+            runtime.registerFunction(kDisplayRect, displayRect);
         // (TF_CAR_LOG at the console's 30: the cars' step wrapped for its log alone - g_levelRate 0 passes it through)
         if (g_frameRate <= 30 && std::getenv("TF_CAR_LOG") && *std::getenv("TF_CAR_LOG") == '1' &&
             (g_carsStep = runtime.lookupFunction(kCarsStep)) != nullptr)
@@ -11497,7 +11618,7 @@ namespace
             g_rateSetting = 30;
             publishPictureCap();
         }
-        if (ps2_host_display::widescreenTv())
+        if (ps2_host_display::widescreenTv() || !(std::getenv("TF_WIDE_SAVE") && *std::getenv("TF_WIDE_SAVE") == '1')) // (TODO 410: 4:3 too)
         {
             if ((g_copyOptions = runtime.lookupFunction(kCopyOptions)) != nullptr)
                 runtime.registerFunction(kCopyOptions, copyOptions);

@@ -1,0 +1,167 @@
+Subject: [PATCH] Present: the path decided before the first picture where GL cannot draw into Direct3D's textures (TODO 417)
+
+A player's Intel N100 (UHD Graphics, driver 32.0.101.7088) crashed inside Intel's OpenGL driver (igxelpicd64.dll) a few
+pictures after the start, right at "the DXGI swap chain cannot take GL's pictures here: GL's own swap from now on": 13 of 20
+starts without the IOP's boot, 5 of 17 with it, 0 of 12 with PS2X_PRESENT=gl. On every Intel PC the GL/Direct3D interop
+refuses the pictures' NT-handle textures (6e) and the legacy-handle retry is not made there (TODO 311), so the present thread
+learnt it on its first pictures and the window went to GL's own swap live: the present thread's GL context (in the window's
+share group) deleted and the flip-model swap chain released while the GS renderer's context and the native renderer were
+already drawing. Now dxgi::open() makes the textures once (in the present thread's context, on the window's thread, before
+the first picture and before any other GL context exists) and drops them again; where they cannot be made the swap chain is
+dropped at once and the window has GL's own swap from the start. Where they can be made nothing changes (the present thread
+makes them anew on its first picture, as before). The live switch stays for the other reasons (failed presents, the picture
+check, stuck pictures before the first shown one), made safer: the present thread's context is left in place instead of
+deleted under the other contexts, and the presenting device's state is cleared and flushed before the swap chain is
+released (Direct3D 11 destroys it late otherwise). PS2X_PRESENT_PROBE=0: as before; =early: tried before the swap chain is
+made (none made where they fail).
+
+diff --git a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+index 8ff5d0e..1a5d7db 100644
+--- a/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_present_dxgi.cpp
+@@ -240,6 +240,27 @@ namespace ps2_host_present::dxgi
+             return s >= window.first && s < window.first + window.second;
+         }
+ 
++        // (TODO 417) Where GL cannot draw into Direct3D's textures (every Intel PC: its interop refuses the NT-handle ones,
++        // 6e, and the legacy-handle retry is not made there - TODO 311), the window used to learn it from the present thread
++        // on its first pictures and went to GL's own swap live, a few pictures in: the present thread's context (sharing the
++        // window's textures) deleted and the swap chain dropped while the GS renderer's and the native renderer's contexts
++        // (the same share group) were drawing. On a player's Intel N100 that crashed inside Intel's GL driver in 13 of 20
++        // starts (0 of 12 with PS2X_PRESENT=gl). Now the textures are tried once in open(), before the first picture and
++        // before any other GL context exists; where they cannot be made the window has GL's own swap from the start.
++        // PS2X_PRESENT_PROBE=0: as before (found on the first pictures, the switch live); =early: tried before the swap chain
++        // is made (none made where they fail - the default makes it and drops it, as the live switch did: TODO 311 measured
++        // the movies' holds gone on the ThinkPad with a swap chain made and dropped).
++        int probeMode()
++        {
++            static const int mode = []()
++            {
++                const char *env = std::getenv("PS2X_PRESENT_PROBE");
++                const std::string v = env ? env : "";
++                return v == "0" ? 0 : v == "early" ? 2 : 1;
++            }();
++            return mode;
++        }
++
+         // (TODO 362) A present that failed: counted in a row; the first of each kind said, with its code.
+         enum Failure
+         {
+@@ -999,6 +1020,21 @@ namespace ps2_host_present::dxgi
+             wglMakeCurrent(windowDc, windowContext); // (the present thread's from now on)
+             return g.interopDevice != nullptr;
+         }
++
++        // (TODO 417) The pictures' textures made once at the window's size in the present thread's context (on the window's
++        // thread, before the first picture), then dropped again: the present thread makes them anew on its first picture,
++        // as before. False: GL cannot draw into them here.
++        bool probePictures()
++        {
++            const HDC windowDc = wglGetCurrentDC();
++            const HGLRC windowContext = wglGetCurrentContext();
++            if (!wglMakeCurrent(g.partDc, g.partContext))
++                return true; // (cannot tell here: the present thread finds out, as before)
++            const bool made = fit(g.width, g.height);
++            dropPictures();
++            wglMakeCurrent(windowDc, windowContext);
++            return made;
++        }
+     }
+ 
+     // (TODO 98) The fence shared by the two devices (State::shareFence). PS2X_PRESENT_FENCE=0: none, as before (an A/B).
+@@ -1125,6 +1161,18 @@ namespace ps2_host_present::dxgi
+             close();
+             return false;
+         }
++        RECT client{};
++        GetClientRect(g.window, &client);
++        g.width = client.right - client.left > 0 ? static_cast<int>(client.right - client.left) : 1;
++        g.height = client.bottom - client.top > 0 ? static_cast<int>(client.bottom - client.top) : 1;
++        // (TODO 417) PS2X_PRESENT_PROBE=early: the textures tried before the swap chain is made
++        if (probeMode() == 2 && !probePictures())
++        {
++            std::fprintf(stderr, "[present] GL cannot draw into Direct3D's textures here (tried before the first picture, no swap chain "
++                                 "made): GL's own swap from the start\n");
++            close();
++            return false;
++        }
+         // Variable refresh in a window takes presents allowed to tear.
+         IDXGIFactory5 *factory5 = nullptr;
+         if (SUCCEEDED(g.factory->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void **>(&factory5))))
+@@ -1134,10 +1182,6 @@ namespace ps2_host_present::dxgi
+             factory5->Release();
+         }
+         g.swapChainFlags = g.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+-        RECT client{};
+-        GetClientRect(g.window, &client);
+-        g.width = client.right - client.left > 0 ? static_cast<int>(client.right - client.left) : 1;
+-        g.height = client.bottom - client.top > 0 ? static_cast<int>(client.bottom - client.top) : 1;
+         DXGI_SWAP_CHAIN_DESC1 desc{};
+         desc.Width = static_cast<UINT>(g.width);
+         desc.Height = static_cast<UINT>(g.height);
+@@ -1157,6 +1201,15 @@ namespace ps2_host_present::dxgi
+             return false;
+         }
+         g.factory->MakeWindowAssociation(g.window, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
++        // (TODO 417) The textures tried before the first picture: where GL cannot draw into them the swap chain is dropped
++        // again at once, before any picture and any other GL context, and the window has GL's own swap from the start.
++        if (probeMode() == 1 && !probePictures())
++        {
++            std::fprintf(stderr, "[present] GL cannot draw into Direct3D's textures here (tried before the first picture): the swap "
++                                 "chain dropped, GL's own swap from the start\n");
++            close();
++            return false;
++        }
+         g.stop = false;
+         g.abandon = false;
+         g.finished.store(false, std::memory_order_relaxed);
+@@ -1307,6 +1360,10 @@ namespace ps2_host_present::dxgi
+ 
+     void close()
+     {
++        // (TODO 417) A switch from a running present thread (the live fallback): the GS renderer's and the native
++        // renderer's contexts share the window's textures with the present thread's - its context is not deleted under
++        // them (nor its hidden window): left as it is, unused. PS2X_PRESENT_PROBE=0: deleted, as before.
++        const bool live = probeMode() != 0; // also before the first picture: deleting it crashes Intel's driver
+         if (g.thread.joinable())
+         {
+             {
+@@ -1345,14 +1402,34 @@ namespace ps2_host_present::dxgi
+             g.interopDevice = nullptr;
+             g.source = 0u;
+         }
+-        if (g.partContext)
+-            wglDeleteContext(g.partContext);
++        if (live)
++            std::fprintf(stderr, "[present] the present thread's GL context is left in place (deleting it crashes some drivers)\n");
++        else
++        {
++            if (g.partContext)
++                wglDeleteContext(g.partContext);
++            if (g.partWindow)
++                DestroyWindow(g.partWindow);
++        }
+         g.partContext = nullptr;
+-        if (g.partWindow)
+-            DestroyWindow(g.partWindow);
+         g.partWindow = nullptr;
+         g.partDc = nullptr;
+         release(g_check.staging);
++        // (TODO 417) Nothing of the presenting device's left bound or queued before the swap chain goes: Direct3D 11 destroys
++        // it late otherwise, and the window must not be presented to by GL while a flip-model swap chain still holds it.
++        if (probeMode() != 0)
++        {
++            if (g.context)
++            {
++                g.context->ClearState();
++                g.context->Flush();
++            }
++            if (g.shareContext)
++            {
++                g.shareContext->ClearState();
++                g.shareContext->Flush();
++            }
++        }
+         release(g.swapChain);
+         release(g.shareFence);
+         release(g.presentFence);

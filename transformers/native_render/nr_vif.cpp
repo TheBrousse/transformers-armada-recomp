@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace nr::vif
@@ -46,7 +47,13 @@ namespace nr::vif
             const size_t words = (static_cast<size_t>(n) * bits + 31u) / 32u;
             if (words > avail)
                 return avail;
-            if (n > 1u)
+            // (The stride comes from the cycle in force, but one-element unpacks under CL == WL - the batch headers, the
+            // constants - would make it 1: they are left out. TODO 411: a one-element unpack under a SKIPPING cycle (CL > WL)
+            // can only be vertex data - a batch of one vertex, e.g. a forest card set holding a single tree, which kept the
+            // batch before's stride and was read from the wrong qwords (a lone pine's card at -2113536, size -2064, never
+            // seen). TF_NATIVE_LONE_SPRITE=0: as before.)
+            static const bool loneVertex = !(std::getenv("TF_NATIVE_LONE_SPRITE") && *std::getenv("TF_NATIVE_LONE_SPRITE") == '0');
+            if (n > 1u || (loneVertex && s.cl > s.wl))
                 s.stride = s.cl >= s.wl ? s.cl : 1u;
             const uint8_t *bytes = reinterpret_cast<const uint8_t *>(w);
             const uint32_t compBytes = 4u >> vl;

@@ -1170,7 +1170,9 @@ read-back from GS memory again instead of the native depth - nr_occlusion.cpp).
   variant at build time; `vulkan/nr_vulkan_vma.cpp`: the Vulkan Memory Allocator; `vulkan/extract_hlsl.cmake`: the HLSL
   taken from `nr_d3d.cpp` at build time.
 - `nr_install.h`: the entry point, called from `applyTransformers` after the decomp layer.
-- `nr_thread.cpp`: the render thread (the frame's list read, grass, D3D12 recording).
+- `nr_thread.cpp`: the render thread's work for the recomp (the frame's list read, grass); `nr_pictures.cpp` (in the core):
+  the pictures between frames (N9);
+  `nr_queue.cpp` (in the core): the frame queue and its two threads (the read and the drawing, the frames left out).
 - `nr_present.cpp`: the live picture's hand-over to the window (stage 4); `nr_glshare.cpp`: its shared
   texture on the GL side.
 - `nr_pace.cpp`: the paced hand-over (N9, `TF_PACING`) - the steady delay after the frames' moments and the thread that
